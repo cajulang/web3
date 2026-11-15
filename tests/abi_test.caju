@@ -1,0 +1,449 @@
+# web3/abi: Solidity ABI encoding and decoding.
+import { describe, it, expect } from "std/testing"
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/abi"
+import "std/strings"
+
+# a hex string from 32-byte words written without "0x"
+fn words(ws: []str) -> str { return strings.join(ws, "") }
+
+fn w(n: int) -> str { return web3.to_hex(web3.from_int(n).bytes32())[2:] }
+
+fn hexs(b: str) -> str { return web3.to_hex(b) }
+
+fn u(v: any) -> str {
+  x, ok := v.(*web3.U256)
+  if !ok { return "not a U256" }
+  return x.dec()
+}
+
+let ERC20_JSON = `[
+  {"type":"constructor","inputs":[{"name":"name_","type":"string"},{"name":"symbol_","type":"string"}],"stateMutability":"nonpayable"},
+  {"type":"function","name":"name","inputs":[],"outputs":[{"name":"","type":"string"}],"stateMutability":"view"},
+  {"type":"function","name":"decimals","inputs":[],"outputs":[{"name":"","type":"uint8"}],"stateMutability":"view"},
+  {"type":"function","name":"totalSupply","inputs":[],"outputs":[{"name":"","type":"uint256"}],"stateMutability":"view"},
+  {"type":"function","name":"balanceOf","inputs":[{"name":"account","type":"address"}],"outputs":[{"name":"","type":"uint256"}],"stateMutability":"view"},
+  {"type":"function","name":"transfer","inputs":[{"name":"to","type":"address"},{"name":"value","type":"uint256"}],"outputs":[{"name":"","type":"bool"}],"stateMutability":"nonpayable"},
+  {"type":"function","name":"allowance","inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],"outputs":[{"name":"","type":"uint256"}],"stateMutability":"view"},
+  {"type":"function","name":"approve","inputs":[{"name":"spender","type":"address"},{"name":"value","type":"uint256"}],"outputs":[{"name":"","type":"bool"}],"stateMutability":"nonpayable"},
+  {"type":"function","name":"transferFrom","inputs":[{"name":"from","type":"address"},{"name":"to","type":"address"},{"name":"value","type":"uint256"}],"outputs":[{"name":"","type":"bool"}],"constant":false,"payable":false},
+  {"type":"event","name":"Transfer","inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}],"anonymous":false},
+  {"type":"event","name":"Approval","inputs":[{"name":"owner","type":"address","indexed":true},{"name":"spender","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}],"anonymous":false},
+  {"type":"error","name":"ERC20InsufficientBalance","inputs":[{"name":"sender","type":"address"},{"name":"balance","type":"uint256"},{"name":"needed","type":"uint256"}]}
+]`
+
+let VITALIK = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+let USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+
+# the Solidity docs example g(uint256[][],string[]) without its selector
+let G_HEX = words([]str{w(0x40), w(0x140), w(2), w(0x40), w(0xa0), w(2), w(1), w(2), w(1), w(3), w(3), w(0x60), w(0xa0), w(0xe0), w(3), "6f6e650000000000000000000000000000000000000000000000000000000000", w(3), "74776f0000000000000000000000000000000000000000000000000000000000", w(5), "7468726565000000000000000000000000000000000000000000000000000000"})
+
+fn g_args() -> []any {
+  return []any{[]any{[]any{1, 2}, []any{3}}, []any{"one", "two", "three"}}
+}
+
+describe("abi.encode (Solidity docs examples)", fn() {
+  it("baz(uint32,bool) with 69, true", fn() {
+    a := abi.must_human([]str{"function baz(uint32 x, bool y) returns (bool r)"})
+    d, err := abi.encode_function_data(a.function("baz"), []any{69, true})
+    expect(err).to_be_nil()
+    expect(hexs(d)).to_equal("0xcdcd77c0" + w(0x45) + w(1))
+  })
+  it("sam(bytes,bool,uint256[]) with \"dave\", true, [1,2,3]", fn() {
+    a := abi.must_human([]str{"function sam(bytes, bool, uint[])"})
+    d, err := abi.encode_function_data(a.function("sam"), []any{"dave", true, []int{1, 2, 3}})
+    expect(err).to_be_nil()
+    want := words([]str{w(0x60), w(1), w(0xa0), w(4), "6461766500000000000000000000000000000000000000000000000000000000", w(3), w(1), w(2), w(3)})
+    expect(hexs(d)).to_equal("0xa5643bf2" + want)
+  })
+  it("f(uint256,uint32[],bytes10,bytes) with 0x123, [0x456,0x789], \"1234567890\", \"Hello, world!\"", fn() {
+    a := abi.must_human([]str{"function f(uint256, uint32[], bytes10, bytes)"})
+    d, err := abi.encode_function_data(a.function("f"), []any{"0x123", []any{0x456, "0x789"}, "1234567890", "Hello, world!"})
+    expect(err).to_be_nil()
+    want := words([]str{w(0x123), w(0x80), "3132333435363738393000000000000000000000000000000000000000000000", w(0xe0), w(2), w(0x456), w(0x789), w(0xd), "48656c6c6f2c20776f726c642100000000000000000000000000000000000000"})
+    expect(hexs(d)).to_equal("0x8be65246" + want)
+  })
+  it("g(uint256[][],string[]) with [[1,2],[3]], [\"one\",\"two\",\"three\"]", fn() {
+    a := abi.must_human([]str{"function g(uint256[][], string[])"})
+    d, err := abi.encode_function_data(a.function("g"), g_args())
+    expect(err).to_be_nil()
+    expect(hexs(d)).to_equal("0x2289b18c" + G_HEX)
+  })
+  it("decodes the g example back", fn() {
+    vs, err := abi.decode_types([]str{"uint256[][]", "string[]"}, web3.must_hex(G_HEX))
+    expect(err).to_be_nil()
+    outer := vs[0].([]any)
+    expect(len(outer)).to_equal(2)
+    first := outer[0].([]any)
+    expect(u(first[1])).to_equal("2")
+    expect(u(outer[1].([]any)[0])).to_equal("3")
+    expect(vs[1]).to_equal([]any{"one", "two", "three"})
+  })
+  it("decodes the f example back", fn() {
+    a := abi.must_human([]str{"function f(uint256, uint32[], bytes10, bytes)"})
+    d, _ := abi.encode_function_data(a.function("f"), []any{"0x123", []any{0x456, 0x789}, "1234567890", "Hello, world!"})
+    it2, args, err := abi.decode_function_data(a, d)
+    expect(err).to_be_nil()
+    expect(it2.name).to_equal("f")
+    expect(u(args[0])).to_equal("291")
+    expect(u(args[1].([]any)[1])).to_equal("1929")
+    expect(args[2]).to_equal("1234567890")
+    expect(args[3]).to_equal("Hello, world!")
+  })
+})
+
+describe("abi signatures", fn() {
+  it("computes the ERC-20 selectors", fn() {
+    a := abi.must_human([]str{"function transfer(address to, uint256 amount) returns (bool)", "function balanceOf(address) view returns (uint256)", "function approve(address spender, uint256 amount) returns (bool)"})
+    expect(abi.signature(a.function("transfer"))).to_equal("transfer(address,uint256)")
+    expect(hexs(abi.selector(a.function("transfer")))).to_equal("0xa9059cbb")
+    expect(hexs(abi.selector(a.function("balanceOf")))).to_equal("0x70a08231")
+    expect(hexs(abi.selector(a.function("approve")))).to_equal("0x095ea7b3")
+  })
+  it("computes the Transfer event topic", fn() {
+    a := abi.must_human([]str{"event Transfer(address indexed from, address indexed to, uint256 value)"})
+    expect(hexs(abi.event_topic(a.event("Transfer")))).to_equal("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+  })
+  it("expands tuples in signatures", fn() {
+    a := abi.must_human([]str{"function fill((uint256 a, address b)[] orders, tuple(bytes32,(bool,string)) x)"})
+    expect(abi.signature(a.function("fill"))).to_equal("fill((uint256,address)[],(bytes32,(bool,string)))")
+    expect(a.function("fill").inputs[0].type).to_equal("tuple[]")
+    expect(a.function("fill").inputs[0].components[1].name).to_equal("b")
+  })
+  it("finds overloads by signature", fn() {
+    a := abi.must_human([]str{"function safeTransferFrom(address,address,uint256)", "function safeTransferFrom(address from, address to, uint256 id, bytes data)"})
+    expect(len(a.function("safeTransferFrom").inputs)).to_equal(3)
+    expect(len(a.function("safeTransferFrom(address, address, uint256, bytes)").inputs)).to_equal(4)
+    expect(a.function("nope") == nil).to_be_true()
+  })
+})
+
+describe("abi.parse_json", fn() {
+  it("parses the ERC-20 JSON ABI", fn() {
+    a, err := abi.parse_json(ERC20_JSON)
+    expect(err).to_be_nil()
+    expect(len(a.items)).to_equal(12)
+    expect(a.function("balanceOf").state_mutability).to_equal("view")
+    expect(a.function("transferFrom").state_mutability).to_equal("nonpayable")
+    expect(a.event("Transfer").inputs[0].indexed).to_be_true()
+    expect(a.error_("ERC20InsufficientBalance").inputs[2].name).to_equal("needed")
+    expect(a.constructor_().inputs[1].name).to_equal("symbol_")
+    expect(hexs(abi.selector(a.function("transferFrom")))).to_equal("0x23b872dd")
+  })
+  it("accepts an artifact with an \"abi\" field and tuple components", fn() {
+    a, err := abi.parse_json(`{"abi":[{"type":"function","name":"h","inputs":[{"name":"p","type":"tuple[2]","components":[{"name":"x","type":"uint8"},{"name":"y","type":"string[]"}]}],"outputs":[]}]}`)
+    expect(err).to_be_nil()
+    expect(abi.signature(a.function("h"))).to_equal("h((uint8,string[])[2])")
+  })
+  it("refuses invalid ABIs", fn() {
+    _, e1 := abi.parse_json("{")
+    expect(e1).not_().to_be_nil()
+    _, e2 := abi.parse_json(`[{"type":"function","name":"x","inputs":[{"type":"uint7"}]}]`)
+    expect(e2).not_().to_be_nil()
+    _, e3 := abi.parse_json(`[{"type":"weird"}]`)
+    expect(e3).not_().to_be_nil()
+  })
+})
+
+describe("abi.parse_human", fn() {
+  it("parses functions, events, errors, constructors and modifiers", fn() {
+    a, err := abi.parse_human([]str{"constructor(string name, uint8 decimals) payable", "function balanceOf(address owner) external view returns (uint256 balance)", "event Transfer(address indexed from, address indexed to, uint256 value)", "error InsufficientBalance(uint256 available, uint256 required)", "receive() external payable", ""})
+    expect(err).to_be_nil()
+    expect(len(a.items)).to_equal(5)
+    expect(a.constructor_().state_mutability).to_equal("payable")
+    bo := a.function("balanceOf")
+    expect(bo.state_mutability).to_equal("view")
+    expect(bo.outputs[0].name).to_equal("balance")
+    expect(a.event("Transfer").inputs[1].indexed).to_be_true()
+    expect(a.event("Transfer").inputs[1].name).to_equal("to")
+    expect(abi.signature(a.error_("InsufficientBalance"))).to_equal("InsufficientBalance(uint256,uint256)")
+    expect(a.items[4].kind).to_equal("receive")
+  })
+  it("resolves struct lines used as types", fn() {
+    a, err := abi.parse_human([]str{"function place(Order[] calldata orders) returns (Point p)", "struct Order { address maker; Point at; }", "struct Point { uint256 x; uint256 y; }"})
+    expect(err).to_be_nil()
+    expect(abi.signature(a.function("place"))).to_equal("place((address,(uint256,uint256))[])")
+    expect(a.function("place").inputs[0].internal_type).to_equal("struct Order[]")
+  })
+  it("refuses malformed lines", fn() {
+    _, e1 := abi.parse_human([]str{"function f(uint256"})
+    expect(e1).not_().to_be_nil()
+    _, e2 := abi.parse_human([]str{"function f(uint257 x)"})
+    expect(e2).not_().to_be_nil()
+    _, e3 := abi.parse_human([]str{"modifier m()"})
+    expect(e3).not_().to_be_nil()
+    _, e4 := abi.parse_human([]str{"function f(Missing m)"})
+    expect(e4).not_().to_be_nil()
+  })
+})
+
+describe("abi integers", fn() {
+  it("encodes int8 -1 as two's complement and decodes it back", fn() {
+    d, err := abi.encode_types([]str{"int8"}, []any{-1})
+    expect(err).to_be_nil()
+    expect(hexs(d)).to_equal("0x" + strings.repeat("f", 64))
+    vs, err2 := abi.decode_types([]str{"int8"}, d)
+    expect(err2).to_be_nil()
+    expect(vs[0].(*web3.U256).signed_dec()).to_equal("-1")
+    d2, _ := abi.encode_types([]str{"int256"}, []any{"-128"})
+    expect(d2).to_equal(web3.from_int(-128).bytes32())
+  })
+  it("refuses values out of range", fn() {
+    _, e1 := abi.encode_types([]str{"uint8"}, []any{256})
+    expect(e1).not_().to_be_nil()
+    _, e2 := abi.encode_types([]str{"uint8"}, []any{-1})
+    expect(e2).not_().to_be_nil()
+    _, e3 := abi.encode_types([]str{"int8"}, []any{128})
+    expect(e3).not_().to_be_nil()
+    _, e4 := abi.encode_types([]str{"int8"}, []any{-129})
+    expect(e4).not_().to_be_nil()
+    _, e5 := abi.encode_types([]str{"uint256"}, []any{"-5"})
+    expect(e5).not_().to_be_nil()
+    _, e6 := abi.encode_types([]str{"uint256"}, []any{"12abc"})
+    expect(e6).not_().to_be_nil()
+    ok8, e7 := abi.encode_types([]str{"uint8", "int8"}, []any{255, -128})
+    expect(e7).to_be_nil()
+    expect(len(ok8)).to_equal(64)
+  })
+  it("accepts U256, int, decimal and hex strings", fn() {
+    a, _ := abi.encode_types([]str{"uint256"}, []any{web3.must_u256("1000")})
+    b, _ := abi.encode_types([]str{"uint256"}, []any{1000})
+    c, _ := abi.encode_types([]str{"uint256"}, []any{"1000"})
+    d, _ := abi.encode_types([]str{"uint256"}, []any{"0x3e8"})
+    expect(a == b && b == c && c == d).to_be_true()
+  })
+})
+
+describe("abi events", fn() {
+  it("decodes a real ERC-20 Transfer log", fn() {
+    a, _ := abi.parse_json(ERC20_JSON)
+    t0 := web3.must_hex("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+    t1 := web3.must_hex("0x000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045")
+    t2 := web3.must_hex("0x00000000000000000000000028c6c06298d514db089934071355e5743bf21d60")
+    l := &abi.Log{address: USDC, topics: []str{t0, t1, t2}, data: web3.must_hex("0x0000000000000000000000000000000000000000000000000000000005f5e100")}
+    ev, m, err := abi.decode_event_log(a, l)
+    expect(err).to_be_nil()
+    expect(ev.name).to_equal("Transfer")
+    expect(m["from"]).to_equal(VITALIK)
+    expect(m["to"]).to_equal("0x28C6c06298d514Db089934071355E5743bf21d60")
+    expect(u(m["value"])).to_equal("100000000")
+  })
+  it("encodes topics with wildcards", fn() {
+    a, _ := abi.parse_json(ERC20_JSON)
+    ts, err := abi.encode_event_topics(a.event("Transfer"), map[str]any{"to": VITALIK})
+    expect(err).to_be_nil()
+    expect(len(ts)).to_equal(3)
+    expect(hexs(ts[0])).to_equal("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+    expect(ts[1]).to_equal("")
+    expect(hexs(ts[2])).to_equal("0x000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045")
+  })
+  it("hashes indexed dynamic values and returns the hash when decoding", fn() {
+    a := abi.must_human([]str{"event Named(string indexed name, uint256[] indexed ids, bytes data)"})
+    ev := a.event("Named")
+    ts, err := abi.encode_event_topics(ev, map[str]any{"name": "caju", "ids": []any{1, 2}})
+    expect(err).to_be_nil()
+    expect(ts[1]).to_equal(web3.keccak256("caju"))
+    expect(ts[2]).to_equal(web3.keccak256(web3.from_int(1).bytes32() + web3.from_int(2).bytes32()))
+    data, _ := abi.encode_types([]str{"bytes"}, []any{"xyz"})
+    ev2, m, err2 := abi.decode_event_log(a, &abi.Log{topics: ts, data: data})
+    expect(err2).to_be_nil()
+    expect(ev2.name).to_equal("Named")
+    expect(m["name"]).to_equal(web3.keccak256("caju"))
+    expect(m["data"]).to_equal("xyz")
+  })
+  it("refuses logs that do not match", fn() {
+    a, _ := abi.parse_json(ERC20_JSON)
+    _, _, e1 := abi.decode_event_log(a, &abi.Log{topics: []str{web3.keccak256("Nope()")}})
+    expect(e1).not_().to_be_nil()
+    tt := web3.must_hex("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+    _, _, e2 := abi.decode_event_log(a, &abi.Log{topics: []str{tt}, data: web3.from_int(1).bytes32()})
+    expect(e2).not_().to_be_nil()
+    bad := web3.must_hex("0x010000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045")
+    _, _, e3 := abi.decode_event_log(a, &abi.Log{topics: []str{tt, bad, bad}, data: web3.from_int(1).bytes32()})
+    expect(e3).not_().to_be_nil()
+  })
+})
+
+describe("abi errors", fn() {
+  it("decodes Error(string)", fn() {
+    data := web3.must_hex("0x08c379a0" + w(0x20) + w(0x1a) + "4e6f7420656e6f7567682045746865722070726f76696465642e000000000000")
+    name, args, err := abi.decode_error_result(nil, data)
+    expect(err).to_be_nil()
+    expect(name).to_equal("Error")
+    expect(args[0]).to_equal("Not enough Ether provided.")
+  })
+  it("decodes Panic(0x11)", fn() {
+    name, args, err := abi.decode_error_result(nil, web3.must_hex("0x4e487b71" + w(0x11)))
+    expect(err).to_be_nil()
+    expect(name).to_equal("Panic")
+    code, _ := args[0].(*web3.U256).to_int()
+    expect(abi.panic_reason(code)).to_equal("arithmetic underflow or overflow")
+    expect(abi.panic_reason(0x12)).to_equal("division or modulo by zero")
+  })
+  it("decodes custom errors from the ABI", fn() {
+    a, _ := abi.parse_json(ERC20_JSON)
+    e := a.error_("ERC20InsufficientBalance")
+    data, _ := abi.encode_function_data(e, []any{VITALIK, 5, 10})
+    name, args, err := abi.decode_error_result(a, data)
+    expect(err).to_be_nil()
+    expect(name).to_equal("ERC20InsufficientBalance")
+    expect(args[0]).to_equal(VITALIK)
+    expect(u(args[2])).to_equal("10")
+    _, _, e2 := abi.decode_error_result(a, web3.must_hex("0xdeadbeef"))
+    expect(e2).not_().to_be_nil()
+    _, _, e3 := abi.decode_error_result(a, "ab")
+    expect(e3).not_().to_be_nil()
+  })
+})
+
+describe("abi.encode_packed", fn() {
+  it("follows the Solidity docs example", fn() {
+    d, err := abi.encode_packed([]str{"int16", "bytes1", "uint16", "string"}, []any{-1, web3.must_hex("0x42"), 3, "Hello, world!"})
+    expect(err).to_be_nil()
+    expect(hexs(d)).to_equal("0xffff42000348656c6c6f2c20776f726c6421")
+  })
+  it("packs addresses, bools and pads array elements to 32 bytes", fn() {
+    d, err := abi.encode_packed([]str{"address", "bool", "uint16[]"}, []any{VITALIK, true, []int{1, 2}})
+    expect(err).to_be_nil()
+    expect(hexs(d)).to_equal("0xd8da6bf26964af9d7eed9e03e53415d37aa9604501" + w(1) + w(2))
+    _, e2 := abi.encode_packed([]str{"string[]"}, []any{[]str{"a"}})
+    expect(e2).not_().to_be_nil()
+    _, e3 := abi.encode_packed([]str{"(uint8)"}, []any{[]any{1}})
+    expect(e3).not_().to_be_nil()
+  })
+})
+
+describe("abi functions and deploy", fn() {
+  it("encodes calls and decodes results of the ERC-20", fn() {
+    a, _ := abi.parse_json(ERC20_JSON)
+    d, err := abi.encode_function_data(a.function("transfer"), []any{"0xd8da6bf26964af9d7eed9e03e53415d37aa96045", 1000})
+    expect(err).to_be_nil()
+    expect(hexs(d)).to_equal("0xa9059cbb000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045" + w(1000))
+    r, err2 := abi.decode_function_result(a.function("name"), web3.must_hex(w(0x20) + w(4) + "5553444300000000000000000000000000000000000000000000000000000000"))
+    expect(err2).to_be_nil()
+    expect(r[0]).to_equal("USDC")
+    _, e3 := abi.encode_function_data(a.function("transfer"), []any{"0xD8DA6BF26964AF9D7EED9E03E53415D37AA9604", 1})
+    expect(e3).not_().to_be_nil()
+    _, e4 := abi.encode_function_data(a.function("transfer"), []any{VITALIK})
+    expect(e4).not_().to_be_nil()
+    _, _, e5 := abi.decode_function_data(a, web3.must_hex("0x12345678"))
+    expect(e5).not_().to_be_nil()
+  })
+  it("appends constructor arguments to the bytecode", fn() {
+    a, _ := abi.parse_json(ERC20_JSON)
+    code := web3.must_hex("0x6080604052")
+    d, err := abi.encode_deploy_data(a, code, []any{"Caju", "CJU"})
+    expect(err).to_be_nil()
+    expect(hexs(d)).to_equal("0x6080604052" + w(0x40) + w(0x80) + w(4) + "43616a7500000000000000000000000000000000000000000000000000000000" + w(3) + "434a550000000000000000000000000000000000000000000000000000000000")
+    b := abi.must_human([]str{"function f()"})
+    d2, _ := abi.encode_deploy_data(b, code, []any{})
+    expect(d2).to_equal(code)
+    _, e2 := abi.encode_deploy_data(b, code, []any{1})
+    expect(e2).not_().to_be_nil()
+  })
+})
+
+describe("abi round trips", fn() {
+  it("round-trips nested tuples and arrays", fn() {
+    types := []str{"(uint256 id, (string name, bytes32[2] tags)[] items, address owner)[]", "bool", "int24[3]", "bytes"}
+    item1 := []any{"alpha", []any{web3.keccak256("a"), web3.keccak256("b")}}
+    item2 := map[str]any{"name": "", "tags": []any{web3.zeros(32), web3.keccak256("c")}}
+    rec := map[str]any{"id": 7, "items": []any{item1, item2}, "owner": VITALIK}
+    vals := []any{[]any{rec, []any{8, []any{}, web3.ZERO_ADDRESS}}, false, []any{-8388608, 0, 8388607}, web3.zeros(33)}
+    d, err := abi.encode_types(types, vals)
+    expect(err).to_be_nil()
+    back, err2 := abi.decode_types(types, d)
+    expect(err2).to_be_nil()
+    again, err3 := abi.encode_types(types, back)
+    expect(err3).to_be_nil()
+    expect(again == d).to_be_true()
+    recs := back[0].([]any)
+    first := recs[0].([]any)
+    expect(u(first[0])).to_equal("7")
+    its := first[1].([]any)
+    expect(its[0].([]any)[0]).to_equal("alpha")
+    expect(its[1].([]any)[1].([]any)[1]).to_equal(web3.keccak256("c"))
+    expect(first[2]).to_equal(VITALIK)
+    expect(back[2].([]any)[0].(*web3.U256).signed_dec()).to_equal("-8388608")
+    expect(len(back[3].(str))).to_equal(33)
+  })
+  it("round-trips empty values", fn() {
+    types := []str{"string", "uint8[]", "()", "bytes[]"}
+    d, err := abi.encode_types(types, []any{"", []any{}, []any{}, []any{""}})
+    expect(err).to_be_nil()
+    back, err2 := abi.decode_types(types, d)
+    expect(err2).to_be_nil()
+    expect(back[0]).to_equal("")
+    expect(back[3]).to_equal([]any{""})
+  })
+  it("round-trips fixed arrays of dynamic values", fn() {
+    types := []str{"string[2]", "(bytes,uint8)[2][]"}
+    vals := []any{[]any{"a", "bc"}, []any{[]any{[]any{"x", 1}, []any{"", 2}}}}
+    d, err := abi.encode_types(types, vals)
+    expect(err).to_be_nil()
+    expect(hexs(d[0:64])).to_equal("0x" + w(0x40) + w(0x100))
+    back, err2 := abi.decode_types(types, d)
+    expect(err2).to_be_nil()
+    expect(back[0]).to_equal([]any{"a", "bc"})
+    again, _ := abi.encode_types(types, back)
+    expect(again == d).to_be_true()
+  })
+})
+
+describe("abi hostile data", fn() {
+  it("refuses truncated data without panicking", fn() {
+    full := web3.must_hex(G_HEX)
+    # the last string's 5 bytes end at len - 27: every shorter cut must fail
+    for n := 0; n < len(full) - 27; n++ {
+      _, err := abi.decode_types([]str{"uint256[][]", "string[]"}, full[0:n])
+      if err == nil { expect("cut " + str(n)).to_equal("an error") }
+    }
+  })
+  it("survives corrupted bytes", fn() {
+    full := web3.must_hex(G_HEX)
+    for i := 0; i < len(full); i++ {
+      bs := []byte(full)
+      bs[i] = byte(int(bs[i]) ^ 0xff)
+      abi.decode_types([]str{"uint256[][]", "string[]"}, string(bs))
+      bs[i] = byte(0x7f)
+      abi.decode_types([]str{"uint256[][]", "string[]"}, string(bs))
+    }
+    expect(true).to_be_true()
+  })
+  it("refuses offsets and lengths out of range", fn() {
+    _, e1 := abi.decode_types([]str{"string"}, web3.must_hex(w(0x1000)))
+    expect(e1).not_().to_be_nil()
+    _, e2 := abi.decode_types([]str{"bytes"}, web3.must_hex(w(0x20) + w(1000000)))
+    expect(e2).not_().to_be_nil()
+    _, e3 := abi.decode_types([]str{"uint256[]"}, web3.must_hex(w(0x20) + "ff" + strings.repeat("0", 62)))
+    expect(e3).not_().to_be_nil()
+    _, e4 := abi.decode_types([]str{"uint256[]"}, web3.must_hex(w(0x20) + w(3) + w(1)))
+    expect(e4).not_().to_be_nil()
+    _, e5 := abi.decode_types([]str{"uint256"}, "")
+    expect(e5).not_().to_be_nil()
+  })
+  it("refuses badly padded values", fn() {
+    _, e1 := abi.decode_types([]str{"bool"}, web3.must_hex(w(2)))
+    expect(e1).not_().to_be_nil()
+    _, e2 := abi.decode_types([]str{"address"}, web3.must_hex("01" + strings.repeat("0", 62)))
+    expect(e2).not_().to_be_nil()
+    _, e3 := abi.decode_types([]str{"uint8"}, web3.must_hex(w(256)))
+    expect(e3).not_().to_be_nil()
+    _, e4 := abi.decode_types([]str{"int8"}, web3.must_hex(w(0x80)))
+    expect(e4).not_().to_be_nil()
+    _, e5 := abi.decode_types([]str{"bytes2"}, web3.must_hex("abcdef" + strings.repeat("0", 58)))
+    expect(e5).not_().to_be_nil()
+    ok, e6 := abi.decode_types([]str{"int8", "bytes2"}, web3.must_hex(strings.repeat("f", 64) + "abcd" + strings.repeat("0", 60)))
+    expect(e6).to_be_nil()
+    expect(ok[1]).to_equal(web3.must_hex("0xabcd"))
+  })
+  it("limits work on offsets that point to the same data", fn() {
+    # a uint256[][] whose 4096 inner arrays all point at one array of 4096 items
+    parts := []str{w(0x20), w(4096)}
+    for i := 0; i < 4096; i++ { parts = append(parts, w(4096 * 32)) }
+    parts = append(parts, w(4096))
+    for j := 0; j < 4096; j++ { parts = append(parts, w(j)) }
+    _, err := abi.decode_types([]str{"uint256[][]"}, web3.must_hex(words(parts)))
+    expect(err).not_().to_be_nil()
+  })
+})

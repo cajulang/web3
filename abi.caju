@@ -1,0 +1,1197 @@
+# web3/abi: Solidity ABI encoding and decoding (import "github.com/cajulang/web3/abi").
+#
+#   a, _ := abi.parse_human([]str{"function transfer(address to, uint256 amount) returns (bool)"})
+#   data, _ := abi.encode_function_data(a.function("transfer"), []any{"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", 1000})
+#   web3.to_hex(data)    # "0xa9059cbb000...d8da6bf2...03e8"
+#
+# Values: uint<N>/int<N> decode to *web3.U256 (int<N> as two's complement) and encode from
+# *web3.U256, int or a decimal/hex str; address is an EIP-55 str; bool is bool; bytes, bytes<N> and
+# string are str (raw bytes, never hex); T[] and T[k] are []any; tuples are []any (positional),
+# and also map[str]any by component name when encoding. Everything encoded or decoded here is raw
+# bytes: use web3.to_hex / web3.must_hex at the edges.
+#
+# Decoding is strict and never panics on hostile data: offsets and lengths must stay inside the
+# data, bool must be 0/1, addresses and bytes<N> must be padded with zeros, uint<N>/int<N> must fit.
+
+import "github.com/cajulang/web3"
+import "std/strings"
+import "std/strconv"
+import "std/json"
+
+# ---------------------------------------------------------------- the ABI description
+
+# a parameter (input, output, event field or tuple component); type is the Solidity type as in
+# the JSON ABI ("uint256", "tuple[]" with components...)
+export struct Param {
+  name: str
+  type: str
+  components: []*Param
+  indexed: bool
+  internal_type: str
+}
+
+# one entry: kind is "function", "event", "error", "constructor", "fallback" or "receive"
+export struct Item {
+  kind: str
+  name: str
+  inputs: []*Param
+  outputs: []*Param
+  state_mutability: str
+  anonymous: bool
+}
+
+export struct Abi {
+  items: []*Item
+}
+
+# an event log as returned by eth_getLogs (topics are 32 raw bytes each; data is raw bytes)
+export struct Log {
+  address: str
+  topics: []str
+  data: str
+}
+
+# a parsed type
+struct Ty {
+  kind: str            # uint, int, address, bool, bytes, string, fixedbytes, array, tuple
+  size: int            # bits (uint/int), bytes (fixedbytes), length (array; -1 = dynamic)
+  elem: *Ty
+  comps: []*Ty
+  names: []str
+}
+
+const MAX_FIXED_ARRAY = 1 << 20
+
+fn err_(msg: str) -> error { return errors.New("abi: " + msg) }
+
+fn all_digits(s: str) -> bool {
+  if s == "" { return false }
+  for i := 0; i < len(s); i++ {
+    c := int(s[i])
+    if c < 48 || c > 57 { return false }
+  }
+  return true
+}
+
+# the number written in s with no sign nor leading zeros, or -1
+fn small_num(s: str) -> int {
+  if !all_digits(s) || len(s) > 9 { return -1 }
+  n, err := strconv.atoi(s)
+  if err != nil || str(n) != s { return -1 }
+  return n
+}
+
+fn elementary(b: str) -> (*Ty, error) {
+  switch b {
+  case "address": return &Ty{kind: "address"}, nil
+  case "bool": return &Ty{kind: "bool"}, nil
+  case "string": return &Ty{kind: "string"}, nil
+  case "bytes": return &Ty{kind: "bytes"}, nil
+  case "uint": return &Ty{kind: "uint", size: 256}, nil
+  case "int": return &Ty{kind: "int", size: 256}, nil
+  case "byte": return &Ty{kind: "fixedbytes", size: 1}, nil
+  }
+  if strings.has_prefix(b, "uint") {
+    n := small_num(b[4:])
+    if n >= 8 && n <= 256 && n % 8 == 0 { return &Ty{kind: "uint", size: n}, nil }
+  } else if strings.has_prefix(b, "int") {
+    n := small_num(b[3:])
+    if n >= 8 && n <= 256 && n % 8 == 0 { return &Ty{kind: "int", size: n}, nil }
+  } else if strings.has_prefix(b, "bytes") {
+    n := small_num(b[5:])
+    if n >= 1 && n <= 32 { return &Ty{kind: "fixedbytes", size: n}, nil }
+  }
+  return nil, err_("unknown type \"" + b + "\"")
+}
+
+# base followed by array suffixes ("[2][]")
+fn apply_suffix(base: *Ty, suf: str) -> (*Ty, error) {
+  t := base
+  s := strings.trim_space(suf)
+  while s != "" {
+    if int(s[0]) != '[' { return nil, err_("invalid type suffix \"" + suf + "\"") }
+    j := strings.index_byte(s, ']')
+    if j < 0 { return nil, err_("invalid type suffix \"" + suf + "\"") }
+    inner := strings.trim_space(s[1:j])
+    if inner == "" {
+      t = &Ty{kind: "array", size: -1, elem: t}
+    } else {
+      n := small_num(inner)
+      if n < 0 || n > MAX_FIXED_ARRAY { return nil, err_("invalid array length \"" + inner + "\"") }
+      t = &Ty{kind: "array", size: n, elem: t}
+    }
+    s = strings.trim_space(s[j + 1:])
+  }
+  return t, nil
+}
+
+# s split at the commas outside parentheses
+fn split_top(s: str) -> []str {
+  out := []str{}
+  depth := 0
+  start := 0
+  for i := 0; i < len(s); i++ {
+    c := int(s[i])
+    if c == '(' { depth++ }
+    if c == ')' { depth-- }
+    if c == ',' && depth == 0 {
+      out = append(out, s[start:i])
+      start = i + 1
+    }
+  }
+  return append(out, s[start:])
+}
+
+# the words of s separated by spaces outside parentheses
+fn words_top(s: str) -> []str {
+  out := []str{}
+  depth := 0
+  cur := []byte{}
+  for i := 0; i < len(s); i++ {
+    c := int(s[i])
+    if c == '(' { depth++ }
+    if c == ')' { depth-- }
+    if depth == 0 && strings.is_space(c) {
+      if len(cur) > 0 { out = append(out, string(cur)) }
+      cur = []byte{}
+    } else { cur = append(cur, s[i]) }
+  }
+  if len(cur) > 0 { out = append(out, string(cur)) }
+  return out
+}
+
+fn is_modifier(w: str) -> bool {
+  return w == "indexed" || w == "memory" || w == "calldata" || w == "storage" || w == "payable"
+}
+
+# a type string: "uint256", "bytes32[2]", "(address,uint256)[]", "tuple(uint256 a, bool b)"
+fn parse_type(s0: str) -> (*Ty, error) {
+  s := strings.trim_space(s0)
+  if s == "" { return nil, err_("empty type") }
+  if strings.has_prefix(s, "tuple(") { s = s[5:] }
+  if int(s[0]) == '(' {
+    depth := 0
+    close := -1
+    for i := 0; i < len(s); i++ {
+      c := int(s[i])
+      if c == '(' { depth++ }
+      if c == ')' {
+        depth--
+        if depth == 0 {
+          close = i
+          break
+        }
+      }
+    }
+    if close < 0 { return nil, err_("unbalanced parentheses in \"" + s0 + "\"") }
+    inner := s[1:close]
+    comps := []*Ty{}
+    names := []str{}
+    if strings.trim_space(inner) != "" {
+      for _, part := range split_top(inner) {
+        ws := words_top(part)
+        if len(ws) == 0 { return nil, err_("empty tuple component in \"" + s0 + "\"") }
+        nm := ""
+        if len(ws) > 1 && !is_modifier(ws[len(ws) - 1]) { nm = ws[len(ws) - 1] }
+        ct, err := parse_type(ws[0])
+        if err != nil { return nil, err }
+        comps = append(comps, ct)
+        names = append(names, nm)
+      }
+    }
+    return apply_suffix(&Ty{kind: "tuple", comps: comps, names: names}, s[close + 1:])
+  }
+  i := strings.index_byte(s, '[')
+  if i < 0 { i = len(s) }
+  base, err2 := elementary(strings.trim_space(s[0:i]))
+  if err2 != nil { return nil, err2 }
+  return apply_suffix(base, s[i:])
+}
+
+fn param_ty(p: *Param) -> (*Ty, error) {
+  if p == nil { return nil, err_("nil parameter") }
+  t := strings.trim_space(p.type)
+  if strings.has_prefix(t, "tuple") && !strings.has_prefix(t, "tuple(") {
+    comps := []*Ty{}
+    names := []str{}
+    for _, c := range p.components {
+      ct, err := param_ty(c)
+      if err != nil { return nil, err }
+      comps = append(comps, ct)
+      names = append(names, c.name)
+    }
+    return apply_suffix(&Ty{kind: "tuple", comps: comps, names: names}, t[5:])
+  }
+  return parse_type(t)
+}
+
+fn params_tys(ps: []*Param) -> ([]*Ty, error) {
+  out := []*Ty{}
+  for _, p := range ps {
+    t, err := param_ty(p)
+    if err != nil { return nil, err }
+    out = append(out, t)
+  }
+  return out, nil
+}
+
+fn types_tys(types: []str) -> ([]*Ty, error) {
+  out := []*Ty{}
+  for _, s := range types {
+    t, err := parse_type(s)
+    if err != nil { return nil, err }
+    out = append(out, t)
+  }
+  return out, nil
+}
+
+# the canonical name ("uint256", "(address,uint256)[]")
+fn canon(t: *Ty) -> str {
+  switch t.kind {
+  case "uint", "int": return t.kind + str(t.size)
+  case "fixedbytes": return "bytes" + str(t.size)
+  case "array":
+    if t.size < 0 { return canon(t.elem) + "[]" }
+    return canon(t.elem) + "[" + str(t.size) + "]"
+  case "tuple":
+    parts := []str{}
+    for _, c := range t.comps { parts = append(parts, canon(c)) }
+    return "(" + strings.join(parts, ",") + ")"
+  }
+  return t.kind
+}
+
+fn is_dynamic(t: *Ty) -> bool {
+  switch t.kind {
+  case "bytes", "string": return true
+  case "array":
+    if t.size < 0 { return true }
+    return is_dynamic(t.elem)
+  case "tuple":
+    for _, c := range t.comps { if is_dynamic(c) { return true } }
+  }
+  return false
+}
+
+# the size of the type in the head of a tuple
+fn head_size(t: *Ty) -> int {
+  if is_dynamic(t) { return 32 }
+  if t.kind == "tuple" {
+    n := 0
+    for _, c := range t.comps { n += head_size(c) }
+    if n > 1 << 40 { n = 1 << 40 }
+    return n
+  }
+  if t.kind == "array" {
+    h := head_size(t.elem)
+    if h > 0 && t.size > (1 << 40) / h { return 1 << 40 }
+    return t.size * h
+  }
+  return 32
+}
+
+# is it a value type (one word, decoded as is when indexed in an event)?
+fn is_value_type(t: *Ty) -> bool {
+  return t.kind == "uint" || t.kind == "int" || t.kind == "address" || t.kind == "bool" || t.kind == "fixedbytes"
+}
+
+# ---------------------------------------------------------------- signatures
+
+# the canonical type of a parameter ("(uint256,address)[]" for a tuple[])
+export fn canonical_type(p: *Param) -> str {
+  t, err := param_ty(p)
+  if err != nil { return p.type }
+  return canon(t)
+}
+
+# "transfer(address,uint256)"
+export fn signature(it: *Item) -> str {
+  parts := []str{}
+  for _, p := range it.inputs { parts = append(parts, canonical_type(p)) }
+  return it.name + "(" + strings.join(parts, ",") + ")"
+}
+
+# the 4-byte selector of a function or error (raw bytes)
+export fn selector(it: *Item) -> str { return web3.keccak256(signature(it))[0:4] }
+
+# the 32-byte topic0 of an event (raw bytes)
+export fn event_topic(it: *Item) -> str { return web3.keccak256(signature(it)) }
+
+# ---------------------------------------------------------------- lookups
+
+fn strip_spaces(s: str) -> str {
+  out := []byte{}
+  for i := 0; i < len(s); i++ {
+    if !strings.is_space(int(s[i])) { out = append(out, s[i]) }
+  }
+  return string(out)
+}
+
+fn (a: *Abi) find(kind: str, name: str) -> *Item {
+  if a == nil { return nil }
+  by_sig := strings.contains(name, "(")
+  want := strip_spaces(name)
+  for _, it := range a.items {
+    if it.kind != kind { continue }
+    if by_sig {
+      if signature(it) == want { return it }
+    } else if it.name == name { return it }
+  }
+  return nil
+}
+
+# the first function with that name, or the one with that signature ("transfer(address,uint256)")
+export fn (a: *Abi) function(name: str) -> *Item { return a.find("function", name) }
+export fn (a: *Abi) event(name: str) -> *Item { return a.find("event", name) }
+export fn (a: *Abi) error_(name: str) -> *Item { return a.find("error", name) }
+
+# the constructor, or nil
+export fn (a: *Abi) constructor_() -> *Item {
+  if a == nil { return nil }
+  for _, it := range a.items { if it.kind == "constructor" { return it } }
+  return nil
+}
+
+# ---------------------------------------------------------------- encoding
+
+fn pad32(s: str) -> str { return web3.pad_right(s, (len(s) + 31) / 32 * 32) }
+
+fn word_of(n: int) -> str { return web3.from_int(n).bytes32() }
+
+fn to_list(v: any) -> ([]any, error) {
+  switch x := v.(type) {
+  case []any: return x, nil
+  case []str:
+    l1 := []any{}
+    for _, e1 := range x { l1 = append(l1, e1) }
+    return l1, nil
+  case []int:
+    l2 := []any{}
+    for _, e2 := range x { l2 = append(l2, e2) }
+    return l2, nil
+  case []bool:
+    l3 := []any{}
+    for _, e3 := range x { l3 = append(l3, e3) }
+    return l3, nil
+  case []*web3.U256:
+    l4 := []any{}
+    for _, e4 := range x { l4 = append(l4, e4) }
+    return l4, nil
+  }
+  return nil, err_("expected a list, got " + str(v))
+}
+
+# the 32-byte word of an integer, checked against the type's range
+fn enc_int(t: *Ty, v: any) -> (str, error) {
+  neg := false
+  let u: *web3.U256 = nil
+  switch x := v.(type) {
+  case *web3.U256:
+    u = x
+  case int:
+    u = web3.from_int(x)
+    neg = x < 0
+  case str:
+    p, err := web3.parse_u256(x)
+    if err != nil { return "", err_("invalid " + canon(t) + " value \"" + x + "\"") }
+    u = p
+    neg = strings.has_prefix(strings.trim_space(x), "-") && !p.is_zero()
+  default:
+    return "", err_("expected an integer for " + canon(t) + ", got " + str(v))
+  }
+  if u == nil { return "", err_("nil value for " + canon(t)) }
+  if !int_fits(t, u) || (t.kind == "uint" && neg) { return "", err_("value out of range for " + canon(t)) }
+  return u.bytes32(), nil
+}
+
+fn int_fits(t: *Ty, u: *web3.U256) -> bool {
+  if t.size >= 256 { return true }
+  if t.kind == "uint" { return u.shr(t.size).is_zero() }
+  hi := u.shr(t.size - 1)
+  return hi.is_zero() || hi.eq(web3.max_u256().shr(t.size - 1))
+}
+
+fn enc_value(t: *Ty, v: any) -> (str, error) {
+  switch t.kind {
+  case "uint", "int": return enc_int(t, v)
+  case "address":
+    s, ok := v.(str)
+    if !ok || !web3.is_address(s) { return "", err_("invalid address " + str(v)) }
+    b, err := web3.address_bytes(s)
+    if err != nil { return "", err }
+    return web3.pad_left(b, 32), nil
+  case "bool":
+    bv, ok2 := v.(bool)
+    if !ok2 { return "", err_("expected a bool, got " + str(v)) }
+    if bv { return word_of(1), nil }
+    return word_of(0), nil
+  case "fixedbytes":
+    fb, ok3 := v.(str)
+    if !ok3 || len(fb) != t.size { return "", err_("expected " + str(t.size) + " raw bytes for " + canon(t)) }
+    return web3.pad_right(fb, 32), nil
+  case "bytes", "string":
+    sb, ok4 := v.(str)
+    if !ok4 { return "", err_("expected a str for " + t.kind + ", got " + str(v)) }
+    return word_of(len(sb)) + pad32(sb), nil
+  case "array":
+    items, err5 := to_list(v)
+    if err5 != nil { return "", err5 }
+    if t.size >= 0 && len(items) != t.size { return "", err_(canon(t) + " needs " + str(t.size) + " items, got " + str(len(items))) }
+    tys := make([]*Ty, len(items))
+    for i := 0; i < len(items); i++ { tys[i] = t.elem }
+    body, err6 := enc_tuple(tys, items)
+    if err6 != nil { return "", err6 }
+    if t.size < 0 { return word_of(len(items)) + body, nil }
+    return body, nil
+  case "tuple":
+    vals, err7 := tuple_values(t, v)
+    if err7 != nil { return "", err7 }
+    return enc_tuple(t.comps, vals)
+  }
+  return "", err_("cannot encode " + t.kind)
+}
+
+# the values of a tuple, given as []any or as map[str]any by component name
+fn tuple_values(t: *Ty, v: any) -> ([]any, error) {
+  if m, ok := v.(map[str]any); ok {
+    out := []any{}
+    for i, nm := range t.names {
+      x, has := m[nm]
+      if nm == "" || !has { return nil, err_("missing tuple component \"" + nm + "\" (" + str(i) + ")") }
+      out = append(out, x)
+    }
+    return out, nil
+  }
+  return to_list(v)
+}
+
+fn enc_tuple(tys: []*Ty, vals: []any) -> (str, error) {
+  if len(vals) != len(tys) { return "", err_("expected " + str(len(tys)) + " values, got " + str(len(vals))) }
+  head_len := 0
+  for _, t := range tys { head_len += head_size(t) }
+  heads := []str{}
+  tails := []str{}
+  tail_len := 0
+  for i, t2 := range tys {
+    enc, err := enc_value(t2, vals[i])
+    if err != nil { return "", err }
+    if is_dynamic(t2) {
+      heads = append(heads, word_of(head_len + tail_len))
+      tails = append(tails, enc)
+      tail_len += len(enc)
+    } else {
+      heads = append(heads, enc)
+    }
+  }
+  return strings.join(heads, "") + strings.join(tails, ""), nil
+}
+
+# the ABI encoding of values for the parameters (raw bytes)
+export fn encode(params: []*Param, values: []any) -> (str, error) {
+  tys, err := params_tys(params)
+  if err != nil { return "", err }
+  return enc_tuple(tys, values)
+}
+
+# like encode, with type strings ("uint256", "(address,uint256)[]")
+export fn encode_types(types: []str, values: []any) -> (str, error) {
+  tys, err := types_tys(types)
+  if err != nil { return "", err }
+  return enc_tuple(tys, values)
+}
+
+# ---------------------------------------------------------------- decoding
+
+struct Dec {
+  data: str
+  budget: int
+}
+
+fn new_dec(data: str) -> *Dec { return &Dec{data: data, budget: len(data) / 8 + 1024} }
+
+fn (d: *Dec) word(pos: int) -> (str, error) {
+  if pos < 0 || pos + 32 > len(d.data) { return "", err_("data too short (reading 32 bytes at " + str(pos) + " of " + str(len(d.data)) + ")") }
+  return d.data[pos:pos + 32], nil
+}
+
+# a word as a small non-negative int (below 2^32), or -1
+fn word_small(w: str) -> int {
+  for i := 0; i < 28; i++ { if int(w[i]) != 0 { return -1 } }
+  return (int(w[28]) << 24) | (int(w[29]) << 16) | (int(w[30]) << 8) | int(w[31])
+}
+
+# a length at pos: it must fit in the data
+fn (d: *Dec) length(pos: int) -> (int, error) {
+  w, err := d.word(pos)
+  if err != nil { return 0, err }
+  n := word_small(w)
+  if n < 0 || n > len(d.data) { return 0, err_("length out of range at " + str(pos)) }
+  return n, nil
+}
+
+# a one-word value
+fn decode_word(t: *Ty, w: str) -> (any, error) {
+  switch t.kind {
+  case "uint", "int":
+    u := web3.from_bytes(w)
+    if !int_fits(t, u) { return nil, err_("value out of range for " + canon(t)) }
+    return u, nil
+  case "address":
+    for i := 0; i < 12; i++ { if int(w[i]) != 0 { return nil, err_("invalid address padding") } }
+    return web3.address_from_bytes(w[12:]), nil
+  case "bool":
+    for j := 0; j < 31; j++ { if int(w[j]) != 0 { return nil, err_("invalid bool") } }
+    b := int(w[31])
+    if b > 1 { return nil, err_("invalid bool") }
+    return b == 1, nil
+  case "fixedbytes":
+    for k := t.size; k < 32; k++ { if int(w[k]) != 0 { return nil, err_("invalid " + canon(t) + " padding") } }
+    return w[0:t.size], nil
+  }
+  return nil, err_("not a one-word type: " + canon(t))
+}
+
+fn (d: *Dec) value(t: *Ty, pos: int) -> (any, error) {
+  d.budget--
+  if d.budget < 0 { return nil, err_("data too complex") }
+  switch t.kind {
+  case "uint", "int", "address", "bool", "fixedbytes":
+    w, err := d.word(pos)
+    if err != nil { return nil, err }
+    return decode_word(t, w)
+  case "bytes", "string":
+    n, err2 := d.length(pos)
+    if err2 != nil { return nil, err2 }
+    if pos + 32 + n > len(d.data) { return nil, err_(t.kind + " runs past the end of the data") }
+    return d.data[pos + 32:pos + 32 + n], nil
+  case "array":
+    n2 := t.size
+    start := pos
+    if n2 < 0 {
+      m, err3 := d.length(pos)
+      if err3 != nil { return nil, err3 }
+      n2 = m
+      start = pos + 32
+      hs := head_size(t.elem)
+      if hs > 0 && n2 > (len(d.data) - start) / hs { return nil, err_("array length out of range at " + str(pos)) }
+      if n2 > d.budget { return nil, err_("data too complex") }
+    }
+    tys := make([]*Ty, n2)
+    for i := 0; i < n2; i++ { tys[i] = t.elem }
+    r, err4 := d.tuple(tys, start)
+    if err4 != nil { return nil, err4 }
+    return r, nil
+  case "tuple":
+    r2, err5 := d.tuple(t.comps, pos)
+    if err5 != nil { return nil, err5 }
+    return r2, nil
+  }
+  return nil, err_("cannot decode " + t.kind)
+}
+
+fn (d: *Dec) tuple(tys: []*Ty, base: int) -> ([]any, error) {
+  out := make([]any, len(tys))
+  pos := base
+  for i, t := range tys {
+    if is_dynamic(t) {
+      w, err := d.word(pos)
+      if err != nil { return nil, err }
+      off := word_small(w)
+      if off < 0 || base + off > len(d.data) { return nil, err_("offset out of range at " + str(pos)) }
+      v, err2 := d.value(t, base + off)
+      if err2 != nil { return nil, err2 }
+      out[i] = v
+    } else {
+      v2, err3 := d.value(t, pos)
+      if err3 != nil { return nil, err3 }
+      out[i] = v2
+    }
+    pos += head_size(t)
+  }
+  return out, nil
+}
+
+# the values of ABI-encoded data (raw bytes) for the parameters
+export fn decode(params: []*Param, data: str) -> ([]any, error) {
+  tys, err := params_tys(params)
+  if err != nil { return nil, err }
+  return new_dec(data).tuple(tys, 0)
+}
+
+# like decode, with type strings
+export fn decode_types(types: []str, data: str) -> ([]any, error) {
+  tys, err := types_tys(types)
+  if err != nil { return nil, err }
+  return new_dec(data).tuple(tys, 0)
+}
+
+# ---------------------------------------------------------------- functions, results, deploy
+
+# selector + the encoded arguments
+export fn encode_function_data(it: *Item, args: []any) -> (str, error) {
+  if it == nil { return "", err_("nil function") }
+  enc, err := encode(it.inputs, args)
+  if err != nil { return "", err }
+  return selector(it) + enc, nil
+}
+
+# the function of a's whose selector starts data, and its arguments
+export fn decode_function_data(a: *Abi, data: str) -> (*Item, []any, error) {
+  if len(data) < 4 { return nil, nil, err_("data shorter than a selector") }
+  sel := data[0:4]
+  if a != nil {
+    for _, it := range a.items {
+      if it.kind == "function" && selector(it) == sel {
+        args, err := decode(it.inputs, data[4:])
+        if err != nil { return nil, nil, err }
+        return it, args, nil
+      }
+    }
+  }
+  return nil, nil, err_("no function with selector " + web3.to_hex(sel))
+}
+
+# the values a function returned
+export fn decode_function_result(it: *Item, data: str) -> ([]any, error) {
+  if it == nil { return nil, err_("nil function") }
+  return decode(it.outputs, data)
+}
+
+# contract creation data: the bytecode (raw bytes) followed by the constructor arguments
+export fn encode_deploy_data(a: *Abi, bytecode: str, args: []any) -> (str, error) {
+  c := a.constructor_()
+  if c == nil {
+    if len(args) > 0 { return "", err_("the ABI has no constructor, but arguments were given") }
+    return bytecode, nil
+  }
+  enc, err := encode(c.inputs, args)
+  if err != nil { return "", err }
+  return bytecode + enc, nil
+}
+
+# ---------------------------------------------------------------- errors
+
+let ERROR_ITEM = &Item{kind: "error", name: "Error", inputs: []*Param{&Param{name: "message", type: "string"}}}
+let PANIC_ITEM = &Item{kind: "error", name: "Panic", inputs: []*Param{&Param{name: "code", type: "uint256"}}}
+
+# the meaning of a Panic(uint256) code
+export fn panic_reason(code: int) -> str {
+  switch code {
+  case 0x00: return "generic compiler panic"
+  case 0x01: return "assert(false)"
+  case 0x11: return "arithmetic underflow or overflow"
+  case 0x12: return "division or modulo by zero"
+  case 0x21: return "enum conversion out of bounds"
+  case 0x22: return "invalid storage byte array encoding"
+  case 0x31: return "pop on an empty array"
+  case 0x32: return "array index out of bounds"
+  case 0x41: return "out of memory"
+  case 0x51: return "call to a zero-initialized function pointer"
+  }
+  return "unknown panic code " + str(code)
+}
+
+# the error in revert data: Error(string) is "Error" with [message], Panic(uint256) is "Panic" with
+# [code] (see panic_reason), and the custom errors of a (which may be nil)
+export fn decode_error_result(a: *Abi, data: str) -> (str, []any, error) {
+  if len(data) < 4 { return "", nil, err_("revert data shorter than a selector") }
+  sel := data[0:4]
+  cands := []*Item{ERROR_ITEM, PANIC_ITEM}
+  if a != nil {
+    for _, it := range a.items { if it.kind == "error" { cands = append(cands, it) } }
+  }
+  for _, c := range cands {
+    if selector(c) == sel {
+      args, err := decode(c.inputs, data[4:])
+      if err != nil { return "", nil, err }
+      return c.name, args, nil
+    }
+  }
+  return "", nil, err_("unknown error selector " + web3.to_hex(sel))
+}
+
+# ---------------------------------------------------------------- events
+
+# the in-place encoding used to hash indexed arrays and tuples
+fn topic_inplace(t: *Ty, v: any) -> (str, error) {
+  switch t.kind {
+  case "bytes", "string":
+    s, ok := v.(str)
+    if !ok { return "", err_("expected a str for " + t.kind) }
+    return pad32(s), nil
+  case "array":
+    items, err := to_list(v)
+    if err != nil { return "", err }
+    if t.size >= 0 && len(items) != t.size { return "", err_(canon(t) + " needs " + str(t.size) + " items") }
+    parts := []str{}
+    for _, x := range items {
+      e, err2 := topic_inplace(t.elem, x)
+      if err2 != nil { return "", err2 }
+      parts = append(parts, e)
+    }
+    return strings.join(parts, ""), nil
+  case "tuple":
+    vals, err3 := tuple_values(t, v)
+    if err3 != nil { return "", err3 }
+    if len(vals) != len(t.comps) { return "", err_("expected " + str(len(t.comps)) + " tuple values") }
+    parts2 := []str{}
+    for i, c := range t.comps {
+      e2, err4 := topic_inplace(c, vals[i])
+      if err4 != nil { return "", err4 }
+      parts2 = append(parts2, e2)
+    }
+    return strings.join(parts2, ""), nil
+  }
+  return enc_value(t, v)
+}
+
+fn encode_topic(t: *Ty, v: any) -> (str, error) {
+  if is_value_type(t) { return enc_value(t, v) }
+  if t.kind == "bytes" || t.kind == "string" {
+    s, ok := v.(str)
+    if !ok { return "", err_("expected a str for " + t.kind) }
+    return web3.keccak256(s), nil
+  }
+  enc, err := topic_inplace(t, v)
+  if err != nil { return "", err }
+  return web3.keccak256(enc), nil
+}
+
+# the key of a parameter in event maps: its name, or its position when unnamed
+fn param_key(p: *Param, i: int) -> str {
+  if p.name != "" { return p.name }
+  return str(i)
+}
+
+# the topics that filter for an event: topic0 (unless anonymous) and one per indexed input, from
+# args by name; a nil or missing value is a wildcard (""). Raw 32-byte topics.
+export fn encode_event_topics(it: *Item, args: map[str]any) -> ([]str, error) {
+  if it == nil { return nil, err_("nil event") }
+  topics := []str{}
+  if !it.anonymous { topics = append(topics, event_topic(it)) }
+  for i, p := range it.inputs {
+    if !p.indexed { continue }
+    t, err := param_ty(p)
+    if err != nil { return nil, err }
+    v, has := args[param_key(p, i)]
+    if !has || v == nil {
+      topics = append(topics, "")
+      continue
+    }
+    enc, err2 := encode_topic(t, v)
+    if err2 != nil { return nil, err2 }
+    topics = append(topics, enc)
+  }
+  return topics, nil
+}
+
+fn count_indexed(it: *Item) -> int {
+  n := 0
+  for _, p := range it.inputs { if p.indexed { n++ } }
+  return n
+}
+
+fn decode_log_with(it: *Item, topics: []str, data: str) -> (map[str]any, error) {
+  if len(topics) != count_indexed(it) { return nil, err_("event " + it.name + " expects " + str(count_indexed(it)) + " indexed topics, got " + str(len(topics))) }
+  out := map[str]any{}
+  rest := []*Param{}
+  rest_keys := []str{}
+  k := 0
+  for i, p := range it.inputs {
+    if !p.indexed {
+      rest = append(rest, p)
+      rest_keys = append(rest_keys, param_key(p, i))
+      continue
+    }
+    t, err := param_ty(p)
+    if err != nil { return nil, err }
+    topic := topics[k]
+    k++
+    if len(topic) != 32 { return nil, err_("a topic must have 32 bytes") }
+    if is_value_type(t) {
+      v, err2 := decode_word(t, topic)
+      if err2 != nil { return nil, err2 }
+      out[param_key(p, i)] = v
+    } else {
+      out[param_key(p, i)] = topic
+    }
+  }
+  vals, err3 := decode(rest, data)
+  if err3 != nil { return nil, err3 }
+  for j, key := range rest_keys { out[key] = vals[j] }
+  return out, nil
+}
+
+# the event of a's that produced the log, and its fields by name (unnamed ones by position).
+# Indexed bytes, string, arrays and tuples come back as their 32-byte hash.
+export fn decode_event_log(a: *Abi, l: *Log) -> (*Item, map[str]any, error) {
+  if l == nil { return nil, nil, err_("nil log") }
+  if a == nil { return nil, nil, err_("nil ABI") }
+  if len(l.topics) > 0 {
+    for _, it := range a.items {
+      if it.kind == "event" && !it.anonymous && event_topic(it) == l.topics[0] {
+        m, err := decode_log_with(it, l.topics[1:], l.data)
+        if err != nil { return nil, nil, err }
+        return it, m, nil
+      }
+    }
+  }
+  for _, it2 := range a.items {
+    if it2.kind == "event" && it2.anonymous && count_indexed(it2) == len(l.topics) {
+      m2, err2 := decode_log_with(it2, l.topics, l.data)
+      if err2 == nil { return it2, m2, nil }
+    }
+  }
+  if len(l.topics) == 0 { return nil, nil, err_("log without topics and no matching anonymous event") }
+  return nil, nil, err_("no event with topic " + web3.to_hex(l.topics[0]))
+}
+
+# ---------------------------------------------------------------- encodePacked
+
+fn packed(t: *Ty, v: any, in_array: bool) -> (str, error) {
+  switch t.kind {
+  case "uint", "int":
+    w, err := enc_int(t, v)
+    if err != nil { return "", err }
+    if in_array { return w, nil }
+    return w[32 - t.size / 8:], nil
+  case "address":
+    w2, err2 := enc_value(t, v)
+    if err2 != nil { return "", err2 }
+    if in_array { return w2, nil }
+    return w2[12:], nil
+  case "bool":
+    w3, err3 := enc_value(t, v)
+    if err3 != nil { return "", err3 }
+    if in_array { return w3, nil }
+    return w3[31:], nil
+  case "fixedbytes":
+    w4, err4 := enc_value(t, v)
+    if err4 != nil { return "", err4 }
+    if in_array { return w4, nil }
+    return w4[0:t.size], nil
+  case "bytes", "string":
+    if in_array { return "", err_("encode_packed does not support " + t.kind + " inside arrays") }
+    s, ok := v.(str)
+    if !ok { return "", err_("expected a str for " + t.kind) }
+    return s, nil
+  case "array":
+    items, err5 := to_list(v)
+    if err5 != nil { return "", err5 }
+    if t.size >= 0 && len(items) != t.size { return "", err_(canon(t) + " needs " + str(t.size) + " items") }
+    parts := []str{}
+    for _, x := range items {
+      e, err6 := packed(t.elem, x, true)
+      if err6 != nil { return "", err6 }
+      parts = append(parts, e)
+    }
+    return strings.join(parts, ""), nil
+  }
+  return "", err_("encode_packed does not support " + canon(t))
+}
+
+# abi.encodePacked: values in their minimal size, bytes/string as is, array elements padded to 32
+export fn encode_packed(types: []str, values: []any) -> (str, error) {
+  if len(types) != len(values) { return "", err_("expected " + str(len(types)) + " values, got " + str(len(values))) }
+  tys, err := types_tys(types)
+  if err != nil { return "", err }
+  parts := []str{}
+  for i, t := range tys {
+    e, err2 := packed(t, values[i], false)
+    if err2 != nil { return "", err2 }
+    parts = append(parts, e)
+  }
+  return strings.join(parts, ""), nil
+}
+
+# ---------------------------------------------------------------- JSON ABI
+
+fn json_param(v: *json.Value) -> (*Param, error) {
+  if v == nil || v.kind != "object" { return nil, err_("a parameter must be an object") }
+  p := &Param{name: v.get_str("name", ""), type: v.get_str("type", ""), indexed: v.get_bool("indexed", false), internal_type: v.get_str("internalType", "")}
+  for _, c := range v.get_array("components") {
+    cp, err := json_param(c)
+    if err != nil { return nil, err }
+    p.components = append(p.components, cp)
+  }
+  if _, err2 := param_ty(p); err2 != nil { return nil, err2 }
+  return p, nil
+}
+
+fn json_params(vs: []*json.Value) -> ([]*Param, error) {
+  out := []*Param{}
+  for _, v := range vs {
+    p, err := json_param(v)
+    if err != nil { return nil, err }
+    out = append(out, p)
+  }
+  return out, nil
+}
+
+# a JSON ABI as solc, Etherscan or Hardhat/Foundry artifacts (an object with "abi") write it
+export fn parse_json(text: str) -> (*Abi, error) {
+  root, err := json.parse(text)
+  if err != nil { return nil, err_("invalid JSON: " + err.Error()) }
+  if root.kind == "object" { root = root.field("abi") }
+  if root == nil || root.kind != "array" { return nil, err_("a JSON ABI must be an array") }
+  a := &Abi{}
+  for _, e := range root.items {
+    if e.kind != "object" { return nil, err_("an ABI entry must be an object") }
+    it := &Item{kind: e.get_str("type", "function"), name: e.get_str("name", ""), state_mutability: e.get_str("stateMutability", ""), anonymous: e.get_bool("anonymous", false)}
+    switch it.kind {
+    case "function", "event", "error", "constructor", "fallback", "receive":
+    default:
+      return nil, err_("unknown ABI entry type \"" + it.kind + "\"")
+    }
+    ins, err2 := json_params(e.get_array("inputs"))
+    if err2 != nil { return nil, err2 }
+    outs, err3 := json_params(e.get_array("outputs"))
+    if err3 != nil { return nil, err3 }
+    it.inputs = ins
+    it.outputs = outs
+    if it.state_mutability == "" && it.kind != "event" && it.kind != "error" {
+      if e.get_bool("constant", false) {
+        it.state_mutability = "view"
+      } else if e.get_bool("payable", false) || it.kind == "receive" {
+        it.state_mutability = "payable"
+      } else { it.state_mutability = "nonpayable" }
+    }
+    a.items = append(a.items, it)
+  }
+  return a, nil
+}
+
+# ---------------------------------------------------------------- human-readable ABI
+
+fn is_ident_char(c: int) -> bool {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '$'
+}
+
+fn tokenize(line: str) -> ([]str, error) {
+  toks := []str{}
+  i := 0
+  while i < len(line) {
+    c := int(line[i])
+    if strings.is_space(c) {
+      i++
+    } else if is_ident_char(c) {
+      j := i
+      while j < len(line) && is_ident_char(int(line[j])) { j++ }
+      toks = append(toks, line[i:j])
+      i = j
+    } else if c == '(' || c == ')' || c == ',' || c == '[' || c == ']' || c == '{' || c == '}' || c == ';' {
+      toks = append(toks, line[i:i + 1])
+      i++
+    } else {
+      return nil, err_("unexpected character in \"" + line + "\"")
+    }
+  }
+  return toks, nil
+}
+
+struct HP {
+  toks: []str
+  i: int
+  line: str
+  structs: map[str][]str        # struct name -> body tokens
+  cache: map[str][]*Param
+  depth: int
+}
+
+fn (h: *HP) peek() -> str {
+  if h.i < len(h.toks) { return h.toks[h.i] }
+  return ""
+}
+
+fn (h: *HP) next() -> str {
+  t := h.peek()
+  if h.i < len(h.toks) { h.i++ }
+  return t
+}
+
+fn (h: *HP) fail(msg: str) -> error { return err_(msg + " in \"" + h.line + "\"") }
+
+fn (h: *HP) expect(t: str) -> error {
+  if h.next() != t { return h.fail("expected \"" + t + "\"") }
+  return nil
+}
+
+fn (h: *HP) struct_params(name: str) -> ([]*Param, error) {
+  if ps, ok := h.cache[name]; ok { return ps, nil }
+  if h.depth > 32 { return nil, h.fail("struct " + name + " is recursive") }
+  body := h.structs[name]
+  sub := &HP{toks: body, line: "struct " + name, structs: h.structs, cache: h.cache, depth: h.depth + 1}
+  out := []*Param{}
+  while sub.peek() != "" {
+    p, err := sub.param()
+    if err != nil { return nil, err }
+    out = append(out, p)
+    if err2 := sub.expect(";"); err2 != nil { return nil, err2 }
+  }
+  h.cache[name] = out
+  return out, nil
+}
+
+# a parameter: type [indexed] [memory|calldata|storage] [name]
+fn (h: *HP) param() -> (*Param, error) {
+  p := &Param{}
+  t := h.peek()
+  if t == "(" || (t == "tuple" && h.i + 1 < len(h.toks) && h.toks[h.i + 1] == "(") {
+    if t == "tuple" { h.next() }
+    comps, err := h.params(false)
+    if err != nil { return nil, err }
+    p.type = "tuple"
+    p.components = comps
+  } else if t == "" || !is_ident_char(int(t[0])) {
+    return nil, h.fail("expected a type")
+  } else {
+    h.next()
+    if _, is_struct := h.structs[t]; is_struct {
+      comps2, err2 := h.struct_params(t)
+      if err2 != nil { return nil, err2 }
+      p.type = "tuple"
+      p.components = comps2
+      p.internal_type = "struct " + t
+    } else {
+      p.type = t
+      if t == "uint" { p.type = "uint256" }
+      if t == "int" { p.type = "int256" }
+    }
+  }
+  # array suffixes
+  while h.peek() == "[" {
+    h.next()
+    if h.peek() == "]" {
+      h.next()
+      p.type = p.type + "[]"
+    } else {
+      n := h.next()
+      if err3 := h.expect("]"); err3 != nil { return nil, err3 }
+      p.type = p.type + "[" + n + "]"
+    }
+  }
+  if p.internal_type != "" && p.type != "tuple" { p.internal_type = p.internal_type + p.type[5:] }
+  while true {
+    w := h.peek()
+    if w == "indexed" {
+      p.indexed = true
+      h.next()
+    } else if w == "memory" || w == "calldata" || w == "storage" || w == "payable" {
+      h.next()
+    } else { break }
+  }
+  w2 := h.peek()
+  if w2 != "" && is_ident_char(int(w2[0])) {
+    p.name = w2
+    h.next()
+  }
+  if _, err4 := param_ty(p); err4 != nil { return nil, h.fail(err4.Error()) }
+  return p, nil
+}
+
+# "(" param, ... ")"
+fn (h: *HP) params(named_ok: bool) -> ([]*Param, error) {
+  if err := h.expect("("); err != nil { return nil, err }
+  out := []*Param{}
+  if h.peek() == ")" {
+    h.next()
+    return out, nil
+  }
+  while true {
+    p, err2 := h.param()
+    if err2 != nil { return nil, err2 }
+    out = append(out, p)
+    t := h.next()
+    if t == ")" { break }
+    if t != "," { return nil, h.fail("expected \",\" or \")\"") }
+  }
+  return out, nil
+}
+
+fn (h: *HP) item() -> (*Item, error) {
+  kind := h.next()
+  it := &Item{kind: kind}
+  switch kind {
+  case "function", "event", "error":
+    it.name = h.next()
+    if it.name == "" || !is_ident_char(int(it.name[0])) { return nil, h.fail("expected a name") }
+    ins, err := h.params(true)
+    if err != nil { return nil, err }
+    it.inputs = ins
+  case "constructor":
+    ins2, err2 := h.params(true)
+    if err2 != nil { return nil, err2 }
+    it.inputs = ins2
+  case "fallback", "receive":
+    if h.peek() == "(" {
+      ins3, err3 := h.params(true)
+      if err3 != nil { return nil, err3 }
+      it.inputs = ins3
+    }
+  default:
+    return nil, h.fail("unknown kind \"" + kind + "\"")
+  }
+  if kind != "event" && kind != "error" {
+    it.state_mutability = "nonpayable"
+    if kind == "receive" { it.state_mutability = "payable" }
+  }
+  while h.peek() != "" {
+    w := h.next()
+    switch w {
+    case "view", "pure", "payable", "nonpayable":
+      it.state_mutability = w
+    case "constant":
+      it.state_mutability = "view"
+    case "external", "public", "internal", "virtual", "override", ";":
+    case "anonymous":
+      it.anonymous = true
+    case "returns":
+      outs, err4 := h.params(true)
+      if err4 != nil { return nil, err4 }
+      it.outputs = outs
+    default:
+      return nil, h.fail("unexpected \"" + w + "\"")
+    }
+  }
+  return it, nil
+}
+
+# a human-readable ABI, as in viem/ethers: "function balanceOf(address owner) view returns (uint256)",
+# "event Transfer(address indexed from, address indexed to, uint256 value)",
+# "error Insufficient(uint256 available)", "constructor(string name)", tuples as "(uint256 a, address b)"
+# or "tuple(uint256,address)[]", and "struct Point { uint256 x; uint256 y; }" lines (in any order)
+# used as types by name. Empty lines and lines starting with "#" or "//" are skipped.
+export fn parse_human(lines: []str) -> (*Abi, error) {
+  structs := map[str][]str{}
+  rest := []str{}
+  rest_toks := [][]str{}
+  for _, line := range lines {
+    l := strings.trim_space(line)
+    if l == "" || strings.has_prefix(l, "#") || strings.has_prefix(l, "//") { continue }
+    toks, err := tokenize(l)
+    if err != nil { return nil, err }
+    if toks[0] == "struct" {
+      if len(toks) < 4 || toks[2] != "{" || toks[len(toks) - 1] != "}" { return nil, err_("invalid struct \"" + l + "\"") }
+      structs[toks[1]] = toks[3:len(toks) - 1]
+      continue
+    }
+    rest = append(rest, l)
+    rest_toks = append(rest_toks, toks)
+  }
+  cache := map[str][]*Param{}
+  a := &Abi{}
+  for i, l2 := range rest {
+    h := &HP{toks: rest_toks[i], line: l2, structs: structs, cache: cache}
+    it, err2 := h.item()
+    if err2 != nil { return nil, err2 }
+    a.items = append(a.items, it)
+  }
+  return a, nil
+}
+
+# like parse_human, for literals known to be valid (panics otherwise)
+export fn must_human(lines: []str) -> *Abi {
+  a, err := parse_human(lines)
+  if err != nil { panic(err.Error()) }
+  return a
+}
