@@ -1,0 +1,312 @@
+# The wallet client against a fake page: caju-ui's fakedom records the ui.call ops (ui.eth.*) and
+# the tests answer them as the page runtime would, and send the wallet's events as page events.
+import { describe, it, expect } from "std/testing"
+import "std/json"
+import "github.com/cajulang/ui"
+import "github.com/cajulang/ui/testdata/fakedom"
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/wallet"
+
+const ALICE = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+const BOB = "0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B"
+
+struct Sent {
+  id: str
+  method: str
+  params: *json.Value
+}
+
+fn page() -> (*ui.Renderer, *fakedom.Dom) {
+  d := fakedom.new_dom()
+  r := ui.new_renderer("#app", fn(b: str) { d.apply(b) })
+  r.render(ui.h("div", nil, nil))
+  return r, d
+}
+
+# the i-th call the page got: its id, function and argument decoded (for ui.eth.request)
+fn sent(d: *fakedom.Dom, i: int) -> (int, str, Sent) {
+  id, name, arg := d.call_at(i)
+  s := Sent{}
+  json.unmarshal(arg, &s)
+  return id, name, s
+}
+
+fn reply(r: *ui.Renderer, id: int, text: str) {
+  r.handle(fakedom.reply_msg(id, text))
+  r.work()
+}
+
+fn metamask() -> *wallet.ProviderInfo {
+  return &wallet.ProviderInfo{id: "uuid-mm", name: "MetaMask", rdns: "io.metamask", is_metamask: true}
+}
+
+describe("finding wallets", fn() {
+  it("lists the page's providers and picks MetaMask by rdns", fn() {
+    r, d := page()
+    got := []*wallet.ProviderInfo{}
+    var_mm := ""
+    wallet.providers(fn(list: []*wallet.ProviderInfo, err: error) { got = list })
+    wallet.find_metamask(fn(p: *wallet.ProviderInfo, err: error) { var_mm = p.id })
+    r.work()
+    id0, name, arg := d.call_at(0)
+    expect(name).to_equal("ui.eth.providers")
+    expect(arg).to_equal("")
+    id1, _, _ := d.call_at(1)
+    list := "[{\"id\":\"injected\",\"name\":\"Injected (window.ethereum)\",\"icon\":\"\",\"rdns\":\"\",\"is_metamask\":true},{\"id\":\"uuid-mm\",\"name\":\"MetaMask\",\"icon\":\"data:image/svg+xml,x\",\"rdns\":\"io.metamask\",\"is_metamask\":true}]"
+    reply(r, id0, list)
+    reply(r, id1, list)
+    expect(len(got)).to_equal(2)
+    expect(got[1].name).to_equal("MetaMask")
+    expect(got[1].icon).to_equal("data:image/svg+xml,x")
+    expect(got[0].is_metamask).to_be_true()
+    expect(var_mm).to_equal("uuid-mm")
+  })
+  it("falls back to an injected MetaMask, and gives nil without one", fn() {
+    r, d := page()
+    ids := []str{}
+    for i := 0; i < 2; i++ {
+      wallet.find_metamask(fn(p: *wallet.ProviderInfo, err: error) {
+        if p == nil { ids = append(ids, "none") } else { ids = append(ids, p.id) }
+      })
+    }
+    r.work()
+    a, _, _ := d.call_at(0)
+    b, _, _ := d.call_at(1)
+    reply(r, a, "[{\"id\":\"uuid-rabby\",\"name\":\"Rabby\",\"rdns\":\"io.rabby\"},{\"id\":\"injected\",\"is_metamask\":true}]")
+    reply(r, b, "[{\"id\":\"uuid-rabby\",\"name\":\"Rabby\",\"rdns\":\"io.rabby\"}]")
+    expect(ids).to_equal([]str{"injected", "none"})
+  })
+})
+
+describe("accounts and chains", fn() {
+  it("requests the addresses (EIP-55) and reads the chain id", fn() {
+    r, d := page()
+    w := wallet.connect(metamask())
+    addrs := []str{}
+    chain := 0
+    w.request_addresses(fn(a: []str, err: error) { addrs = a })
+    w.get_chain_id(fn(n: int, err: error) { chain = n })
+    r.work()
+    id, name, s := sent(d, 0)
+    expect(name).to_equal("ui.eth.request")
+    expect(s.id).to_equal("uuid-mm")
+    expect(s.method).to_equal("eth_requestAccounts")
+    expect(s.params.string()).to_equal("[]")
+    reply(r, id, "{\"result\":[\"0xd8da6bf26964af9d7eed9e03e53415d37aa96045\",\"0xab5801a7d398351b8be11c439e05c5b3259aec9b\"]}")
+    expect(addrs).to_equal([]str{ALICE, BOB})
+    expect(w.address()).to_equal(ALICE)
+    id2, _, s2 := sent(d, 1)
+    expect(s2.method).to_equal("eth_chainId")
+    reply(r, id2, "{\"result\":\"0x2105\"}")
+    expect(chain).to_equal(8453)
+    expect(w.chain_id).to_equal(8453)
+  })
+  it("get_addresses uses eth_accounts (no prompt)", fn() {
+    r, d := page()
+    w := wallet.connect(metamask())
+    n := -1
+    w.get_addresses(fn(a: []str, err: error) { n = len(a) })
+    r.work()
+    id, _, s := sent(d, 0)
+    expect(s.method).to_equal("eth_accounts")
+    reply(r, id, "{\"result\":[]}")
+    expect(n).to_equal(0)
+  })
+  it("turns a 4001 into a user rejection", fn() {
+    r, d := page()
+    w := wallet.connect(metamask())
+    let got: error = nil
+    w.request_addresses(fn(a: []str, err: error) { got = err })
+    r.work()
+    id, _, _ := sent(d, 0)
+    reply(r, id, "{\"error\":{\"code\":4001,\"message\":\"User rejected the request.\",\"data\":{\"cause\":\"x\"}}}")
+    expect(wallet.is_user_rejected(got)).to_be_true()
+    expect(wallet.is_unknown_chain(got)).to_be_false()
+    e := got.(*wallet.WalletError)
+    expect(e.data).to_equal("{\"cause\":\"x\"}")
+    expect(got.Error()).to_equal("wallet: User rejected the request. (code 4001)")
+  })
+  it("switches chains, adding the chain after a 4902", fn() {
+    r, d := page()
+    w := wallet.connect(metamask())
+    done := 0
+    let res: error = nil
+    add := &wallet.AddChainParams{chain_id: 8453, name: "Base", symbol: "ETH", rpc_urls: []str{"https://mainnet.base.org"}, explorer_urls: []str{"https://basescan.org"}}
+    w.switch_chain(8453, add, fn(err: error) {
+      done++
+      res = err
+    })
+    r.work()
+    id, _, s := sent(d, 0)
+    expect(s.method).to_equal("wallet_switchEthereumChain")
+    expect(s.params.string()).to_equal("[{\"chainId\":\"0x2105\"}]")
+    reply(r, id, "{\"error\":{\"code\":4902,\"message\":\"Unrecognized chain ID\",\"data\":null}}")
+    id, _, s = sent(d, 1)
+    expect(s.method).to_equal("wallet_addEthereumChain")
+    expect(s.params.string()).to_equal("[{\"blockExplorerUrls\":[\"https://basescan.org\"],\"chainId\":\"0x2105\",\"chainName\":\"Base\",\"nativeCurrency\":{\"decimals\":18,\"name\":\"ETH\",\"symbol\":\"ETH\"},\"rpcUrls\":[\"https://mainnet.base.org\"]}]")
+    reply(r, id, "{\"result\":null}")
+    id, _, s = sent(d, 2)
+    expect(s.method).to_equal("wallet_switchEthereumChain")
+    expect(done).to_equal(0)
+    reply(r, id, "{\"result\":null}")
+    expect(done).to_equal(1)
+    expect(res).to_equal(nil)
+    expect(w.chain_id).to_equal(8453)
+  })
+  it("gives the 4902 back when there is nothing to add", fn() {
+    r, d := page()
+    w := wallet.connect(metamask())
+    let res: error = nil
+    w.switch_chain(10, nil, fn(err: error) { res = err })
+    r.work()
+    id, _, _ := sent(d, 0)
+    reply(r, id, "{\"error\":{\"code\":4902,\"message\":\"Unrecognized chain ID\"}}")
+    expect(wallet.is_unknown_chain(res)).to_be_true()
+    expect(len(d.calls)).to_equal(1)
+  })
+})
+
+describe("transactions and signatures", fn() {
+  it("hex-encodes the transaction's quantities and data", fn() {
+    r, d := page()
+    w := wallet.connect(metamask())
+    w.addresses = []str{ALICE}
+    hash := ""
+    tx := &wallet.TxRequest{
+      to_: "0xab5801a7d398351b8be11c439e05c5b3259aec9b",
+      value: web3.parse_ether("1.5"),
+      data: web3.must_hex("0xa9059cbb"),
+      gas: web3.u256(21000),
+      max_fee_per_gas: web3.must_u256("30000000000"),
+      max_priority_fee_per_gas: web3.u256(1000000000),
+      nonce: web3.u256(0),
+    }
+    w.send_transaction(tx, fn(h: str, err: error) { hash = h })
+    r.work()
+    id, _, s := sent(d, 0)
+    expect(s.method).to_equal("eth_sendTransaction")
+    expect(s.params.string()).to_equal("[{\"data\":\"0xa9059cbb\",\"from\":\"" + ALICE + "\",\"gas\":\"0x5208\",\"maxFeePerGas\":\"0x6fc23ac00\",\"maxPriorityFeePerGas\":\"0x3b9aca00\",\"nonce\":\"0x0\",\"to\":\"" + BOB + "\",\"value\":\"0x14d1120d7b160000\"}]")
+    reply(r, id, "{\"result\":\"0x88df016429689c079f3b2f6ad39fa052532c56795b733da78a91ebe6a713944b\"}")
+    expect(hash).to_equal("0x88df016429689c079f3b2f6ad39fa052532c56795b733da78a91ebe6a713944b")
+  })
+  it("leaves out what is not set, and refuses a bad address without asking the wallet", fn() {
+    r, d := page()
+    w := wallet.connect(metamask())
+    m, err := wallet.tx_params(&wallet.TxRequest{from_: BOB, to_: ALICE}, "")
+    expect(err).to_equal(nil)
+    expect(len(m)).to_equal(2)
+    let e1: error = nil
+    let e2: error = nil
+    w.send_transaction(&wallet.TxRequest{to_: "0x123"}, fn(h: str, err: error) { e1 = err })
+    w.addresses = []str{ALICE}
+    w.send_transaction(&wallet.TxRequest{to_: "0x123"}, fn(h: str, err: error) { e2 = err })
+    r.work()
+    expect(wallet.error_code(e1)).to_equal(-32602)
+    expect(e1.Error()).to_equal("wallet: send_transaction: no from address (call request_addresses first) (code -32602)")
+    expect(e2.Error()).to_equal("wallet: send_transaction: invalid to address 0x123 (code -32602)")
+    expect(len(d.calls)).to_equal(0)
+  })
+  it("signs a message with personal_sign (hex) and typed data with eth_signTypedData_v4", fn() {
+    r, d := page()
+    w := wallet.connect(metamask())
+    sigs := []str{}
+    w.sign_message("0xd8da6bf26964af9d7eed9e03e53415d37aa96045", "hello", fn(s: str, err: error) { sigs = append(sigs, s) })
+    typed := "{\"types\":{\"EIP712Domain\":[]},\"primaryType\":\"EIP712Domain\",\"domain\":{},\"message\":{}}"
+    w.sign_typed_data_json(ALICE, typed, fn(s: str, err: error) { sigs = append(sigs, s) })
+    r.work()
+    id, _, s := sent(d, 0)
+    expect(s.method).to_equal("personal_sign")
+    expect(s.params.string()).to_equal("[\"0x68656c6c6f\",\"" + ALICE + "\"]")
+    reply(r, id, "{\"result\":\"0xabcd\"}")
+    id, _, s = sent(d, 1)
+    expect(s.method).to_equal("eth_signTypedData_v4")
+    expect(s.params.get_str("0", "")).to_equal(ALICE)
+    expect(s.params.get_str("1", "")).to_equal(typed)
+    reply(r, id, "{\"result\":\"0x1234\"}")
+    expect(sigs).to_equal([]str{"0xabcd", "0x1234"})
+  })
+  it("asks the wallet to watch a token", fn() {
+    r, d := page()
+    w := wallet.connect(metamask())
+    added := false
+    w.watch_asset("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "USDC", 6, "", fn(ok: bool, err: error) { added = ok })
+    r.work()
+    id, _, s := sent(d, 0)
+    expect(s.method).to_equal("wallet_watchAsset")
+    expect(s.params.string()).to_equal("{\"options\":{\"address\":\"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\",\"decimals\":6,\"symbol\":\"USDC\"},\"type\":\"ERC20\"}")
+    reply(r, id, "{\"result\":true}")
+    expect(added).to_be_true()
+  })
+})
+
+describe("raw requests and the transport", fn() {
+  it("passes params through and gives the result as JSON", fn() {
+    r, d := page()
+    w := wallet.connect(metamask())
+    t := wallet.eip1193_transport(w)
+    got := ""
+    t("eth_getBalance", "[\"" + ALICE + "\",\"latest\"]", fn(res: str, err: error) { got = res })
+    r.work()
+    id, _, s := sent(d, 0)
+    expect(s.method).to_equal("eth_getBalance")
+    expect(s.params.string()).to_equal("[\"" + ALICE + "\",\"latest\"]")
+    reply(r, id, "{\"result\":\"0x1bc16d674ec80000\"}")
+    expect(got).to_equal("\"0x1bc16d674ec80000\"")
+  })
+  it("cancel stops waiting: the late answer is ignored", fn() {
+    r, d := page()
+    w := wallet.connect(metamask())
+    n := 0
+    cancel := w.request("eth_blockNumber", "", fn(res: str, err: error) { n++ })
+    r.work()
+    id, _, arg := d.call_at(0)
+    expect(arg).to_equal("{\"id\":\"uuid-mm\",\"method\":\"eth_blockNumber\"}")
+    cancel()
+    reply(r, id, "{\"result\":\"0x1\"}")
+    expect(n).to_equal(0)
+  })
+  it("refuses params that are not JSON, and a reply from an old page", fn() {
+    r, d := page()
+    w := wallet.connect(metamask())
+    errs := []str{}
+    w.request("x", "[", fn(res: str, err: error) { errs = append(errs, err.Error()) })
+    w.request("y", "", fn(res: str, err: error) { errs = append(errs, err.Error()) })
+    r.work()
+    id, _, _ := d.call_at(0)
+    reply(r, id, "nope")
+    expect(errs).to_equal([]str{
+      "wallet: the params of x are not JSON (code -32602)",
+      "wallet: the page gave a reply that is not JSON (is the page's caju-ui 0.4.0 or newer?) (code -32603)",
+    })
+  })
+})
+
+describe("events", fn() {
+  it("subscribes once and delivers this wallet's events", fn() {
+    r, d := page()
+    w := wallet.connect(metamask())
+    accounts := [][]str{}
+    chains := []int{}
+    gone := 0
+    off := w.on_accounts_changed(fn(a: []str) { accounts = append(accounts, a) })
+    offc := w.on_chain_changed(fn(n: int) { chains = append(chains, n) })
+    offd := w.on_disconnect(fn() { gone++ })
+    r.work()
+    expect(d.calls).to_equal([]str{"1 ui.eth.subscribe {\"id\":\"uuid-mm\"}"})
+    r.handle(fakedom.event_msg("ui.eth.accountsChanged", "{\"id\":\"uuid-mm\",\"data\":[\"0xab5801a7d398351b8be11c439e05c5b3259aec9b\"]}"))
+    r.handle(fakedom.event_msg("ui.eth.accountsChanged", "{\"id\":\"other\",\"data\":[]}"))
+    r.handle(fakedom.event_msg("ui.eth.chainChanged", "{\"id\":\"uuid-mm\",\"data\":\"0x89\"}"))
+    r.handle(fakedom.event_msg("ui.eth.disconnect", "{\"id\":\"uuid-mm\",\"data\":{\"code\":4900,\"message\":\"gone\",\"data\":null}}"))
+    r.work()
+    expect(accounts).to_equal([][]str{[]str{BOB}})
+    expect(w.address()).to_equal(BOB)
+    expect(chains).to_equal([]int{137})
+    expect(w.chain_id).to_equal(137)
+    expect(gone).to_equal(1)
+    off()
+    offc()
+    offd()
+    r.handle(fakedom.event_msg("ui.eth.chainChanged", "{\"id\":\"uuid-mm\",\"data\":\"0x1\"}"))
+    expect(chains).to_equal([]int{137})
+  })
+})

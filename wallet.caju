@@ -1,0 +1,509 @@
+# wallet: the browser's Ethereum wallets (MetaMask and any EIP-1193 wallet) for caju-ui programs
+# (import "github.com/cajulang/web3/wallet").
+#
+#   wallet.find_metamask(fn(p: *wallet.ProviderInfo, err: error) {
+#     if p == nil { ...; return }                  # not installed (or err)
+#     w := wallet.connect(p)
+#     w.request_addresses(fn(addrs: []str, err: error) {
+#       if wallet.is_user_rejected(err) { ...; return }
+#       tx := &wallet.TxRequest{to_: shop, value: web3.parse_ether("0.01")}
+#       w.send_transaction(tx, fn(hash: str, err: error) { ... })
+#     })
+#     w.on_accounts_changed(fn(addrs: []str) { ... })
+#   })
+#
+# The program runs in a Web Worker and wallets live in the page, so everything goes through
+# caju-ui's page runtime (ui 0.4.0 or newer): wallets are found with EIP-6963 (ui.eth.providers),
+# requests go to the wallet's provider.request (ui.eth.request) and its events come back as page
+# events (ui.eth.subscribe, ui.on_page_event).
+#
+# Asynchronous calls take a callback last, fn(result, err: error), called once, and return a
+# function that cancels the wait (the wallet may still show its prompt; the callback is not
+# called). Wallet errors are *WalletError, with the EIP-1193 code (is_user_rejected: 4001,
+# is_unknown_chain: 4902).
+import "github.com/cajulang/web3"
+import "github.com/cajulang/ui"
+import "std/json"
+import "std/strings"
+
+# ---------------------------------------------------------------- types
+
+# a wallet found in the page: an EIP-6963 announcement (id is its uuid, icon a data URI, rdns
+# like "io.metamask"), or window.ethereum with id "injected"
+export struct ProviderInfo {
+  id: str
+  name: str
+  icon: str
+  rdns: str
+  is_metamask: bool
+}
+
+# an error from the wallet (EIP-1193 / JSON-RPC: 4001 user rejected, 4100 unauthorized, 4200
+# unsupported method, 4900 disconnected, 4902 unknown chain, -32602 invalid params...); data is
+# the error's data as JSON ("" for none)
+export struct WalletError {
+  code: int
+  message: str
+  data: str
+}
+
+export fn (e: *WalletError) Error() -> str {
+  return "wallet: " + e.message + " (code " + str(e.code) + ")"
+}
+
+export const USER_REJECTED = 4001
+export const UNAUTHORIZED = 4100
+export const UNSUPPORTED_METHOD = 4200
+export const DISCONNECTED = 4900
+export const UNKNOWN_CHAIN = 4902
+export const INVALID_PARAMS = -32602
+export const INTERNAL_ERROR = -32603
+
+# the user said no in the wallet (code 4001)
+export fn is_user_rejected(err: error) -> bool { return error_code(err) == USER_REJECTED }
+
+# the wallet does not know the chain (code 4902): add it first (add_chain, or switch_chain with params)
+export fn is_unknown_chain(err: error) -> bool { return error_code(err) == UNKNOWN_CHAIN }
+
+# the EIP-1193 code of a *WalletError (0 for nil or another error)
+export fn error_code(err: error) -> int {
+  if err == nil { return 0 }
+  e, ok := err.(*WalletError)
+  if !ok { return 0 }
+  return e.code
+}
+
+fn fail(code: int, message: str) -> *WalletError { return &WalletError{code: code, message: message} }
+
+# a chain to add to the wallet (wallet_addEthereumChain, EIP-3085)
+export struct AddChainParams {
+  chain_id: int
+  name: str                   # "Base"
+  symbol: str                 # the native currency: "ETH"
+  decimals: int               # 0: 18
+  rpc_urls: []str
+  explorer_urls: []str        # may be empty
+}
+
+# a transaction for the wallet to sign and send (eth_sendTransaction). Empty fields are left to
+# the wallet (from_: the first connected address; gas and fees: its estimate; nonce: the next one)
+export struct TxRequest {
+  from_: str                  # (from and to are keywords)
+  to_: str                    # "" deploys a contract (data is its code)
+  value: *web3.U256           # wei
+  data: str                   # raw bytes (calldata), hex-encoded for the wallet
+  gas: *web3.U256
+  max_fee_per_gas: *web3.U256
+  max_priority_fee_per_gas: *web3.U256
+  nonce: *web3.U256
+}
+
+# a connected wallet (connect)
+export struct WalletClient {
+  info: *ProviderInfo
+  addresses: []str            # the last addresses the wallet gave (request/get_addresses, accountsChanged)
+  chain_id: int               # the last chain id it gave (get_chain_id, chainChanged); 0: not known yet
+  subscribed: bool
+}
+
+# ---------------------------------------------------------------- finding wallets
+
+fn not_in_page() -> *WalletError {
+  return fail(DISCONNECTED, "no page: wallets are only reachable from a caju-ui program in the browser")
+}
+
+# the wallets in the page: those that announce themselves with EIP-6963 and, when no announced
+# one is it, window.ethereum (id "injected")
+export fn providers(cb: fn([]*ProviderInfo, error)) {
+  if !ui.in_page() {
+    cb(nil, not_in_page())
+    return
+  }
+  ui.call("ui.eth.providers", "", fn(reply: str) {
+    list := []*ProviderInfo{}
+    if json.unmarshal(reply, &list) != nil {
+      cb(nil, fail(INTERNAL_ERROR, "the page gave a reply that is not JSON (is the page's caju-ui 0.4.0 or newer?)"))
+      return
+    }
+    cb(list, nil)
+  })
+}
+
+# MetaMask: the wallet announced as "io.metamask" or, failing that, an injected window.ethereum
+# that says it is MetaMask. nil (and no error) when there is none
+export fn find_metamask(cb: fn(*ProviderInfo, error)) {
+  providers(fn(list: []*ProviderInfo, err: error) {
+    if err != nil {
+      cb(nil, err)
+      return
+    }
+    cb(pick_metamask(list), nil)
+  })
+}
+
+fn pick_metamask(list: []*ProviderInfo) -> *ProviderInfo {
+  for _, p := range list {
+    if p.rdns == "io.metamask" { return p }
+  }
+  for _, p := range list {
+    if p.is_metamask { return p }
+  }
+  return nil
+}
+
+# a client for the wallet p (no prompt yet: request_addresses asks the user)
+export fn connect(p: *ProviderInfo) -> *WalletClient {
+  return &WalletClient{info: p, addresses: []str{}}
+}
+
+# ---------------------------------------------------------------- requests
+
+let next_request: int = 0
+
+# any EIP-1193 request: method and its params as JSON ("" for none); cb gets the result as JSON
+export fn (w: *WalletClient) request(method: str, params_json: str, cb: fn(str, error)) -> fn() {
+  canceled := false
+  stop := fn() { canceled = true }
+  if !ui.in_page() {
+    cb("", not_in_page())
+    return stop
+  }
+  if w.info == nil {
+    cb("", fail(DISCONNECTED, "no wallet (connect(nil))"))
+    return stop
+  }
+  p := strings.trim_space(params_json)
+  if p != "" && !json.valid(p) {
+    cb("", fail(INVALID_PARAMS, "the params of " + method + " are not JSON"))
+    return stop
+  }
+  arg := "{\"id\":" + json.quote(w.info.id) + ",\"method\":" + json.quote(method)
+  if p != "" { arg = arg + ",\"params\":" + p }
+  arg = arg + "}"
+  ui.call("ui.eth.request", arg, fn(reply: str) {
+    if canceled { return }
+    canceled = true
+    result, err := decode_reply(reply)
+    cb(result, err)
+  })
+  return stop
+}
+
+# the page's {result} or {error: {code, message, data}}
+fn decode_reply(reply: str) -> (str, error) {
+  v, err := json.parse(reply)
+  if err != nil || v.kind != "object" {
+    return "", fail(INTERNAL_ERROR, "the page gave a reply that is not JSON (is the page's caju-ui 0.4.0 or newer?)")
+  }
+  e := v.field("error")
+  if e != nil && !e.is_null() {
+    we := &WalletError{code: e.get_int("code", INTERNAL_ERROR), message: e.get_str("message", "wallet error")}
+    d := e.field("data")
+    if d != nil && !d.is_null() { we.data = d.string() }
+    return "", we
+  }
+  r := v.field("result")
+  if r == nil { return "null", nil }
+  return r.string(), nil
+}
+
+# a request whose params are a Caju value (encoded with std/json)
+fn (w: *WalletClient) call(method: str, params: any, cb: fn(str, error)) -> fn() {
+  s, err := json.marshal(params)
+  if err != nil {
+    cb("", fail(INVALID_PARAMS, err.Error()))
+    return fn() {}
+  }
+  return w.request(method, s, cb)
+}
+
+# a JSON array of addresses, in their EIP-55 form
+fn decode_addresses(result: str) -> ([]str, error) {
+  list := []str{}
+  if json.unmarshal(result, &list) != nil {
+    return nil, fail(INTERNAL_ERROR, "the wallet gave addresses that are not a list: " + short(result))
+  }
+  out := []str{}
+  for _, a := range list {
+    if !web3.is_address(a) { return nil, fail(INTERNAL_ERROR, "the wallet gave an invalid address: " + short(a)) }
+    out = append(out, web3.checksum_address(a))
+  }
+  return out, nil
+}
+
+# a JSON-RPC quantity ("0x2105", as a JSON string) as an int
+fn decode_quantity(result: str) -> (int, error) {
+  s := ""
+  if json.unmarshal(result, &s) != nil || !strings.has_prefix(s, "0x") {
+    return 0, fail(INTERNAL_ERROR, "the wallet gave a number that is not a hex string: " + short(result))
+  }
+  v, err := web3.parse_u256(s)
+  if err != nil { return 0, fail(INTERNAL_ERROR, err.Error()) }
+  n, ok := v.to_int()
+  if !ok { return 0, fail(INTERNAL_ERROR, "the wallet gave a number that is too big: " + s) }
+  return n, nil
+}
+
+fn short(s: str) -> str {
+  if len(s) > 80 { return s[:80] + "..." }
+  return s
+}
+
+fn qty(n: int) -> str { return web3.u256(n).hex() }
+
+# ---------------------------------------------------------------- accounts and chains
+
+# asks the user to connect (eth_requestAccounts): the addresses they allow, EIP-55
+export fn (w: *WalletClient) request_addresses(cb: fn([]str, error)) -> fn() {
+  return w.request("eth_requestAccounts", "[]", fn(result: str, err: error) { w.got_addresses(result, err, cb) })
+}
+
+# the addresses already connected, without a prompt (eth_accounts; empty when none)
+export fn (w: *WalletClient) get_addresses(cb: fn([]str, error)) -> fn() {
+  return w.request("eth_accounts", "[]", fn(result: str, err: error) { w.got_addresses(result, err, cb) })
+}
+
+fn (w: *WalletClient) got_addresses(result: str, err: error, cb: fn([]str, error)) {
+  if err != nil {
+    cb(nil, err)
+    return
+  }
+  list, derr := decode_addresses(result)
+  if derr != nil {
+    cb(nil, derr)
+    return
+  }
+  w.addresses = list
+  cb(list, nil)
+}
+
+# the first connected address ("" before request_addresses / get_addresses)
+export fn (w: *WalletClient) address() -> str {
+  if len(w.addresses) == 0 { return "" }
+  return w.addresses[0]
+}
+
+# the chain the wallet is on (eth_chainId)
+export fn (w: *WalletClient) get_chain_id(cb: fn(int, error)) -> fn() {
+  return w.request("eth_chainId", "[]", fn(result: str, err: error) {
+    if err != nil {
+      cb(0, err)
+      return
+    }
+    n, derr := decode_quantity(result)
+    if derr != nil {
+      cb(0, derr)
+      return
+    }
+    w.chain_id = n
+    cb(n, nil)
+  })
+}
+
+# asks the wallet to switch to chain_id (wallet_switchEthereumChain). When the wallet does not know
+# it (4902) and add is not nil, adds it (wallet_addEthereumChain) and switches again
+export fn (w: *WalletClient) switch_chain(chain_id: int, add: *AddChainParams, cb: fn(error)) -> fn() {
+  canceled := false
+  let stage: fn() = nil
+  params := []any{map[str]any{"chainId": qty(chain_id)}}
+  done := fn(err: error) {
+    if canceled { return }
+    canceled = true
+    if err == nil { w.chain_id = chain_id }
+    cb(err)
+  }
+  stage = w.call("wallet_switchEthereumChain", params, fn(result: str, err: error) {
+    if err == nil || !is_unknown_chain(err) || add == nil {
+      done(err)
+      return
+    }
+    stage = w.add_chain(add, fn(aerr: error) {
+      if aerr != nil {
+        done(aerr)
+        return
+      }
+      stage = w.call("wallet_switchEthereumChain", params, fn(r2: str, serr: error) { done(serr) })
+    })
+  })
+  return fn() {
+    canceled = true
+    if stage != nil { stage() }
+  }
+}
+
+# adds a chain to the wallet (wallet_addEthereumChain; the wallet usually offers to switch to it too)
+export fn (w: *WalletClient) add_chain(params: *AddChainParams, cb: fn(error)) -> fn() {
+  if params == nil || params.chain_id <= 0 || len(params.rpc_urls) == 0 {
+    cb(fail(INVALID_PARAMS, "add_chain needs a chain id and at least one RPC URL"))
+    return fn() {}
+  }
+  decimals := params.decimals
+  if decimals == 0 { decimals = 18 }
+  c := map[str]any{
+    "chainId": qty(params.chain_id),
+    "chainName": params.name,
+    "nativeCurrency": map[str]any{"name": params.symbol, "symbol": params.symbol, "decimals": decimals},
+    "rpcUrls": params.rpc_urls,
+  }
+  if len(params.explorer_urls) > 0 { c["blockExplorerUrls"] = params.explorer_urls }
+  return w.call("wallet_addEthereumChain", []any{c}, fn(result: str, err: error) { cb(err) })
+}
+
+# ---------------------------------------------------------------- transactions and signatures
+
+# the transaction as eth_sendTransaction wants it (hex quantities and data), or an error
+export fn tx_params(tx: *TxRequest, default_from: str) -> (map[str]any, error) {
+  m := map[str]any{}
+  f := tx.from_
+  if f == "" { f = default_from }
+  if f == "" { return nil, fail(INVALID_PARAMS, "send_transaction: no from address (call request_addresses first)") }
+  if !web3.is_address(f) { return nil, fail(INVALID_PARAMS, "send_transaction: invalid from address " + short(f)) }
+  m["from"] = web3.checksum_address(f)
+  if tx.to_ != "" {
+    if !web3.is_address(tx.to_) { return nil, fail(INVALID_PARAMS, "send_transaction: invalid to address " + short(tx.to_)) }
+    m["to"] = web3.checksum_address(tx.to_)
+  } else if tx.data == "" {
+    return nil, fail(INVALID_PARAMS, "send_transaction: no to address and no data (a contract's code)")
+  }
+  if tx.value != nil { m["value"] = tx.value.hex() }
+  if tx.data != "" { m["data"] = web3.to_hex(tx.data) }
+  if tx.gas != nil { m["gas"] = tx.gas.hex() }
+  if tx.max_fee_per_gas != nil { m["maxFeePerGas"] = tx.max_fee_per_gas.hex() }
+  if tx.max_priority_fee_per_gas != nil { m["maxPriorityFeePerGas"] = tx.max_priority_fee_per_gas.hex() }
+  if tx.nonce != nil { m["nonce"] = tx.nonce.hex() }
+  return m, nil
+}
+
+# asks the wallet to sign and send tx (eth_sendTransaction): cb gets the transaction hash
+export fn (w: *WalletClient) send_transaction(tx: *TxRequest, cb: fn(str, error)) -> fn() {
+  if tx == nil {
+    cb("", fail(INVALID_PARAMS, "send_transaction: no transaction"))
+    return fn() {}
+  }
+  m, err := tx_params(tx, w.address())
+  if err != nil {
+    cb("", err)
+    return fn() {}
+  }
+  return w.call("eth_sendTransaction", []any{m}, fn(result: str, rerr: error) { w.got_hex(result, rerr, cb) })
+}
+
+# signs a message with EIP-191 (personal_sign; the message goes hex-encoded): cb gets the
+# 65-byte signature as hex
+export fn (w: *WalletClient) sign_message(address: str, message: str, cb: fn(str, error)) -> fn() {
+  if !web3.is_address(address) {
+    cb("", fail(INVALID_PARAMS, "sign_message: invalid address " + short(address)))
+    return fn() {}
+  }
+  params := []any{web3.to_hex(message), web3.checksum_address(address)}
+  return w.call("personal_sign", params, fn(result: str, err: error) { w.got_hex(result, err, cb) })
+}
+
+# signs EIP-712 typed data given as JSON ({types, primaryType, domain, message}) with
+# eth_signTypedData_v4: cb gets the signature as hex
+export fn (w: *WalletClient) sign_typed_data_json(address: str, typed_data_json: str, cb: fn(str, error)) -> fn() {
+  if !web3.is_address(address) {
+    cb("", fail(INVALID_PARAMS, "sign_typed_data: invalid address " + short(address)))
+    return fn() {}
+  }
+  if !json.valid(typed_data_json) {
+    cb("", fail(INVALID_PARAMS, "sign_typed_data: the typed data is not JSON"))
+    return fn() {}
+  }
+  params := []any{web3.checksum_address(address), typed_data_json}
+  return w.call("eth_signTypedData_v4", params, fn(result: str, err: error) { w.got_hex(result, err, cb) })
+}
+
+fn (w: *WalletClient) got_hex(result: str, err: error, cb: fn(str, error)) {
+  if err != nil {
+    cb("", err)
+    return
+  }
+  s := ""
+  if json.unmarshal(result, &s) != nil || !web3.is_hex(s, -1) {
+    cb("", fail(INTERNAL_ERROR, "the wallet gave something that is not hex: " + short(result)))
+    return
+  }
+  cb(s, nil)
+}
+
+# asks the wallet to show an ERC-20 token (wallet_watchAsset, EIP-747): cb gets whether the user
+# added it
+export fn (w: *WalletClient) watch_asset(token: str, symbol: str, decimals: int, image: str, cb: fn(bool, error)) -> fn() {
+  if !web3.is_address(token) {
+    cb(false, fail(INVALID_PARAMS, "watch_asset: invalid token address " + short(token)))
+    return fn() {}
+  }
+  opts := map[str]any{"address": web3.checksum_address(token), "symbol": symbol, "decimals": decimals}
+  if image != "" { opts["image"] = image }
+  params := map[str]any{"type": "ERC20", "options": opts}
+  return w.call("wallet_watchAsset", params, fn(result: str, err: error) {
+    if err != nil {
+      cb(false, err)
+      return
+    }
+    cb(result == "true", nil)
+  })
+}
+
+# ---------------------------------------------------------------- events
+
+# the page forwards this wallet's events (once per client)
+fn (w: *WalletClient) subscribe() {
+  if w.subscribed || w.info == nil || !ui.in_page() { return }
+  w.subscribed = true
+  ui.call("ui.eth.subscribe", "{\"id\":" + json.quote(w.info.id) + "}", nil)
+}
+
+# the event's data when it is for this wallet ({id, data} from the page), or nil
+fn (w: *WalletClient) event_data(text: str) -> *json.Value {
+  v, err := json.parse(text)
+  if err != nil || w.info == nil || v.get_str("id", "") != w.info.id { return nil }
+  d := v.field("data")
+  if d == nil { return &json.Value{kind: "null"} }
+  return d
+}
+
+# f runs when the user switches or disconnects accounts (accountsChanged; EIP-55 addresses, empty
+# when the wallet locks or the site loses access). Returns a function that stops it
+export fn (w: *WalletClient) on_accounts_changed(f: fn([]str)) -> fn() {
+  w.subscribe()
+  return ui.on_page_event("ui.eth.accountsChanged", fn(text: str) {
+    d := w.event_data(text)
+    if d == nil { return }
+    list, err := decode_addresses(d.string())
+    if err != nil { return }
+    w.addresses = list
+    f(list)
+  })
+}
+
+# f runs when the wallet changes chains (chainChanged), with the new chain id
+export fn (w: *WalletClient) on_chain_changed(f: fn(int)) -> fn() {
+  w.subscribe()
+  return ui.on_page_event("ui.eth.chainChanged", fn(text: str) {
+    d := w.event_data(text)
+    if d == nil { return }
+    n, err := decode_quantity(d.string())
+    if err != nil { return }
+    w.chain_id = n
+    f(n)
+  })
+}
+
+# f runs when the wallet can no longer reach any chain (disconnect)
+export fn (w: *WalletClient) on_disconnect(f: fn()) -> fn() {
+  w.subscribe()
+  return ui.on_page_event("ui.eth.disconnect", fn(text: str) {
+    if w.event_data(text) == nil { return }
+    f()
+  })
+}
+
+# ---------------------------------------------------------------- as a JSON-RPC transport
+
+# the wallet as a JSON-RPC transport (the public client's ClientConfig.transport), so reads such as
+# eth_getBalance or eth_call go through the wallet's own node
+export fn eip1193_transport(w: *WalletClient) -> fn(str, str, fn(str, error)) -> fn() {
+  return fn(method: str, params_json: str, cb: fn(str, error)) -> fn() { return w.request(method, params_json, cb) }
+}
