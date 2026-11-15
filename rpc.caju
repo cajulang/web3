@@ -27,6 +27,7 @@ import "github.com/cajulang/fetch"
 import "github.com/cajulang/ui"
 import "std/json"
 import "std/strings"
+import "std/os"
 
 # ---------------------------------------------------------------- errors
 
@@ -250,7 +251,7 @@ fn later(ms: int, f: fn()) -> fn() {
     id := ui.set_timeout(ms, f)
     return fn() { ui.clear_timer(id) }
   }
-  if ms > 0 { sleep(num(ms) / 1000.0) }
+  if ms > 0 { os.sleep(num(ms) / 1000.0) }
   f()
   return nil
 }
@@ -1224,7 +1225,7 @@ fn (p: *Poller) run(tick: fn(fn())) -> fn() {
   while true {
     p.step(tick)
     if p.is_stopped() { break }
-    sleep(num(p.poll_ms) / 1000.0)
+    os.sleep(num(p.poll_ms) / 1000.0)
     if p.is_stopped() { break }
   }
   return fn() { p.stopped = true }
