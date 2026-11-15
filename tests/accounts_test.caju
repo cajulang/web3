@@ -1,0 +1,365 @@
+# web3/accounts: keys, ECDSA, EIP-191, EIP-712, transactions and EIP-7702. Reference values come
+# from the EIPs and from viem 2.26.
+import { describe, it, expect } from "std/testing"
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/accounts"
+import "std/strings"
+import "std/crypto"
+
+let EIP155_RAW = "0xf86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a76400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a067cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83"
+let T2_RAW = "0x02f8af01078459682f008506fc23ac0082c3509470997970c51812dc3a010c7d01b50e0d17dc79c8872bdc545d58750084a9059cbbf838f7945fbdb2315678afecb367f032d93f642f64180aa3e1a0000000000000000000000000000000000000000000000000000000000000000101a00557cd2f4cc0497d46b4ba7a0ffe8be47336646277c155c69379f774307bc922a07e0a9cc5ffe67a9d038ae2f36058c54780a154b9b03d3a196572a734ac0d0c74"
+let T1_RAW = "0x01f86883aa36a780843b9aca008275309470997970c51812dc3a010c7d01b50e0d17dc79c80180c080a02b3a917d266c0d9359dbe23eccff7ee37f7f8d1ff9a2571a5db7b920dbabfb93a060e849f2ff02cd4478f1fe8b36d65267fbc2af4450fa05f6154ac556ae229346"
+let T4_RAW = "0x04f8c101040102830186a094f39fd6e51aad88f6f4ce6ab8827279cfffb922668080c0f85cf85a01945fbdb2315678afecb367f032d93f642f64180aa30301a0479b26b5d649a8d18baa08b170e6d58713988d9d0c47bef6ecafb029ea47eebfa060ece290629fb3551ecd9a195a0b3e1b9882c166c1e7cd2a070dfa875c1cccea80a0a06604d057a0a5a2afd5e04b0a18d5182eaaf14913095f5aaa99340882dbbe11a05154281c8ebd617defa8443a173cd53dca0b6419aa8a65257986c341d81c4e97"
+let ORDER_HASH = "0x8d4de5aed34516764641d83deb10cee5361ddab2af9ccd9c1f1ce0bbfe1ddf2d"
+let HARDHAT0 = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+let HARDHAT0_ADDR = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+let HH_SIG = "0xa461f509887bd19e312c0c58467ce8ff8e300d3c1a90b608a760c5b80318eaf15fe57c96f9175d6cd4daad4663763baa7e78836e067d0163e9a2ccf2ff753f5b1b"
+
+fn acct(k: str) -> *accounts.Account {
+  a, err := accounts.private_key_to_account(k)
+  if err != nil { panic(err.Error()) }
+  return a
+}
+
+fn mail() -> *accounts.TypedData {
+  return &accounts.TypedData{
+    domain: map[str]any{"name": "Ether Mail", "version": "1", "chainId": 1, "verifyingContract": "0xCcCCccccCCCCcCCCCCCcCcCccCcCCCcCcccccccC"},
+    types: map[str][]*accounts.TypedField{
+      "Person": []*accounts.TypedField{&accounts.TypedField{name: "name", type: "string"}, &accounts.TypedField{name: "wallet", type: "address"}},
+      "Mail": []*accounts.TypedField{&accounts.TypedField{name: "from", type: "Person"}, &accounts.TypedField{name: "to", type: "Person"}, &accounts.TypedField{name: "contents", type: "string"}},
+    },
+    primary_type: "Mail",
+    message: map[str]any{
+      "from": map[str]any{"name": "Cow", "wallet": "0xCD2a3d9F938E13CD947Ec05AbC7FE734Df8DD826"},
+      "to": map[str]any{"name": "Bob", "wallet": "0xbBbBBBBbbBBBbbbBbbBbbbbBBbBbbbbBbBbbBBbB"},
+      "contents": "Hello, Bob!",
+    },
+  }
+}
+
+describe("keys", fn() {
+  it("derives the address of a private key", fn() {
+    expect(acct("0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318").address).to_equal("0x2c7536E3605D9C16a7a3D7b1898e529396a65c23")
+    a := acct(HARDHAT0)
+    expect(a.address).to_equal(HARDHAT0_ADDR)
+    expect(len(a.public_key)).to_equal(65)
+    expect(len(a.private_key)).to_equal(32)
+    # raw bytes and hex without 0x work too
+    expect(acct(web3.must_hex(HARDHAT0)).address).to_equal(HARDHAT0_ADDR)
+    expect(acct(HARDHAT0[2:]).address).to_equal(HARDHAT0_ADDR)
+  })
+  it("handles small and large keys", fn() {
+    one := acct("0x" + strings.repeat("0", 63) + "1")
+    expect(web3.to_hex(one.public_key)).to_equal("0x0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8")
+    expect(one.address).to_equal("0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf")
+    expect(acct("0x0000000000000000000000000000000000000000000000000000000000000002").address).to_equal("0x2B5AD5c4795c026514f8317c7a215E218DcCD6cF")
+    nm1 := acct("0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140")
+    expect(nm1.address).to_equal("0x80C0dbf239224071c59dD8970ab9d542E3414aB2")
+  })
+  it("refuses invalid keys", fn() {
+    for _, k := range []str{"", "0x", "0x1234", "0x" + strings.repeat("0", 64), "0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141", "0x" + strings.repeat("zz", 32)} {
+      _, err := accounts.private_key_to_account(k)
+      expect(err).not_().to_be_nil()
+    }
+  })
+  it("converts public keys", fn() {
+    a := acct(HARDHAT0)
+    c, err := accounts.compress_public_key(a.public_key)
+    expect(err).to_be_nil()
+    expect(len(c)).to_equal(33)
+    expect(accounts.public_key_to_address(c)).to_equal(HARDHAT0_ADDR)
+    expect(accounts.public_key_to_address(web3.to_hex(a.public_key))).to_equal(HARDHAT0_ADDR)
+    u, _ := accounts.decompress_public_key(c)
+    expect(u).to_equal(a.public_key)
+    expect(accounts.public_key_to_address("\x04" + strings.repeat("\x01", 64))).to_equal("")
+    expect(accounts.public_key_to_address("abc")).to_equal("")
+    pc, _ := accounts.private_key_to_public_key(HARDHAT0, true)
+    expect(pc).to_equal(c)
+  })
+  it("generates random keys", fn() {
+    k := accounts.generate_private_key()
+    expect(web3.is_hex(k, 32)).to_be_true()
+    expect(k != accounts.generate_private_key()).to_be_true()
+    _, err := accounts.private_key_to_account(k)
+    expect(err).to_be_nil()
+  })
+})
+
+describe("ECDSA", fn() {
+  it("signs deterministically with low s and recovers", fn() {
+    a := acct(HARDHAT0)
+    h := web3.keccak256("some data")
+    s1, err := a.sign_hash(h)
+    expect(err).to_be_nil()
+    s2, _ := a.sign_hash(web3.to_hex(h))
+    expect(s1.r.eq(s2.r) && s1.s.eq(s2.s)).to_be_true()
+    expect(s1.s.lt(web3.must_u256("0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a1"))).to_be_true()
+    got, err2 := accounts.recover_address(h, s1)
+    expect(err2).to_be_nil()
+    expect(got).to_equal(HARDHAT0_ADDR)
+    e, _ := accounts.ecrecover(h, s1.r, s1.s, s1.v)
+    expect(e).to_equal(HARDHAT0_ADDR)
+    e2, _ := accounts.ecrecover(h, s1.r, s1.s, s1.y_parity)
+    expect(e2).to_equal(HARDHAT0_ADDR)
+    expect(accounts.verify_hash(HARDHAT0_ADDR, h, s1)).to_be_true()
+    pub, _ := accounts.recover_public_key(h, s1)
+    expect(pub).to_equal(a.public_key)
+  })
+  it("signs many hashes that all recover", fn() {
+    a := acct("0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
+    ok := 0
+    for i := 0; i < 20; i++ {
+      h := web3.keccak256("msg " + str(i))
+      s, _ := a.sign_hash(h)
+      got, _ := accounts.recover_address(h, s)
+      if got == a.address { ok++ }
+    }
+    expect(ok).to_equal(20)
+  })
+  it("refuses bad hashes and signatures", fn() {
+    a := acct(HARDHAT0)
+    _, err := a.sign_hash("short")
+    expect(err).not_().to_be_nil()
+    h := web3.keccak256("x")
+    _, e1 := accounts.ecrecover(h, web3.zero(), web3.u256(1), 27)
+    expect(e1).not_().to_be_nil()
+    _, e2 := accounts.ecrecover(h, web3.u256(1), accounts.curve_order(), 27)
+    expect(e2).not_().to_be_nil()
+    _, e3 := accounts.ecrecover(h, web3.u256(1), web3.u256(1), 29)
+    expect(e3).not_().to_be_nil()
+    _, e4 := accounts.ecrecover("abc", web3.u256(1), web3.u256(1), 27)
+    expect(e4).not_().to_be_nil()
+    # x = 5 is not on the curve... some r give no point: try a few, none may panic
+    for i := 1; i < 10; i++ { accounts.ecrecover(h, web3.u256(i), web3.u256(7), 27) }
+  })
+  it("serializes and parses signatures", fn() {
+    sig, err := accounts.parse_signature(HH_SIG)
+    expect(err).to_be_nil()
+    expect(sig.y_parity).to_equal(0)
+    expect(sig.v).to_equal(27)
+    expect(web3.to_hex(accounts.serialize_signature(sig))).to_equal(HH_SIG)
+    compact := accounts.compact_signature(sig)
+    expect(len(compact)).to_equal(64)
+    back, _ := accounts.parse_signature(compact)
+    expect(back.s.eq(sig.s) && back.y_parity == sig.y_parity).to_be_true()
+    raw := web3.must_hex(HH_SIG)
+    s01, _ := accounts.parse_signature(raw[0:64] + "\x01")
+    expect(s01.y_parity).to_equal(1)
+    _, e1 := accounts.parse_signature(raw[0:64] + "\x05")
+    expect(e1).not_().to_be_nil()
+    _, e2 := accounts.parse_signature("0x1234")
+    expect(e2).not_().to_be_nil()
+    _, e3 := accounts.parse_signature("")
+    expect(e3).not_().to_be_nil()
+  })
+})
+
+describe("EIP-191", fn() {
+  it("hashes and signs messages as viem does", fn() {
+    expect(web3.to_hex(accounts.hash_message("hello world"))).to_equal("0xd9eba16ed0ecae432b71fe008c98cc872bb4cc214d3220a36f365326cf807d68")
+    a := acct(HARDHAT0)
+    expect(a.sign_message("hello world")).to_equal(HH_SIG)
+    got, err := accounts.recover_message_address("hello world", HH_SIG)
+    expect(err).to_be_nil()
+    expect(got).to_equal(HARDHAT0_ADDR)
+    expect(accounts.verify_message(HARDHAT0_ADDR, "hello world", HH_SIG)).to_be_true()
+    expect(accounts.verify_message(HARDHAT0_ADDR, "hello world!", HH_SIG)).to_be_false()
+    expect(accounts.verify_message(HARDHAT0_ADDR, "hello world", "0xzz")).to_be_false()
+  })
+})
+
+describe("EIP-712", fn() {
+  it("hashes the Mail example of the EIP", fn() {
+    h, err := accounts.hash_typed_data(mail())
+    expect(err).to_be_nil()
+    expect(web3.to_hex(h)).to_equal("0xbe609aee343fb3c4b28e1df9e632fca64fcfaede20f02e86244efddf30957bd2")
+    ds, _ := accounts.domain_separator(mail())
+    expect(web3.to_hex(ds)).to_equal("0xf2cee375fa42b42143804025fc449deafd50cc031ca257e0b194a650a912090f")
+  })
+  it("signs it with the key keccak256(\"cow\")", fn() {
+    cow := acct(web3.keccak256_hex("cow"))
+    expect(cow.address).to_equal("0xCD2a3d9F938E13CD947Ec05AbC7FE734Df8DD826")
+    sig, err := cow.sign_typed_data(mail())
+    expect(err).to_be_nil()
+    expect(sig).to_equal("0x4355c47d63924e8a72e509b65029052eb6c299d53a04e167c5775fd466751c9d07299936d304c153f6443dfa05f40ff007d72911b6f72307f996231605b915621c")
+    got, _ := accounts.recover_typed_data_address(mail(), sig)
+    expect(got).to_equal(cow.address)
+    expect(accounts.verify_typed_data(cow.address, mail(), sig)).to_be_true()
+  })
+  it("encodes arrays, integers, bytes and bools", fn() {
+    td := &accounts.TypedData{
+      domain: map[str]any{"name": "T", "chainId": "0x1", "salt": web3.keccak256("salt")},
+      types: map[str][]*accounts.TypedField{
+        "Item": []*accounts.TypedField{&accounts.TypedField{name: "id", type: "uint8"}, &accounts.TypedField{name: "tags", type: "string[]"}},
+        "Order": []*accounts.TypedField{&accounts.TypedField{name: "items", type: "Item[2]"}, &accounts.TypedField{name: "delta", type: "int256"}, &accounts.TypedField{name: "ok", type: "bool"}, &accounts.TypedField{name: "blob", type: "bytes"}, &accounts.TypedField{name: "tag", type: "bytes4"}, &accounts.TypedField{name: "amount", type: "uint256"}},
+      },
+      primary_type: "Order",
+      message: map[str]any{
+        "items": []any{map[str]any{"id": 1, "tags": []any{"a", "b"}}, map[str]any{"id": "255", "tags": []any{}}},
+        "delta": -5, "ok": true, "blob": "\x01\x02\x03", "tag": "0xdeadbeef", "amount": web3.parse_ether("1.5"),
+      },
+    }
+    h, err := accounts.hash_typed_data(td)
+    expect(err).to_be_nil()
+    expect(web3.to_hex(h)).to_equal(ORDER_HASH)
+  })
+  it("reports bad typed data", fn() {
+    td := mail()
+    delete(td.message, "contents")
+    _, err := accounts.hash_typed_data(td)
+    expect(err).not_().to_be_nil()
+    td2 := mail()
+    td2.primary_type = "Nope"
+    _, err2 := accounts.hash_typed_data(td2)
+    expect(err2).not_().to_be_nil()
+    td3 := mail()
+    td3.message["from"] = map[str]any{"name": "Cow", "wallet": "0x123"}
+    _, err3 := accounts.hash_typed_data(td3)
+    expect(err3).not_().to_be_nil()
+    td4 := mail()
+    td4.types["Mail"] = []*accounts.TypedField{&accounts.TypedField{name: "contents", type: "uint8"}}
+    td4.message["contents"] = 256
+    _, err4 := accounts.hash_typed_data(td4)
+    expect(err4).not_().to_be_nil()
+    _, err5 := accounts.hash_typed_data(nil)
+    expect(err5).not_().to_be_nil()
+  })
+})
+
+describe("transactions", fn() {
+  it("signs the EIP-155 example", fn() {
+    tx := &accounts.Transaction{type_: 0, chain_id: 1, nonce: 9, gas: 21000, gas_price: web3.must_u256("20000000000"), to_: "0x3535353535353535353535353535353535353535", value: web3.parse_ether("1")}
+    payload, err := accounts.serialize_transaction(tx, nil)
+    expect(err).to_be_nil()
+    expect(web3.to_hex(payload)).to_equal("0xec098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a764000080018080")
+    h, _ := accounts.transaction_signing_hash(tx)
+    expect(web3.to_hex(h)).to_equal("0xdaf5a779ae972f972197303d7b574746c7ef83eadac0f2791ad23db92e4c8e53")
+    a := acct("0x4646464646464646464646464646464646464646464646464646464646464646")
+    raw, err2 := a.sign_transaction(tx)
+    expect(err2).to_be_nil()
+    expect(web3.to_hex(raw)).to_equal(EIP155_RAW)
+    got, _ := accounts.recover_transaction_address(raw)
+    expect(got).to_equal(a.address)
+    ptx, sig, err3 := accounts.parse_transaction(raw)
+    expect(err3).to_be_nil()
+    expect(ptx.chain_id).to_equal(1)
+    expect(ptx.nonce).to_equal(9)
+    expect(sig.v).to_equal(37)
+    expect(sig.r.hex()).to_equal("0x28ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276")
+  })
+  it("parses and recovers a type-2 transaction signed by viem", fn() {
+    tx, sig, err := accounts.parse_transaction(web3.must_hex(T2_RAW))
+    expect(err).to_be_nil()
+    expect(tx.type_).to_equal(2)
+    expect(tx.nonce).to_equal(7)
+    expect(tx.gas).to_equal(50000)
+    expect(tx.max_fee_per_gas.dec()).to_equal("30000000000")
+    expect(tx.max_priority_fee_per_gas.dec()).to_equal("1500000000")
+    expect(tx.to_).to_equal("0x70997970C51812dc3A010C7d01b50e0d17dc79C8")
+    expect(tx.value.dec()).to_equal("12345678900000000")
+    expect(web3.to_hex(tx.data)).to_equal("0xa9059cbb")
+    expect(tx.access_list[0].address).to_equal("0x5FbDB2315678afecb367f032d93F642f64180aa3")
+    expect(tx.access_list[0].storage_keys[0]).to_equal("0x0000000000000000000000000000000000000000000000000000000000000001")
+    expect(sig.y_parity).to_equal(1)
+    got, _ := accounts.recover_transaction_address(web3.must_hex(T2_RAW))
+    expect(got).to_equal(HARDHAT0_ADDR)
+    expect(accounts.transaction_hash(web3.must_hex(T2_RAW))).to_equal("0xd7dca82ffd17cc36dd92e81abff740049e4a0ca545d4e25eb7fb430d4dfb0f62")
+    # and signing it again gives the same bytes
+    raw, _ := acct(HARDHAT0).sign_transaction(tx)
+    expect(web3.to_hex(raw)).to_equal(T2_RAW)
+  })
+  it("signs EIP-2930 transactions as viem does", fn() {
+    tx := &accounts.Transaction{type_: 1, chain_id: 11155111, nonce: 0, gas: 30000, gas_price: web3.must_u256("1000000000"), to_: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8", value: web3.u256(1)}
+    raw, err := acct(HARDHAT0).sign_transaction(tx)
+    expect(err).to_be_nil()
+    expect(web3.to_hex(raw)).to_equal(T1_RAW)
+    got, _ := accounts.recover_transaction_address(raw)
+    expect(got).to_equal(HARDHAT0_ADDR)
+  })
+  it("round-trips contract creation and legacy without chain id", fn() {
+    a := acct(HARDHAT0)
+    tx := &accounts.Transaction{type_: 2, chain_id: 8453, nonce: 1, gas: 3000000, max_fee_per_gas: web3.u256(100), max_priority_fee_per_gas: web3.u256(1), data: "\x60\x80\x60\x40"}
+    raw, _ := a.sign_transaction(tx)
+    ptx, _, err := accounts.parse_transaction(raw)
+    expect(err).to_be_nil()
+    expect(ptx.to_).to_equal("")
+    expect(ptx.chain_id).to_equal(8453)
+    got, _ := accounts.recover_transaction_address(raw)
+    expect(got).to_equal(HARDHAT0_ADDR)
+    old := &accounts.Transaction{nonce: 0, gas: 21000, gas_price: web3.u256(1), to_: HARDHAT0_ADDR}
+    raw2, _ := a.sign_transaction(old)
+    _, sig2, _ := accounts.parse_transaction(raw2)
+    expect(sig2.v == 27 || sig2.v == 28).to_be_true()
+    got2, _ := accounts.recover_transaction_address(raw2)
+    expect(got2).to_equal(HARDHAT0_ADDR)
+    unsigned, _ := accounts.serialize_transaction(tx, nil)
+    _, nosig, err3 := accounts.parse_transaction(unsigned)
+    expect(err3).to_be_nil()
+    expect(nosig == nil).to_be_true()
+  })
+  it("refuses malformed transactions", fn() {
+    for _, h := range []str{"0x", "0x03c0", "0x02", "0x02c0", "0xc0", "0x02c3010203", "0xf86c0985", "0x01" + T1_RAW[4:] + "00"} {
+      _, _, err := accounts.parse_transaction(web3.must_hex(h))
+      expect(err).not_().to_be_nil()
+    }
+    _, err2 := accounts.recover_transaction_address(web3.must_hex("0xec098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a764000080018080"))
+    expect(err2).not_().to_be_nil()
+    _, err3 := accounts.serialize_transaction(&accounts.Transaction{type_: 2, to_: "0x1234"}, nil)
+    expect(err3).not_().to_be_nil()
+    _, err4 := accounts.serialize_transaction(&accounts.Transaction{type_: 3}, nil)
+    expect(err4).not_().to_be_nil()
+    _, err5 := accounts.serialize_transaction(&accounts.Transaction{type_: 4}, nil)
+    expect(err5).not_().to_be_nil()
+  })
+})
+
+describe("hostile input", fn() {
+  it("never panics on random or mutated bytes", fn() {
+    base := web3.must_hex(T2_RAW)
+    for i := 0; i < 300; i++ {
+      r, _ := crypto.random_bytes(i % 70)
+      accounts.parse_transaction(r)
+      accounts.parse_transaction("\x02" + r)
+      accounts.parse_signature(r)
+      accounts.public_key_to_address(r)
+      # flip one byte of a valid transaction
+      pos := i % len(base)
+      m := base[0:pos] + string([]byte{byte(int(base[pos]) ^ (1 + i % 255))}) + base[pos + 1:]
+      accounts.recover_transaction_address(m)
+    }
+    expect(true).to_be_true()
+  })
+})
+
+describe("EIP-7702", fn() {
+  it("signs authorizations as viem does and recovers them", fn() {
+    a := acct(HARDHAT0)
+    au, err := a.sign_authorization(1, "0x5fbdb2315678afecb367f032d93f642f64180aa3", 3)
+    expect(err).to_be_nil()
+    expect(au.address).to_equal("0x5FbDB2315678afecb367f032d93F642f64180aa3")
+    expect(au.y_parity).to_equal(1)
+    expect(au.r.hex()).to_equal("0x479b26b5d649a8d18baa08b170e6d58713988d9d0c47bef6ecafb029ea47eebf")
+    expect(au.s.hex()).to_equal("0x60ece290629fb3551ecd9a195a0b3e1b9882c166c1e7cd2a070dfa875c1cccea")
+    got, err2 := accounts.recover_authorization_address(au)
+    expect(err2).to_be_nil()
+    expect(got).to_equal(HARDHAT0_ADDR)
+    _, err3 := a.sign_authorization(1, "0xnope", 0)
+    expect(err3).not_().to_be_nil()
+  })
+  it("signs and parses a type-4 transaction", fn() {
+    a := acct(HARDHAT0)
+    au, _ := a.sign_authorization(1, "0x5FbDB2315678afecb367f032d93F642f64180aa3", 3)
+    tx := &accounts.Transaction{type_: 4, chain_id: 1, nonce: 4, gas: 100000, max_fee_per_gas: web3.u256(2), max_priority_fee_per_gas: web3.u256(1), to_: HARDHAT0_ADDR, authorization_list: []*accounts.Authorization{au}}
+    raw, err := a.sign_transaction(tx)
+    expect(err).to_be_nil()
+    expect(web3.to_hex(raw)).to_equal(T4_RAW)
+    ptx, _, err2 := accounts.parse_transaction(raw)
+    expect(err2).to_be_nil()
+    expect(len(ptx.authorization_list)).to_equal(1)
+    got, _ := accounts.recover_authorization_address(ptx.authorization_list[0])
+    expect(got).to_equal(HARDHAT0_ADDR)
+    got2, _ := accounts.recover_transaction_address(raw)
+    expect(got2).to_equal(HARDHAT0_ADDR)
+  })
+})
+
