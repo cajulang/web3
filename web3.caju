@@ -1,0 +1,613 @@
+# web3: Ethereum and other EVM chains for Caju programs, on the server and in the browser
+# (caju-ui pages), in the spirit of viem (import "github.com/cajulang/web3").
+#
+#   v := web3.parse_ether("1.5")                      # a U256: 1500000000000000000 wei
+#   print(web3.format_units(v, 18) + " ETH")            # "1.5 ETH"
+#   web3.keccak256_hex("transfer(address,uint256)")    # "0xa9059cbb2ab09eb219583f4a59a5d0623ade346d962bcd4e46b11da047c9049b"
+#   web3.checksum_address("0xd8da6bf26964af9d7eed9e03e53415d37aa96045")   # "0xd8dA6BF2..."
+#
+# This file is the core: hex, Keccak-256, 256-bit integers (U256), units and addresses. The rest
+# lives in sub-packages: web3/abi (encoding), web3/rlp, web3/accounts (keys, signing,
+# transactions), web3/hd (mnemonics), web3/rpc (the public client, chains, contracts), web3/wallet
+# (EIP-1193 wallets in the browser), web3/aa (account abstraction). See README.md.
+#
+# Bytes are Caju strings of raw bytes; hex strings have the "0x" prefix.
+
+import "std/strings"
+import "std/hex"
+
+# ---------------------------------------------------------------- hex
+
+# "0x" + the hex of the bytes
+export fn to_hex(b: str) -> str { return "0x" + hex.encode(b) }
+
+# the bytes of a hex string ("0x" optional; an odd number of digits gets a leading 0)
+export fn from_hex(h: str) -> (str, error) {
+  s := strings.trim_prefix(strings.trim_prefix(h, "0x"), "0X")
+  if len(s) % 2 == 1 { s = "0" + s }
+  b, err := hex.decode(s)
+  if err != nil { return "", errors.New("web3: invalid hex " + strings_quote_short(h)) }
+  return b, nil
+}
+
+# like from_hex, for literals known to be valid (panics otherwise)
+export fn must_hex(h: str) -> str {
+  b, err := from_hex(h)
+  if err != nil { panic(err.Error()) }
+  return b
+}
+
+# is s "0x" followed by hex digits (of exactly n bytes when n >= 0)?
+export fn is_hex(s: str, n: int) -> bool {
+  if !strings.has_prefix(s, "0x") && !strings.has_prefix(s, "0X") { return false }
+  for i := 2; i < len(s); i++ {
+    if hex_val(int(s[i])) < 0 { return false }
+  }
+  return n < 0 || len(s) == 2 + 2 * n
+}
+
+# b left-padded with zero bytes to n bytes (unchanged if longer)
+export fn pad_left(b: str, n: int) -> str {
+  if len(b) >= n { return b }
+  return zeros(n - len(b)) + b
+}
+
+# b right-padded with zero bytes to n bytes
+export fn pad_right(b: str, n: int) -> str {
+  if len(b) >= n { return b }
+  return b + zeros(n - len(b))
+}
+
+# n zero bytes
+export fn zeros(n: int) -> str {
+  bs := []byte{}
+  for i := 0; i < n; i++ { bs = append(bs, byte(0)) }
+  return string(bs)
+}
+
+fn hex_val(c: int) -> int {
+  if c >= 48 && c <= 57 { return c - 48 }
+  if c >= 97 && c <= 102 { return c - 87 }
+  if c >= 65 && c <= 70 { return c - 55 }
+  return -1
+}
+
+# s without the bytes c at its start / end
+fn trim_leading(s: str, c: int) -> str {
+  i := 0
+  while i < len(s) && int(s[i]) == c { i++ }
+  return s[i:]
+}
+fn trim_trailing(s: str, c: int) -> str {
+  n := len(s)
+  while n > 0 && int(s[n - 1]) == c { n-- }
+  return s[0:n]
+}
+
+fn strings_quote_short(s: str) -> str {
+  if len(s) > 80 { s = s[0:80] + "..." }
+  return "\"" + s + "\""
+}
+
+# ---------------------------------------------------------------- Keccak-256
+
+# round constants (hi, lo) and rotation offsets (index x + 5y)
+let KECCAK_RC = []int{0x00000000, 0x00000001, 0x00000000, 0x00008082, 0x80000000, 0x0000808a, 0x80000000, 0x80008000, 0x00000000, 0x0000808b, 0x00000000, 0x80000001, 0x80000000, 0x80008081, 0x80000000, 0x00008009, 0x00000000, 0x0000008a, 0x00000000, 0x00000088, 0x00000000, 0x80008009, 0x00000000, 0x8000000a, 0x00000000, 0x8000808b, 0x80000000, 0x0000008b, 0x80000000, 0x00008089, 0x80000000, 0x00008003, 0x80000000, 0x00008002, 0x80000000, 0x00000080, 0x00000000, 0x0000800a, 0x80000000, 0x8000000a, 0x80000000, 0x80008081, 0x80000000, 0x00008080, 0x00000000, 0x80000001, 0x80000000, 0x80008008}
+let KECCAK_ROT = []int{0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14}
+
+fn rotl(x: int, n: int) -> int {
+  if n == 0 { return x }
+  return (x << n) | int(uint64(x) >> (64 - n))
+}
+
+fn keccak_f(a: []int) {
+  c := make([]int, 5)
+  d := make([]int, 5)
+  b := make([]int, 25)
+  round := 0
+  while round < 24 {
+    x := 0
+    while x < 5 {
+      c[x] = a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20]
+      x++
+    }
+    x = 0
+    while x < 5 {
+      d[x] = c[(x + 4) % 5] ^ rotl(c[(x + 1) % 5], 1)
+      x++
+    }
+    i := 0
+    while i < 25 {
+      a[i] = a[i] ^ d[i % 5]
+      i++
+    }
+    # rho and pi
+    y := 0
+    while y < 5 {
+      x = 0
+      while x < 5 {
+        b[y + 5 * ((2 * x + 3 * y) % 5)] = rotl(a[x + 5 * y], KECCAK_ROT[x + 5 * y])
+        x++
+      }
+      y++
+    }
+    # chi
+    y = 0
+    while y < 5 {
+      x = 0
+      while x < 5 {
+        a[x + 5 * y] = b[x + 5 * y] ^ ((b[(x + 1) % 5 + 5 * y] ^ -1) & b[(x + 2) % 5 + 5 * y])
+        x++
+      }
+      y++
+    }
+    # iota
+    a[0] = a[0] ^ ((KECCAK_RC[2 * round] << 32) | KECCAK_RC[2 * round + 1])
+    round++
+  }
+}
+
+# Keccak-256 (Ethereum's hash: the original Keccak padding, not SHA3-256's), 32 bytes
+export fn keccak256(data: str) -> str {
+  rate := 136
+  a := make([]int, 25)
+  # padding: 0x01 ... 0x80
+  n := len(data)
+  padded := (n / rate + 1) * rate
+  blk := make([]int, padded)
+  for i := 0; i < n; i++ { blk[i] = int(data[i]) }
+  blk[n] = blk[n] | 0x01
+  blk[padded - 1] = blk[padded - 1] | 0x80
+  off := 0
+  while off < padded {
+    lane := 0
+    while lane < rate / 8 {
+      v := 0
+      k := 7
+      while k >= 0 {
+        v = (v << 8) | blk[off + 8 * lane + k]
+        k--
+      }
+      a[lane] = a[lane] ^ v
+      lane++
+    }
+    keccak_f(a)
+    off += rate
+  }
+  out := []byte{}
+  for lane := 0; lane < 4; lane++ {
+    v := a[lane]
+    for k := 0; k < 8; k++ { out = append(out, byte((v >> (8 * k)) & 255)) }
+  }
+  return string(out)
+}
+
+# "0x" + the hex of keccak256(data)
+export fn keccak256_hex(data: str) -> str { return to_hex(keccak256(data)) }
+
+# ---------------------------------------------------------------- U256
+
+# an unsigned 256-bit integer (the EVM's word): eight 32-bit limbs, least significant first.
+# Arithmetic wraps around 2^256, as in the EVM; int256 values are their two's complement
+# (from_int(-1) is 2^256 - 1; to_signed_dec, is_negative read them as signed).
+export struct U256 {
+  w: []int
+}
+
+const MASK32 = 0xFFFFFFFF
+
+fn new_u256() -> *U256 { return &U256{w: make([]int, 8)} }
+
+# 0, 1...
+export fn u256(n: int) -> *U256 { return from_int(n) }
+
+# n (a negative n is its two's complement)
+export fn from_int(n: int) -> *U256 {
+  r := new_u256()
+  r.w[0] = n & MASK32
+  r.w[1] = (n >> 32) & MASK32
+  fill := 0
+  if n < 0 { fill = MASK32 }
+  for i := 2; i < 8; i++ { r.w[i] = fill }
+  return r
+}
+
+export fn zero() -> *U256 { return new_u256() }
+
+# 2^256 - 1
+export fn max_u256() -> *U256 {
+  r := new_u256()
+  for i := 0; i < 8; i++ { r.w[i] = MASK32 }
+  return r
+}
+
+# a number written in decimal ("1500"), hex ("0x5dc") or with a minus sign ("-1": two's complement)
+export fn parse_u256(s: str) -> (*U256, error) {
+  t := strings.trim_space(s)
+  neg := false
+  if strings.has_prefix(t, "-") {
+    neg = true
+    t = t[1:]
+  }
+  if t == "" { return nil, errors.New("web3: empty number") }
+  r := new_u256()
+  if strings.has_prefix(t, "0x") || strings.has_prefix(t, "0X") {
+    h := t[2:]
+    if h == "" || len(h) > 64 { return nil, errors.New("web3: invalid hex number " + strings_quote_short(s)) }
+    for i := 0; i < len(h); i++ {
+      v := hex_val(int(h[i]))
+      if v < 0 { return nil, errors.New("web3: invalid hex number " + strings_quote_short(s)) }
+      r = r.shl(4)
+      r.w[0] = r.w[0] | v
+    }
+  } else {
+    ten := from_int(10)
+    for i := 0; i < len(t); i++ {
+      c := int(t[i])
+      if c == 95 { continue }      # 1_000_000
+      if c < 48 || c > 57 { return nil, errors.New("web3: invalid number " + strings_quote_short(s)) }
+      m := r.mul(ten)
+      if m.div(ten).cmp(r) != 0 { return nil, errors.New("web3: number above 2^256: " + strings_quote_short(s)) }
+      sum := m.add(from_int(c - 48))
+      if sum.cmp(m) < 0 { return nil, errors.New("web3: number above 2^256: " + strings_quote_short(s)) }
+      r = sum
+    }
+  }
+  if neg { r = r.neg() }
+  return r, nil
+}
+
+# like parse_u256, for literals known to be valid
+export fn must_u256(s: str) -> *U256 {
+  r, err := parse_u256(s)
+  if err != nil { panic(err.Error()) }
+  return r
+}
+
+# the 32-byte big-endian encoding of an integer (up to 32 bytes; longer input keeps its last 32)
+export fn from_bytes(b: str) -> *U256 {
+  if len(b) > 32 { b = b[len(b) - 32:] }
+  b = pad_left(b, 32)
+  r := new_u256()
+  for i := 0; i < 8; i++ {
+    p := 28 - 4 * i
+    r.w[i] = (int(b[p]) << 24) | (int(b[p + 1]) << 16) | (int(b[p + 2]) << 8) | int(b[p + 3])
+  }
+  return r
+}
+
+# 32 bytes, big-endian
+export fn (a: *U256) bytes32() -> str {
+  out := []byte{}
+  i := 7
+  while i >= 0 {
+    v := a.w[i]
+    out = append(out, byte((v >> 24) & 255))
+    out = append(out, byte((v >> 16) & 255))
+    out = append(out, byte((v >> 8) & 255))
+    out = append(out, byte(v & 255))
+    i--
+  }
+  return string(out)
+}
+
+# the shortest big-endian bytes ("" for zero), as RLP wants
+export fn (a: *U256) bytes() -> str {
+  b := a.bytes32()
+  i := 0
+  while i < 32 && int(b[i]) == 0 { i++ }
+  return b[i:]
+}
+
+export fn (a: *U256) is_zero() -> bool {
+  for i := 0; i < 8; i++ { if a.w[i] != 0 { return false } }
+  return true
+}
+
+# -1, 0 or 1 (unsigned)
+export fn (a: *U256) cmp(b: *U256) -> int {
+  i := 7
+  while i >= 0 {
+    if a.w[i] < b.w[i] { return -1 }
+    if a.w[i] > b.w[i] { return 1 }
+    i--
+  }
+  return 0
+}
+
+export fn (a: *U256) eq(b: *U256) -> bool { return a.cmp(b) == 0 }
+export fn (a: *U256) lt(b: *U256) -> bool { return a.cmp(b) < 0 }
+export fn (a: *U256) gt(b: *U256) -> bool { return a.cmp(b) > 0 }
+
+export fn (a: *U256) add(b: *U256) -> *U256 {
+  r := new_u256()
+  carry := 0
+  for i := 0; i < 8; i++ {
+    s := a.w[i] + b.w[i] + carry
+    r.w[i] = s & MASK32
+    carry = s >> 32
+  }
+  return r
+}
+
+export fn (a: *U256) sub(b: *U256) -> *U256 {
+  r := new_u256()
+  borrow := 0
+  for i := 0; i < 8; i++ {
+    s := a.w[i] - b.w[i] - borrow
+    if s < 0 {
+      s += 1 << 32
+      borrow = 1
+    } else { borrow = 0 }
+    r.w[i] = s
+  }
+  return r
+}
+
+export fn (a: *U256) mul(b: *U256) -> *U256 {
+  t := make([]int, 8)
+  for i := 0; i < 8; i++ {
+    if a.w[i] == 0 { continue }
+    carry := 0
+    j := 0
+    while i + j < 8 {
+      # 32x32 bits into 64: split to stay within a signed int
+      p := a.w[i] * b.w[j]
+      lo := (p & MASK32) + t[i + j] + carry
+      t[i + j] = lo & MASK32
+      carry = int(uint64(p) >> 32) + (lo >> 32)
+      j++
+    }
+  }
+  return &U256{w: t}
+}
+
+# the two's complement (-a)
+export fn (a: *U256) neg() -> *U256 { return zero().sub(a) }
+
+export fn (a: *U256) shl(n: int) -> *U256 {
+  r := new_u256()
+  if n >= 256 || n < 0 { return r }
+  words := n / 32
+  bits := n % 32
+  i := 7
+  while i >= words {
+    v := a.w[i - words] << bits
+    if bits > 0 && i - words - 1 >= 0 { v = v | (a.w[i - words - 1] >> (32 - bits)) }
+    r.w[i] = v & MASK32
+    i--
+  }
+  return r
+}
+
+export fn (a: *U256) shr(n: int) -> *U256 {
+  r := new_u256()
+  if n >= 256 || n < 0 { return r }
+  words := n / 32
+  bits := n % 32
+  for i := 0; i + words < 8; i++ {
+    v := a.w[i + words] >> bits
+    if bits > 0 && i + words + 1 < 8 { v = v | (a.w[i + words + 1] << (32 - bits)) }
+    r.w[i] = v & MASK32
+  }
+  return r
+}
+
+export fn (a: *U256) and_(b: *U256) -> *U256 {
+  r := new_u256()
+  for i := 0; i < 8; i++ { r.w[i] = a.w[i] & b.w[i] }
+  return r
+}
+
+export fn (a: *U256) or_(b: *U256) -> *U256 {
+  r := new_u256()
+  for i := 0; i < 8; i++ { r.w[i] = a.w[i] | b.w[i] }
+  return r
+}
+
+fn (a: *U256) bit_len() -> int {
+  i := 7
+  while i >= 0 {
+    if a.w[i] != 0 {
+      b := 32
+      while b > 0 && ((a.w[i] >> (b - 1)) & 1) == 0 { b-- }
+      return 32 * i + b
+    }
+    i--
+  }
+  return 0
+}
+
+# quotient and remainder (b must not be zero)
+export fn (a: *U256) divmod(b: *U256) -> (*U256, *U256) {
+  if b.is_zero() { panic("web3: division by zero") }
+  if a.cmp(b) < 0 { return zero(), a }
+  q := new_u256()
+  r := new_u256()
+  i := a.bit_len() - 1
+  while i >= 0 {
+    r = r.shl(1)
+    r.w[0] = r.w[0] | ((a.w[i / 32] >> (i % 32)) & 1)
+    if r.cmp(b) >= 0 {
+      r = r.sub(b)
+      q.w[i / 32] = q.w[i / 32] | (1 << (i % 32))
+    }
+    i--
+  }
+  return q, r
+}
+
+export fn (a: *U256) div(b: *U256) -> *U256 {
+  q, _ := a.divmod(b)
+  return q
+}
+
+export fn (a: *U256) mod(b: *U256) -> *U256 {
+  _, r := a.divmod(b)
+  return r
+}
+
+# 10^n
+export fn pow10(n: int) -> *U256 {
+  r := from_int(1)
+  ten := from_int(10)
+  for i := 0; i < n; i++ { r = r.mul(ten) }
+  return r
+}
+
+# the value as an int, and whether it fits (below 2^63)
+export fn (a: *U256) to_int() -> (int, bool) {
+  for i := 2; i < 8; i++ { if a.w[i] != 0 { return 0, false } }
+  if a.w[1] >= 0x80000000 { return 0, false }
+  return (a.w[1] << 32) | a.w[0], true
+}
+
+# decimal digits
+export fn (a: *U256) dec() -> str {
+  if a.is_zero() { return "0" }
+  digits := []byte{}
+  x := a
+  # 9 digits at a time
+  billion := from_int(1000000000)
+  while !x.is_zero() {
+    q, r := x.divmod(billion)
+    chunk, _ := r.to_int()
+    for k := 0; k < 9; k++ {
+      digits = append(digits, byte(48 + chunk % 10))
+      chunk = chunk / 10
+    }
+    x = q
+  }
+  # reverse and drop leading zeros
+  n := len(digits)
+  while n > 1 && int(digits[n - 1]) == 48 { n-- }
+  out := []byte{}
+  i := n - 1
+  while i >= 0 {
+    out = append(out, digits[i])
+    i--
+  }
+  return string(out)
+}
+
+# "0x" + the shortest hex digits ("0x0" for zero), as JSON-RPC quantities are written
+export fn (a: *U256) hex() -> str {
+  h := hex.encode(a.bytes())
+  h = trim_leading(h, 48)
+  if h == "" { h = "0" }
+  return "0x" + h
+}
+
+# is the int256 reading of a negative (its top bit set)?
+export fn (a: *U256) is_negative() -> bool { return (a.w[7] >> 31) & 1 == 1 }
+
+# the decimal digits of the int256 reading
+export fn (a: *U256) signed_dec() -> str {
+  if a.is_negative() { return "-" + a.neg().dec() }
+  return a.dec()
+}
+
+export fn (a: *U256) string() -> str { return a.dec() }
+
+# ---------------------------------------------------------------- units
+
+# "1.5" with 18 decimals is 1500000000000000000 (the smallest unit); too many decimals is an error
+export fn parse_units(s: str, decimals: int) -> (*U256, error) {
+  t := strings.trim_space(s)
+  if strings.has_prefix(t, "-") { return nil, errors.New("web3: negative amount " + strings_quote_short(s)) }
+  whole := t
+  frac := ""
+  dot := strings.index(t, ".")
+  if dot >= 0 {
+    whole = t[0:dot]
+    frac = t[dot + 1:]
+  }
+  if whole == "" { whole = "0" }
+  if len(frac) > decimals {
+    # extra digits must be zeros
+    extra := frac[decimals:]
+    if trim_trailing(extra, 48) != "" { return nil, errors.New("web3: " + strings_quote_short(s) + " has more than " + str(decimals) + " decimals") }
+    frac = frac[0:decimals]
+  }
+  if strings.contains(frac, "-") || strings.contains(frac, "+") { return nil, errors.New("web3: invalid amount " + strings_quote_short(s)) }
+  w, err := parse_u256(whole)
+  if err != nil || strings.has_prefix(whole, "0x") { return nil, errors.New("web3: invalid amount " + strings_quote_short(s)) }
+  f := zero()
+  if frac != "" {
+    f2, err2 := parse_u256(frac + strings.repeat("0", decimals - len(frac)))
+    if err2 != nil { return nil, errors.New("web3: invalid amount " + strings_quote_short(s)) }
+    f = f2
+  }
+  scale := pow10(decimals)
+  wv := w.mul(scale)
+  if !scale.is_zero() && wv.div(scale).cmp(w) != 0 { return nil, errors.New("web3: amount above 2^256") }
+  return wv.add(f), nil
+}
+
+# 1500000000000000000 with 18 decimals is "1.5" (no trailing zeros; "0" for zero)
+export fn format_units(v: *U256, decimals: int) -> str {
+  if decimals == 0 { return v.dec() }
+  q, r := v.divmod(pow10(decimals))
+  if r.is_zero() { return q.dec() }
+  fs := r.dec()
+  fs = strings.repeat("0", decimals - len(fs)) + fs
+  fs = trim_trailing(fs, 48)
+  return q.dec() + "." + fs
+}
+
+# ether to wei (18 decimals)
+export fn parse_ether(s: str) -> *U256 {
+  v, err := parse_units(s, 18)
+  if err != nil { panic(err.Error()) }
+  return v
+}
+
+# wei to ether
+export fn format_ether(v: *U256) -> str { return format_units(v, 18) }
+
+# gwei (9 decimals)
+export fn parse_gwei(s: str) -> (*U256, error) { return parse_units(s, 9) }
+export fn format_gwei(v: *U256) -> str { return format_units(v, 9) }
+
+# ---------------------------------------------------------------- addresses
+
+# is s a 20-byte hex address? With mixed case, its EIP-55 checksum must match
+export fn is_address(s: str) -> bool {
+  if !is_hex(s, 20) { return false }
+  body := s[2:]
+  if body == strings.to_lower(body) || body == strings.to_upper(body) { return true }
+  return checksum_address(s) == s
+}
+
+# the EIP-55 form of an address (mixed case from its Keccak-256)
+export fn checksum_address(s: str) -> str {
+  lower := strings.to_lower(strings.trim_prefix(strings.trim_prefix(s, "0x"), "0X"))
+  h := hex.encode(keccak256(lower))
+  out := []byte{}
+  for i := 0; i < len(lower); i++ {
+    c := int(lower[i])
+    if c >= 97 && c <= 102 && hex_val(int(h[i])) >= 8 { c = c - 32 }
+    out = append(out, byte(c))
+  }
+  return "0x" + string(out)
+}
+
+# a valid address in its EIP-55 form, or an error
+export fn get_address(s: str) -> (str, error) {
+  if !is_address(s) { return "", errors.New("web3: invalid address " + strings_quote_short(s)) }
+  return checksum_address(s), nil
+}
+
+# the 20 bytes of an address
+export fn address_bytes(s: str) -> (str, error) {
+  if !is_address(s) { return "", errors.New("web3: invalid address " + strings_quote_short(s)) }
+  return from_hex(s)
+}
+
+# the address (EIP-55) of 20 bytes
+export fn address_from_bytes(b: str) -> str { return checksum_address(to_hex(pad_left(b, 20)[len(pad_left(b, 20)) - 20:])) }
+
+export const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+
+# are two addresses the same (any case)?
+export fn same_address(a: str, b: str) -> bool { return strings.to_lower(a) == strings.to_lower(b) }

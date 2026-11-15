@@ -1,0 +1,85 @@
+# web3's core: hex, Keccak-256, U256, units, addresses.
+import { describe, it, expect } from "std/testing"
+import "github.com/cajulang/web3"
+import "std/strings"
+
+describe("keccak256", fn() {
+  it("hashes the known vectors", fn() {
+    expect(web3.keccak256_hex("")).to_equal("0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+    expect(web3.keccak256_hex("abc")).to_equal("0x4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45")
+    expect(web3.keccak256_hex("transfer(address,uint256)")).to_equal("0xa9059cbb2ab09eb219583f4a59a5d0623ade346d962bcd4e46b11da047c9049b")
+    expect(web3.keccak256_hex("Transfer(address,address,uint256)")).to_equal("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+  })
+  it("handles lengths around the rate (136 bytes)", fn() {
+    expect(web3.keccak256_hex(strings.repeat("a", 135))).to_equal("0x34367dc248bbd832f4e3e69dfaac2f92638bd0bbd18f2912ba4ef454919cf446")
+    expect(web3.keccak256_hex(strings.repeat("a", 136))).to_equal("0xa6c4d403279fe3e0af03729caada8374b5ca54d8065329a3ebcaeb4b60aa386e")
+    expect(web3.keccak256_hex(strings.repeat("a", 137))).to_equal("0xd869f639c7046b4929fc92a4d988a8b22c55fbadb802c0c66ebcd484f1915f39")
+  })
+})
+
+describe("U256", fn() {
+  it("parses and prints decimal and hex", fn() {
+    v := web3.must_u256("115792089237316195423570985008687907853269984665640564039457584007913129639935")
+    expect(v.eq(web3.max_u256())).to_be_true()
+    expect(v.hex()).to_equal("0x" + strings.repeat("f", 64))
+    expect(web3.must_u256("0x5dc").dec()).to_equal("1500")
+    expect(web3.must_u256("1_000_000").dec()).to_equal("1000000")
+    expect(web3.zero().hex()).to_equal("0x0")
+    _, err := web3.parse_u256("115792089237316195423570985008687907853269984665640564039457584007913129639936")
+    expect(err).not_().to_be_nil()
+  })
+  it("adds, subtracts, multiplies and divides, wrapping at 2^256", fn() {
+    a := web3.must_u256("123456789012345678901234567890")
+    b := web3.must_u256("987654321098765432109876543210")
+    expect(a.add(b).dec()).to_equal("1111111110111111111011111111100")
+    expect(b.sub(a).dec()).to_equal("864197532086419753208641975320")
+    expect(a.mul(b).dec()).to_equal("121932631137021795226185032733622923332237463801111263526900")
+    expect(b.div(a).dec()).to_equal("8")
+    expect(b.mod(a).dec()).to_equal("9000000000900000000090")
+    expect(web3.max_u256().add(web3.u256(1)).is_zero()).to_be_true()
+    expect(web3.zero().sub(web3.u256(1)).eq(web3.max_u256())).to_be_true()
+  })
+  it("reads int256 values", fn() {
+    expect(web3.from_int(-5).signed_dec()).to_equal("-5")
+    expect(web3.from_int(-5).is_negative()).to_be_true()
+    expect(web3.from_int(7).signed_dec()).to_equal("7")
+  })
+  it("converts to and from 32 bytes", fn() {
+    v := web3.must_u256("0x0102")
+    expect(len(v.bytes32())).to_equal(32)
+    expect(web3.from_bytes(v.bytes32()).eq(v)).to_be_true()
+    expect(web3.to_hex(v.bytes())).to_equal("0x0102")
+    expect(web3.zero().bytes()).to_equal("")
+  })
+})
+
+describe("units", fn() {
+  it("parses and formats ether, gwei and token units", fn() {
+    expect(web3.parse_ether("1.5").dec()).to_equal("1500000000000000000")
+    expect(web3.format_ether(web3.must_u256("1500000000000000000"))).to_equal("1.5")
+    expect(web3.format_ether(web3.must_u256("1"))).to_equal("0.000000000000000001")
+    v, _ := web3.parse_units("12.345678", 6)
+    expect(v.dec()).to_equal("12345678")
+    expect(web3.format_units(v, 6)).to_equal("12.345678")
+    expect(web3.format_units(web3.must_u256("1000000"), 6)).to_equal("1")
+    _, err := web3.parse_units("1.0000001", 6)
+    expect(err).not_().to_be_nil()
+    w, _ := web3.parse_units("2.50", 6)
+    expect(w.dec()).to_equal("2500000")
+  })
+})
+
+describe("addresses", fn() {
+  it("checksums as EIP-55 says", fn() {
+    for _, a := range []str{"0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359", "0xdbF03B407c01E7cD3CBea99509d93f8DDDC8C6FB", "0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb"} {
+      expect(web3.checksum_address(strings.to_lower(a))).to_equal(a)
+      expect(web3.is_address(a)).to_be_true()
+    }
+  })
+  it("refuses a wrong checksum and bad lengths", fn() {
+    expect(web3.is_address("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeD")).to_be_false()
+    expect(web3.is_address("0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed")).to_be_true()
+    expect(web3.is_address("0x1234")).to_be_false()
+    expect(web3.is_address("5aaeb6053f3e94c9b9a09f33669435e7ef1beaed")).to_be_false()
+  })
+})

@@ -1,0 +1,12 @@
+[package]
+name = "github.com/cajulang/web3"
+version = "0.1.0"
+description = "Ethereum and EVM chains for Caju, on the server and in the browser, in the spirit of viem"
+license = "MIT"
+authors = ["Aécio"]
+entry = "web3.caju"
+caju = "0.8.0"
+
+[dependencies]
+"github.com/cajulang/fetch" = "0.1.1"
+"github.com/cajulang/ui" = "0.3.0"
