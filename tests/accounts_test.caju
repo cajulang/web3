@@ -4,6 +4,7 @@ import { describe, it, expect } from "std/testing"
 import "github.com/cajulang/web3"
 import "github.com/cajulang/web3/accounts"
 import "std/strings"
+import "std/crypto"
 
 let EIP155_RAW = "0xf86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a76400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a067cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83"
 let T2_RAW = "0x02f8af01078459682f008506fc23ac0082c3509470997970c51812dc3a010c7d01b50e0d17dc79c8872bdc545d58750084a9059cbbf838f7945fbdb2315678afecb367f032d93f642f64180aa3e1a0000000000000000000000000000000000000000000000000000000000000000101a00557cd2f4cc0497d46b4ba7a0ffe8be47336646277c155c69379f774307bc922a07e0a9cc5ffe67a9d038ae2f36058c54780a154b9b03d3a196572a734ac0d0c74"
@@ -309,6 +310,24 @@ describe("transactions", fn() {
     expect(err4).not_().to_be_nil()
     _, err5 := accounts.serialize_transaction(&accounts.Transaction{type_: 4}, nil)
     expect(err5).not_().to_be_nil()
+  })
+})
+
+describe("hostile input", fn() {
+  it("never panics on random or mutated bytes", fn() {
+    base := web3.must_hex(T2_RAW)
+    for i := 0; i < 300; i++ {
+      r, _ := crypto.random_bytes(i % 70)
+      accounts.parse_transaction(r)
+      accounts.parse_transaction("\x02" + r)
+      accounts.parse_signature(r)
+      accounts.public_key_to_address(r)
+      # flip one byte of a valid transaction
+      pos := i % len(base)
+      m := base[0:pos] + string([]byte{byte(int(base[pos]) ^ (1 + i % 255))}) + base[pos + 1:]
+      accounts.recover_transaction_address(m)
+    }
+    expect(true).to_be_true()
   })
 })
 

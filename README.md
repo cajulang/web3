@@ -82,3 +82,34 @@ no special cases); k*G through a precomputed table of 64 4-bit windows read enti
 (the same operations for every secret scalar); RFC 6979 nonces (the same signatures as viem and
 ethers); low s (EIP-2). On a typical x86-64 machine: about 1 ms to sign, 2 ms to recover, 0.5 ms
 from key to address, plus 5 ms once to build the table.
+
+## web3/hd
+
+BIP-39 mnemonics (English), BIP-32 hierarchical keys and BIP-44 Ethereum accounts.
+
+```caju
+import "github.com/cajulang/web3/hd"
+
+m, err := hd.generate_mnemonic(128)                  # 12 words (128..256 bits: 12..24 words)
+err = hd.validate_mnemonic(m)                         # nil, or why it is invalid (word, checksum)
+acct, err := hd.mnemonic_to_account(m, "", 0)         # m/44'/60'/0'/0/0, like MetaMask/Hardhat/viem
+
+seed := hd.mnemonic_to_seed(m, "passphrase")          # 64 bytes (PBKDF2-HMAC-SHA512, 2048 rounds)
+k, err := hd.master_from_seed(seed).derive("m/44'/60'/0'/0/3")
+k.xprv()                                              # "xprv..."; k.xpub() "xpub..."
+a3, err := k.account()
+```
+
+| Function | |
+|---|---|
+| `generate_mnemonic(bits)`, `entropy_to_mnemonic(e)`, `mnemonic_to_entropy(m)`, `validate_mnemonic(m)` | BIP-39 with the English list (`wordlist()`) |
+| `mnemonic_to_seed(m, passphrase)`, `pbkdf2_sha512(...)` | the seed |
+| `master_from_seed(seed) -> *HDKey` | `HDKey { private_key, chain_code, public_key (33 bytes, compressed), depth, index, parent_fingerprint }` |
+| `k.derive("m/44'/60'/0'/0/0")`, `k.child(index)` | hardened with `'` or `h` (or `index >= hd.HARDENED`); paths are relative to `k` |
+| `k.xprv()`, `k.xpub()`, `k.fingerprint()`, `k.account()` | serialization (Base58Check) and the Ethereum account |
+| `mnemonic_to_account(m, passphrase, index)` | BIP-44 `m/44'/60'/0'/0/index` |
+| `base58check(payload)`, `ripemd160(data)` | helpers |
+
+The mnemonic is used with its whitespace trimmed and collapsed; BIP-39 also asks for Unicode
+NFKD, which leaves ASCII unchanged: normalize non-ASCII passphrases before calling. Deriving a
+seed takes about 35 ms. Not included yet: parsing xprv/xpub strings and public-only derivation.

@@ -3,6 +3,7 @@ import { describe, it, expect } from "std/testing"
 import "github.com/cajulang/web3"
 import "github.com/cajulang/web3/rlp"
 import "std/strings"
+import "std/crypto"
 
 fn hx(v: any) -> str { return web3.to_hex(rlp.encode(v)) }
 
@@ -78,6 +79,15 @@ describe("rlp.decode", fn() {
     expect(dec_err("0xf800")).to_be_true()
     expect(dec_err("0xbf")).to_be_true()
     expect(dec_err("0xffffffffffffffffff")).to_be_true()
+  })
+  it("never panics on random bytes", fn() {
+    n := 0
+    for i := 0; i < 500; i++ {
+      r, _ := crypto.random_bytes(1 + i % 40)
+      _, err := rlp.decode(r)
+      if err == nil { n++ }
+    }
+    expect(n >= 0).to_be_true()
   })
   it("refuses bad integers", fn() {
     _, err := rlp.as_uint("\x00\x01")

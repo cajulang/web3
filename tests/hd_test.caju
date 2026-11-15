@@ -1,0 +1,127 @@
+# web3/hd: BIP-39 (Trezor vectors), BIP-32 (test vector 1) and BIP-44 accounts.
+import { describe, it, expect } from "std/testing"
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/hd"
+import "std/crypto"
+import "std/hex"
+import "std/strings"
+
+let HARDHAT = "test test test test test test test test test test test junk"
+
+# [entropy, mnemonic, seed with the passphrase "TREZOR"]
+let TREZOR = [][]str{
+  []str{"00000000000000000000000000000000", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e53495531f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04"},
+  []str{"7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f", "legal winner thank year wave sausage worth useful legal winner thank yellow", "2e8905819b8723fe2c1d161860e5ee1830318dbf49a83bd451cfb8440c28bd6fa457fe1296106559a3c80937a1c1069be3a3a5bd381ee6260e8d9739fce1f607"},
+  []str{"80808080808080808080808080808080", "letter advice cage absurd amount doctor acoustic avoid letter advice cage above", "d71de856f81a8acc65e6fc851a38d4d7ec216fd0796d0a6827a3ad6ed5511a30fa280f12eb2e47ed2ac03b5c462a0358d18d69fe4f985ec81778c1b370b652a8"},
+  []str{"ffffffffffffffffffffffffffffffff", "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "ac27495480225222079d7be181583751e86f571027b0497b5b5d11218e0a8a13332572917f0f8e5a589620c6f15b11c61dee327651a14c34e18231052e48c069"},
+  []str{"0000000000000000000000000000000000000000000000000000000000000000", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art", "bda85446c68413707090a52022edd26a1c9462295029f2e60cd7c4f2bbd3097170af7a4d73245cafa9c3cca8d561a7c3de6f5d4a10be8ed2a5e608d68f92fcc8"},
+  []str{"f585c11aec520db57dd353c69554b21a89b20fb0650966fa0a9d6f74fd989d8f", "void come effort suffer camp survey warrior heavy shoot primary clutch crush open amazing screen patrol group space point ten exist slush involve unfold", "01f5bced59dec48e362f2c45b5de68b9fd6c92c6634f44d6d40aab69056506f0e35524a518034ddc1192e1dacd32c1ed3eaa3c3b131c88ed8e7e54c49a5d0998"},
+}
+
+fn unhex(s: str) -> str {
+  b, err := hex.decode(s)
+  if err != nil { panic(err.Error()) }
+  return b
+}
+
+describe("BIP-39", fn() {
+  it("has the 2048-word English list", fn() {
+    w := hd.wordlist()
+    expect(len(w)).to_equal(2048)
+    expect(w[0]).to_equal("abandon")
+    expect(w[2047]).to_equal("zoo")
+    expect(crypto.sha256_hex(strings.join(w, "\n") + "\n")).to_equal("2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda")
+  })
+  it("maps entropy to mnemonics and back (Trezor vectors)", fn() {
+    for _, v := range TREZOR {
+      m, err := hd.entropy_to_mnemonic(unhex(v[0]))
+      expect(err).to_be_nil()
+      expect(m).to_equal(v[1])
+      e, err2 := hd.mnemonic_to_entropy(v[1])
+      expect(err2).to_be_nil()
+      expect(hex.encode(e)).to_equal(v[0])
+    }
+  })
+  it("derives the seeds of the Trezor vectors", fn() {
+    for _, v := range TREZOR { expect(hex.encode(hd.mnemonic_to_seed(v[1], "TREZOR"))).to_equal(v[2]) }
+  })
+  it("validates words and checksums", fn() {
+    expect(hd.validate_mnemonic(HARDHAT)).to_be_nil()
+    expect(hd.validate_mnemonic("  test test test test test test test test test test test junk ")).to_be_nil()
+    expect(hd.validate_mnemonic("test test test test test test test test test test test test")).not_().to_be_nil()
+    expect(hd.validate_mnemonic("test test test test test test test test test test test jnuk")).not_().to_be_nil()
+    expect(hd.validate_mnemonic("test test test")).not_().to_be_nil()
+    expect(hd.validate_mnemonic("")).not_().to_be_nil()
+    expect(hd.validate_mnemonic("Test test test test test test test test test test test junk")).not_().to_be_nil()
+  })
+  it("generates valid mnemonics", fn() {
+    for _, bits := range []int{128, 160, 192, 224, 256} {
+      m, err := hd.generate_mnemonic(bits)
+      expect(err).to_be_nil()
+      expect(len(strings.fields(m))).to_equal(bits / 32 * 3)
+      expect(hd.validate_mnemonic(m)).to_be_nil()
+    }
+    _, err2 := hd.generate_mnemonic(100)
+    expect(err2).not_().to_be_nil()
+    _, err3 := hd.generate_mnemonic(512)
+    expect(err3).not_().to_be_nil()
+    _, err4 := hd.entropy_to_mnemonic("abc")
+    expect(err4).not_().to_be_nil()
+  })
+})
+
+describe("BIP-32", fn() {
+  it("follows test vector 1", fn() {
+    m := hd.master_from_seed(unhex("000102030405060708090a0b0c0d0e0f"))
+    expect(hex.encode(m.private_key)).to_equal("e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35")
+    expect(hex.encode(m.chain_code)).to_equal("873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d508")
+    expect(m.xprv()).to_equal("xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi")
+    expect(m.xpub()).to_equal("xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8")
+    c1, err := m.derive("m/0'")
+    expect(err).to_be_nil()
+    expect(hex.encode(c1.private_key)).to_equal("edb2e14f9ee77d26dd93b4ecede8d16ed408ce149b6cd80b0715a2d911a0afea")
+    expect(hex.encode(c1.chain_code)).to_equal("47fdacbd0f1097043b78c63c20c34ef4ed9a111d980047ad16282c7ae6236141")
+    expect(c1.xprv()).to_equal("xprv9uHRZZhk6KAJC1avXpDAp4MDc3sQKNxDiPvvkX8Br5ngLNv1TxvUxt4cV1rGL5hj6KCesnDYUhd7oWgT11eZG7XnxHrnYeSvkzY7d2bhkJ7")
+    expect(c1.xpub()).to_equal("xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw")
+    c2, _ := m.derive("m/0h/1")
+    expect(hex.encode(c2.private_key)).to_equal("3c6cb8d0f6a264c91ea8b5030fadaa8e538b020f0a387421a12de9319dc93368")
+    expect(hex.encode(c2.chain_code)).to_equal("2a7857631386ba23dacac34180dd1983734e444fdbf774041578e9b6adb37c19")
+    expect(c2.xprv()).to_equal("xprv9wTYmMFdV23N2TdNG573QoEsfRrWKQgWeibmLntzniatZvR9BmLnvSxqu53Kw1UmYPxLgboyZQaXwTCg8MSY3H2EU4pWcQDnRnrVA1xe8fs")
+    expect(c2.xpub()).to_equal("xpub6ASuArnXKPbfEwhqN6e3mwBcDTgzisQN1wXN9BJcM47sSikHjJf3UFHKkNAWbWMiGj7Wf5uMash7SyYq527Hqck2AxYysAA7xmALppuCkwQ")
+    c5, _ := m.derive("m/0'/1/2'/2/1000000000")
+    expect(hex.encode(c5.private_key)).to_equal("471b76e389e528d6de6d816857e012c5455051cad6660850e58372a6c3e6e7c8")
+    expect(c5.xprv()).to_equal("xprvA41z7zogVVwxVSgdKUHDy1SKmdb533PjDz7J6N6mV6uS3ze1ai8FHa8kmHScGpWmj4WggLyQjgPie1rFSruoUihUZREPSL39UNdE3BBDu76")
+    expect(c5.depth).to_equal(5)
+  })
+  it("refuses bad paths", fn() {
+    m := hd.master_from_seed(unhex("000102030405060708090a0b0c0d0e0f"))
+    for _, p := range []str{"", "44'/60'", "m/", "m//1", "m/x", "m/1''", "m/2147483648", "m/-1", "m/99999999999"} {
+      _, err := m.derive(p)
+      expect(err).not_().to_be_nil()
+    }
+    same, _ := m.derive("m")
+    expect(same.xprv()).to_equal(m.xprv())
+  })
+  it("hashes with RIPEMD-160", fn() {
+    expect(hex.encode(hd.ripemd160(""))).to_equal("9c1185a5c5e9fc54612808977ee8f548b2258d31")
+    expect(hex.encode(hd.ripemd160("abc"))).to_equal("8eb208f7e05d987a9b044a8e98c6b087f15a0bfc")
+    expect(hex.encode(hd.ripemd160(strings.repeat("a", 1000)))).to_equal("aa69deee9a8922e92f8105e007f76110f381e9cf")
+  })
+})
+
+describe("BIP-44 accounts", fn() {
+  it("gives the Hardhat accounts", fn() {
+    a0, err := hd.mnemonic_to_account(HARDHAT, "", 0)
+    expect(err).to_be_nil()
+    expect(a0.address).to_equal("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
+    expect(web3.to_hex(a0.private_key)).to_equal("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+    a1, _ := hd.mnemonic_to_account(HARDHAT, "", 1)
+    expect(a1.address).to_equal("0x70997970C51812dc3A010C7d01b50e0d17dc79C8")
+  })
+  it("refuses invalid mnemonics and indexes", fn() {
+    _, err := hd.mnemonic_to_account("test test test", "", 0)
+    expect(err).not_().to_be_nil()
+    _, err2 := hd.mnemonic_to_account(HARDHAT, "", -1)
+    expect(err2).not_().to_be_nil()
+  })
+})
