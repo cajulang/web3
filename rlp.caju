@@ -1,0 +1,173 @@
+# web3/rlp: Recursive Length Prefix, the serialization of Ethereum transactions
+# (import "github.com/cajulang/web3/rlp").
+#
+#   rlp.encode([]any{"cat", "dog"})                  # "\xc8\x83cat\x83dog"
+#   rlp.encode(rlp.encode_int(1024))                 # integers: big-endian without leading zeros
+#   item, err := rlp.decode(raw)                     # a str (bytes) or a []any (a list)
+#
+# An item is a string of raw bytes (str) or a list of items ([]any). encode also takes []str,
+# int (>= 0) and *web3.U256, which it writes as integers. decode is strict: it refuses
+# non-canonical encodings (a single byte below 0x80 wrapped in a prefix, long forms for short
+# payloads, lengths with leading zeros), truncated input and trailing bytes.
+
+import "github.com/cajulang/web3"
+
+# the RLP encoding of an item: str (bytes), []any or []str (lists), int (>= 0) or *web3.U256
+# (integers). Any other value is a programming error and panics.
+export fn encode(v: any) -> str {
+  switch x := v.(type) {
+  case str:
+    return encode_bytes(x)
+  case []any:
+    parts := []str{}
+    for _, e := range x { parts = append(parts, encode(e)) }
+    return encode_list_raw(join(parts))
+  case []str:
+    parts2 := []str{}
+    for _, e2 := range x { parts2 = append(parts2, encode_bytes(e2)) }
+    return encode_list_raw(join(parts2))
+  case int:
+    return encode_int(x)
+  case *web3.U256:
+    return encode_uint(x)
+  }
+  panic("rlp: cannot encode this value (want str, []any, []str, int or *web3.U256)")
+  return ""
+}
+
+# the encoding of a byte string
+export fn encode_bytes(b: str) -> str {
+  if len(b) == 1 && int(b[0]) < 0x80 { return b }
+  return header(0x80, len(b)) + b
+}
+
+# the encoding of a list whose items are already encoded and concatenated
+export fn encode_list_raw(payload: str) -> str { return header(0xc0, len(payload)) + payload }
+
+# an unsigned integer: its big-endian bytes without leading zeros (zero is the empty string)
+export fn encode_uint(u: *web3.U256) -> str {
+  if u == nil { return encode_bytes("") }
+  return encode_bytes(u.bytes())
+}
+
+# a non-negative int (a negative one panics: RLP has no signed integers)
+export fn encode_int(n: int) -> str {
+  if n < 0 { panic("rlp: negative integer") }
+  return encode_bytes(int_bytes(n))
+}
+
+# the big-endian bytes of n >= 0, without leading zeros ("" for zero)
+export fn int_bytes(n: int) -> str {
+  bs := []byte{}
+  while n > 0 {
+    bs = append(bs, byte(n & 255))
+    n = int(uint64(n) >> 8)
+  }
+  out := []byte{}
+  i := len(bs) - 1
+  while i >= 0 {
+    out = append(out, bs[i])
+    i--
+  }
+  return string(out)
+}
+
+fn header(base: int, n: int) -> str {
+  if n < 56 { return string([]byte{byte(base + n)}) }
+  lb := int_bytes(n)
+  return string([]byte{byte(base + 55 + len(lb))}) + lb
+}
+
+fn join(parts: []str) -> str {
+  total := 0
+  for _, p := range parts { total += len(p) }
+  bs := make([]byte, 0, total)
+  for _, p2 := range parts {
+    for i := 0; i < len(p2); i++ { bs = append(bs, p2[i]) }
+  }
+  return string(bs)
+}
+
+# ---------------------------------------------------------------- decoding
+
+# one item that must take all of data: a str (bytes) or a []any (a list of items)
+export fn decode(data: str) -> (any, error) {
+  v, n, err := decode_at(data, 0, len(data), 0)
+  if err != nil { return nil, err }
+  if n != len(data) { return nil, errors.New("rlp: " + str(len(data) - n) + " trailing bytes") }
+  return v, nil
+}
+
+# the item at data[pos:end]: its value and where it ends
+fn decode_at(data: str, pos: int, end: int, depth: int) -> (any, int, error) {
+  if depth > 64 { return nil, 0, errors.New("rlp: nested too deep") }
+  if pos >= end { return nil, 0, errors.New("rlp: unexpected end of input") }
+  b := int(data[pos])
+  if b < 0x80 { return data[pos:pos + 1], pos + 1, nil }
+  is_list := b >= 0xc0
+  base := 0x80
+  if is_list { base = 0xc0 }
+  short := b - base
+  start := pos + 1
+  size := 0
+  if short < 56 {
+    size = short
+  } else {
+    nl := short - 55
+    if start + nl > end { return nil, 0, errors.New("rlp: truncated length") }
+    if int(data[start]) == 0 { return nil, 0, errors.New("rlp: length with leading zeros") }
+    if nl > 7 { return nil, 0, errors.New("rlp: length too large") }
+    for i := 0; i < nl; i++ { size = (size << 8) | int(data[start + i]) }
+    if size < 56 { return nil, 0, errors.New("rlp: long form for a short payload") }
+    start += nl
+  }
+  if size > end - start { return nil, 0, errors.New("rlp: payload longer than the input") }
+  stop := start + size
+  if !is_list {
+    if size == 1 && int(data[start]) < 0x80 { return nil, 0, errors.New("rlp: single byte below 0x80 must not have a prefix") }
+    return data[start:stop], stop, nil
+  }
+  items := []any{}
+  p := start
+  while p < stop {
+    v, next, err := decode_at(data, p, stop, depth + 1)
+    if err != nil { return nil, 0, err }
+    items = append(items, v)
+    p = next
+  }
+  return items, stop, nil
+}
+
+# ---------------------------------------------------------------- reading decoded items
+
+# the bytes of a decoded item that must be a string
+export fn as_bytes(item: any) -> (str, error) {
+  s, ok := item.(str)
+  if !ok { return "", errors.New("rlp: expected a string, got a list") }
+  return s, nil
+}
+
+# the list of a decoded item that must be a list
+export fn as_list(item: any) -> ([]any, error) {
+  l, ok := item.([]any)
+  if !ok { return nil, errors.New("rlp: expected a list, got a string") }
+  return l, nil
+}
+
+# a decoded integer (at most 32 bytes, no leading zeros)
+export fn as_uint(item: any) -> (*web3.U256, error) {
+  s, err := as_bytes(item)
+  if err != nil { return nil, err }
+  if len(s) > 32 { return nil, errors.New("rlp: integer larger than 256 bits") }
+  if len(s) > 0 && int(s[0]) == 0 { return nil, errors.New("rlp: integer with leading zeros") }
+  return web3.from_bytes(s), nil
+}
+
+# a decoded integer that fits an int (below 2^63)
+export fn as_int(item: any) -> (int, error) {
+  u, err := as_uint(item)
+  if err != nil { return 0, err }
+  n, ok := u.to_int()
+  if !ok { return 0, errors.New("rlp: integer too large") }
+  return n, nil
+}
