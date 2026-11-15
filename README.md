@@ -156,8 +156,6 @@ How events reach the program: `on_*` asks the page once per client to subscribe
 id. The tests (`tests/wallet_test.caju`) run against caju-ui's fake DOM, answering the page calls
 as the runtime would.
 
-# web3
-
 ## Chains (`web3/chains`)
 
 ```caju
