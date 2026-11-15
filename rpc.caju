@@ -1,0 +1,1355 @@
+# web3/rpc: the public client, JSON-RPC to an EVM node (import "github.com/cajulang/web3/rpc").
+#
+#   client := rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum})
+#   client.get_balance("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", "latest", fn(v: *web3.U256, err: error) {
+#     if err != nil { print(err.Error()); return }
+#     print(web3.format_ether(v) + " ETH")
+#   })
+#
+# Every network operation takes a callback as its last parameter, fn(result, err: error), and
+# returns a function that cancels it (after a cancel the callback is not called). On the server
+# (fetch/native is synchronous) the callback runs before the call returns; in the page (caju-ui)
+# it runs later. A server program must import "github.com/cajulang/fetch/native" itself; this
+# package does not, so the browser build carries no sockets.
+#
+# Values: quantities are *web3.U256; block numbers, nonces, gas and chain ids are int; hashes are
+# "0x" hex strings; addresses are EIP-55 strings; bytes (call data, code, log data and topics)
+# are raw bytes (Caju strings), as everywhere in web3. A block is "latest", "pending", "safe",
+# "finalized", "earliest" or a hex number (quantity_int(n)); "" means "latest".
+#
+# Errors: a JSON-RPC error is a *rpc.RpcError (code, message, data; a revert carries its revert
+# data, see revert_data); an HTTP status other than 2xx is a *rpc.HttpError; no answer at all is
+# fetch's *fetch.Error ("network", "timeout"). Network errors, 429 and 5xx are retried
+# (ClientConfig.retries, 2 by default, with a growing pause).
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/chains"
+import "github.com/cajulang/fetch"
+import "github.com/cajulang/ui"
+import "std/json"
+import "std/strings"
+
+# ---------------------------------------------------------------- errors
+
+# an error answered by the node
+export struct RpcError {
+  code: int
+  message: str
+  data: str           # the error's data: a JSON string as it is (a revert's "0x..." data), anything else as raw JSON
+}
+
+export fn (e: *RpcError) Error() -> str {
+  return "rpc: " + e.message + " (code " + str(e.code) + ")"
+}
+
+# an HTTP status other than 2xx
+export struct HttpError {
+  status: int
+  url: str
+  body: str
+}
+
+export fn (e: *HttpError) Error() -> str {
+  msg := "rpc: HTTP " + str(e.status)
+  if e.url != "" { msg = msg + " from " + e.url }
+  b := strings.trim_space(e.body)
+  if len(b) > 200 { b = b[0:200] + "..." }
+  if b != "" { msg = msg + ": " + b }
+  return msg
+}
+
+# the revert data (raw bytes) an error carries, if it is a revert with data: decode it with the
+# contract's ABI (Error(string), Panic(uint256) or a custom error)
+export fn revert_data(err: error) -> (str, bool) {
+  if err == nil { return "", false }
+  e, ok := err.(*RpcError)
+  if !ok { return "", false }
+  d := strings.trim_space(e.data)
+  if strings.has_prefix(d, "Reverted ") { d = strings.trim_space(d[9:]) }   # Nethermind
+  if !web3.is_hex(d, -1) || len(d) <= 2 { return "", false }
+  b, herr := web3.from_hex(d)
+  if herr != nil { return "", false }
+  return b, true
+}
+
+# a revert (an "execution reverted" error, with or without data)
+export fn is_revert(err: error) -> bool {
+  if err == nil { return false }
+  e, ok := err.(*RpcError)
+  if !ok { return false }
+  if e.code == 3 { return true }
+  return strings.contains(strings.to_lower(e.message), "revert")
+}
+
+# ---------------------------------------------------------------- the client
+
+# the settings of a client (create_public_client)
+export struct ClientConfig {
+  chain: *chains.Chain
+  url: str                          # "" : chain.rpc_urls[0]
+  # nil: JSON-RPC over HTTP with fetch. Set it for tests, mocks or an EIP-1193 provider: it gets
+  # the method and the params as JSON, and answers the result as JSON (or an error)
+  transport: fn(str, str, fn(str, error)) -> fn()
+  timeout_ms: int                   # per HTTP request (0: 10000)
+  retries: int                      # on network errors, 429 and 5xx (0: 2; negative: none)
+  headers: map[str]str              # sent with every HTTP request
+  poll_ms: int                      # for watchers and wait_for_transaction_receipt (0: from the chain's block time, 1 to 4 s)
+  http_client: *fetch.Client        # the fetch client for HTTP (nil: one made from url, headers, timeout_ms)
+}
+
+# a public client: reads the chain through one node
+export struct Client {
+  config: ClientConfig
+  chain: *chains.Chain
+  url: str
+  retries: int
+  poll_ms: int
+  transport: fn(str, str, fn(str, error)) -> fn()
+  http: *fetch.Client
+  next_id: int
+}
+
+# a client for c (nil: no chain and no URL; requests then fail until transport or url is set)
+export fn create_public_client(c: *ClientConfig) -> *Client {
+  cfg := ClientConfig{}
+  if c != nil { cfg = *c }
+  cl := &Client{config: cfg, chain: cfg.chain, url: cfg.url, retries: cfg.retries}
+  if cl.url == "" && cfg.chain != nil && len(cfg.chain.rpc_urls) > 0 { cl.url = cfg.chain.rpc_urls[0] }
+  if cl.retries == 0 { cl.retries = 2 }
+  if cl.retries < 0 { cl.retries = 0 }
+  if cfg.timeout_ms == 0 { cl.config.timeout_ms = 10000 }
+  cl.poll_ms = cfg.poll_ms
+  if cl.poll_ms <= 0 { cl.poll_ms = default_poll(cfg.chain) }
+  cl.http = cfg.http_client
+  if cl.http == nil { cl.http = fetch.create(&fetch.Config{headers: cfg.headers, timeout_ms: cl.config.timeout_ms}) }
+  if cfg.transport != nil {
+    cl.transport = cfg.transport
+  } else {
+    cl.transport = fn(method: str, params_json: str, cb: fn(str, error)) -> fn() { return cl.http_call(method, params_json, cb) }
+  }
+  return cl
+}
+
+fn default_poll(c: *chains.Chain) -> int {
+  ms := 4000
+  if c != nil && c.block_time_ms > 0 && c.block_time_ms < ms { ms = c.block_time_ms }
+  if ms < 1000 { ms = 1000 }
+  return ms
+}
+
+# "0x" hex of v, as JSON-RPC writes quantities ("0x0" for zero)
+export fn quantity(v: *web3.U256) -> str {
+  if v == nil { return "0x0" }
+  return v.hex()
+}
+
+# "0x" hex of n (n >= 0)
+export fn quantity_int(n: int) -> str { return web3.u256(n).hex() }
+
+# ---------------------------------------------------------------- HTTP
+
+# POSTs body to the client's URL; cb gets the response's body
+fn (c: *Client) http_post(body: str, cb: fn(str, error)) -> fn() {
+  if c.url == "" {
+    cb("", errors.New("rpc: no URL (set ClientConfig.url, a chain with rpc_urls, or a transport)"))
+    return nil
+  }
+  url := c.url
+  call := c.http.request(&fetch.Request{method: "POST", url: url, body: body, headers: map[str]str{"Content-Type": "application/json", "Accept": "application/json"}})
+  call.done(fn(r: *fetch.Response, err: error) {
+    if err != nil {
+      if fe, ok := err.(*fetch.Error); ok && fe.kind == "status" && r != nil {
+        cb("", http_error(url, r))
+        return
+      }
+      cb("", err)
+      return
+    }
+    cb(r.body, nil)
+  })
+  return fn() { call.cancel() }
+}
+
+# a status other than 2xx: a JSON-RPC error inside a 4xx (not 429) is that error; anything else an *HttpError
+fn http_error(url: str, r: *fetch.Response) -> error {
+  if r.status >= 400 && r.status < 500 && r.status != 429 {
+    doc, err := json.parse(r.body)
+    if err == nil && doc.kind == "object" {
+      e := doc.field("error")
+      if e != nil && e.kind == "object" { return rpc_error_of(e) }
+    }
+  }
+  return &HttpError{status: r.status, url: url, body: r.body}
+}
+
+# one JSON-RPC request over HTTP
+fn (c: *Client) http_call(method: str, params_json: str, cb: fn(str, error)) -> fn() {
+  c.next_id++
+  body := "{\"jsonrpc\":\"2.0\",\"id\":" + str(c.next_id) + ",\"method\":" + json.quote(method) + ",\"params\":" + params_json + "}"
+  url := c.url
+  return c.http_post(body, fn(text: str, err: error) {
+    if err != nil {
+      cb("", err)
+      return
+    }
+    doc, perr := json.parse(text)
+    if perr != nil || doc.kind != "object" {
+      cb("", &HttpError{status: 200, url: url, body: "not a JSON-RPC response: " + text})
+      return
+    }
+    res, rerr := envelope(doc)
+    cb(res, rerr)
+  })
+}
+
+# the result (as JSON) or the error of a JSON-RPC response
+fn envelope(doc: *json.Value) -> (str, error) {
+  e := doc.field("error")
+  if e != nil && !e.is_null() { return "", rpc_error_of(e) }
+  r := doc.field("result")
+  if r == nil { return "", errors.New("rpc: a response with neither result nor error") }
+  return r.string(), nil
+}
+
+fn rpc_error_of(e: *json.Value) -> *RpcError {
+  if e.kind == "string" { return &RpcError{code: -32603, message: e.s} }
+  re := &RpcError{code: e.get_int("code", 0), message: e.get_str("message", "")}
+  d := e.field("data")
+  if d != nil && !d.is_null() {
+    if d.kind == "string" {
+      re.data = d.s
+    } else {
+      re.data = d.string()
+      # some nodes nest the revert data: {"data": {"data": "0x..."}} or {"result": "0x..."}
+      inner := d.get_str("data", d.get_str("result", ""))
+      if web3.is_hex(inner, -1) { re.data = inner }
+    }
+  }
+  return re
+}
+
+# ---------------------------------------------------------------- retries
+
+fn retryable(err: error) -> bool {
+  if err == nil { return false }
+  if fetch.is_kind(err, "network") || fetch.is_kind(err, "timeout") { return true }
+  if h, ok := err.(*HttpError); ok { return h.status == 429 || h.status >= 500 }
+  return false
+}
+
+# ms after attempt n (1, 2...) failed: 200, 400, 800... up to 5 s
+fn backoff(n: int) -> int {
+  ms := 200
+  for i := 1; i < n; i++ { ms = ms * 2 }
+  if ms > 5000 { ms = 5000 }
+  return ms
+}
+
+# runs f in ms milliseconds: a page timer in the page; elsewhere, sleeps and runs it now
+fn later(ms: int, f: fn()) -> fn() {
+  if ui.in_page() {
+    id := ui.set_timeout(ms, f)
+    return fn() { ui.clear_timer(id) }
+  }
+  if ms > 0 { sleep(num(ms) / 1000.0) }
+  f()
+  return nil
+}
+
+# calls f. (A function value held by a closure's own parameter or local variable cannot be called
+# directly in an imported module with caju 0.8.0; passing it here works.)
+fn run0(f: fn()) { f() }
+
+struct Attempt {
+  n: int
+  done: bool
+  canceled: bool
+  abort: fn()
+}
+
+# send, again after a pause while it fails with a retryable error; cb gets the last outcome
+fn (c: *Client) with_retries(send: fn(fn(str, error)) -> fn(), cb: fn(str, error)) -> fn() {
+  st := &Attempt{}
+  let attempt: fn() = nil
+  attempt = fn() {
+    st.n++
+    a := send(fn(res: str, err: error) {
+      if st.canceled || st.done { return }
+      if err != nil && st.n <= c.retries && retryable(err) {
+        st.abort = later(backoff(st.n), attempt)
+        return
+      }
+      st.done = true
+      cb(res, err)
+    })
+    if !st.done && a != nil { st.abort = a }
+  }
+  attempt()
+  return fn() {
+    if st.done || st.canceled { return }
+    st.canceled = true
+    if st.abort != nil { run0(st.abort) }
+  }
+}
+
+# ---------------------------------------------------------------- requests
+
+# v with every *web3.U256 (also inside []any and map[str]any) as its hex quantity
+fn normalize(v: any) -> any {
+  switch x := v.(type) {
+  case *web3.U256:
+    if x == nil { return nil }
+    return x.hex()
+  case []any:
+    out := make([]any, len(x))
+    for i, y := range x { out[i] = normalize(y) }
+    return out
+  case map[str]any:
+    m := map[str]any{}
+    for k, y := range x { m[k] = normalize(y) }
+    return m
+  }
+  return v
+}
+
+fn encode_params(params: []any) -> (str, error) {
+  if params == nil { return "[]", nil }
+  s, err := json.marshal(normalize(params))
+  if err != nil { return "", errors.New("rpc: the params cannot be encoded as JSON: " + err.Error()) }
+  return s, nil
+}
+
+# sends method with params (JSON-encoded with std/json; *web3.U256 values become hex
+# quantities); cb gets the result as JSON text ("null", "\"0x1\"", "{...}")
+export fn (c: *Client) request(method: str, params: []any, cb: fn(str, error)) -> fn() {
+  pj, err := encode_params(params)
+  if err != nil {
+    cb("", err)
+    return nil
+  }
+  t := c.transport
+  return c.with_retries(fn(k: fn(str, error)) -> fn() { return t(method, pj, k) }, cb)
+}
+
+# one call of a batch: the method and params going in, the result (JSON) or error coming out
+export struct BatchCall {
+  method: str
+  params: []any
+  result: str
+  error: error
+}
+
+# sends the calls in one JSON-RPC batch (one HTTP request); with a transport, one by one. cb gets
+# the calls with their result or error filled in; err is an error of the whole batch (no answer,
+# or a node that refuses batches)
+export fn (c: *Client) batch(calls: []*BatchCall, cb: fn([]*BatchCall, error)) -> fn() {
+  if len(calls) == 0 {
+    cb(calls, nil)
+    return nil
+  }
+  if c.config.transport != nil { return c.batch_each(calls, cb) }
+  ids := map[int]*BatchCall{}
+  parts := []str{}
+  for _, bc := range calls {
+    pj, err := encode_params(bc.params)
+    if err != nil {
+      cb(calls, err)
+      return nil
+    }
+    c.next_id++
+    ids[c.next_id] = bc
+    parts = append(parts, "{\"jsonrpc\":\"2.0\",\"id\":" + str(c.next_id) + ",\"method\":" + json.quote(bc.method) + ",\"params\":" + pj + "}")
+  }
+  body := "[" + strings.join(parts, ",") + "]"
+  url := c.url
+  return c.with_retries(fn(k: fn(str, error)) -> fn() { return c.http_post(body, k) }, fn(text: str, err: error) {
+    if err != nil {
+      for _, bc := range calls { bc.error = err }
+      cb(calls, err)
+      return
+    }
+    doc, perr := json.parse(text)
+    if perr != nil || (doc.kind != "array" && doc.kind != "object") {
+      let he: error = &HttpError{status: 200, url: url, body: "not a JSON-RPC response: " + text}
+      for _, bc := range calls { bc.error = he }
+      cb(calls, he)
+      return
+    }
+    if doc.kind == "object" {
+      # one answer for the whole batch: an error (batches not supported, too large...)
+      _, e := envelope(doc)
+      if e == nil { e = errors.New("rpc: the node answered a batch with a single response") }
+      for _, bc := range calls { bc.error = e }
+      cb(calls, e)
+      return
+    }
+    got := map[int]bool{}
+    for _, item := range doc.items {
+      id := item.get_int("id", -1)
+      bc, ok := ids[id]
+      if !ok { continue }
+      got[id] = true
+      res, rerr := envelope(item)
+      bc.result = res
+      bc.error = rerr
+    }
+    for id, bc := range ids {
+      if !got[id] { bc.error = errors.New("rpc: no answer for " + bc.method + " in the batch") }
+    }
+    cb(calls, nil)
+  })
+}
+
+# a batch through a transport: the calls one by one, cb when all have answered
+fn (c: *Client) batch_each(calls: []*BatchCall, cb: fn([]*BatchCall, error)) -> fn() {
+  left := len(calls)
+  aborts := []fn(){}
+  canceled := false
+  for _, bc := range calls {
+    one := bc
+    a := c.request(one.method, one.params, fn(res: str, err: error) {
+      one.result = res
+      one.error = err
+      left--
+      if left == 0 && !canceled { cb(calls, nil) }
+    })
+    if a != nil { aborts = append(aborts, a) }
+  }
+  return fn() {
+    if left == 0 || canceled { return }
+    canceled = true
+    for _, a := range aborts { run0(a) }
+  }
+}
+
+# ---------------------------------------------------------------- reading results
+
+fn parse_result(method: str, res: str) -> (*json.Value, error) {
+  doc, err := json.parse(res)
+  if err != nil { return nil, errors.New("rpc: " + method + " answered invalid JSON: " + err.Error()) }
+  return doc, nil
+}
+
+fn bad_result(method: str, res: str) -> error {
+  if len(res) > 120 { res = res[0:120] + "..." }
+  return errors.New("rpc: unexpected result for " + method + ": " + res)
+}
+
+# a quantity ("0x1a" or a JSON number) as a U256; nil when missing or null
+fn ju256(v: *json.Value) -> *web3.U256 {
+  if v == nil { return nil }
+  if v.kind == "number" {
+    if v.is_int { return web3.from_int(v.i) }
+    return web3.from_int(int(v.n))
+  }
+  if v.kind != "string" || v.s == "" { return nil }
+  r, err := web3.parse_u256(v.s)
+  if err != nil { return nil }
+  return r
+}
+
+# a quantity as an int (0 when missing)
+fn jint(v: *json.Value) -> int {
+  u := ju256(v)
+  if u == nil { return 0 }
+  n, _ := u.to_int()
+  return n
+}
+
+fn jstr(v: *json.Value) -> str {
+  if v == nil || v.kind != "string" { return "" }
+  return v.s
+}
+
+# hex data as raw bytes
+fn jbytes(v: *json.Value) -> str {
+  s := jstr(v)
+  if s == "" { return "" }
+  b, err := web3.from_hex(s)
+  if err != nil { return "" }
+  return b
+}
+
+# an address in its EIP-55 form ("" when missing)
+fn jaddr(v: *json.Value) -> str {
+  s := jstr(v)
+  if s == "" { return "" }
+  if web3.is_hex(s, 20) { return web3.checksum_address(s) }
+  return s
+}
+
+# a list of hex strings as they are
+fn jstrs(v: *json.Value) -> []str {
+  out := []str{}
+  if v == nil || v.kind != "array" { return out }
+  for _, x := range v.items { out = append(out, jstr(x)) }
+  return out
+}
+
+# a quantity result as an int
+fn int_result(method: str, res: str) -> (int, error) {
+  doc, err := parse_result(method, res)
+  if err != nil { return 0, err }
+  u := ju256(doc)
+  if u == nil { return 0, bad_result(method, res) }
+  n, ok := u.to_int()
+  if !ok { return 0, bad_result(method, res) }
+  return n, nil
+}
+
+fn u256_result(method: str, res: str) -> (*web3.U256, error) {
+  doc, err := parse_result(method, res)
+  if err != nil { return nil, err }
+  u := ju256(doc)
+  if u == nil { return nil, bad_result(method, res) }
+  return u, nil
+}
+
+fn bytes_result(method: str, res: str) -> (str, error) {
+  doc, err := parse_result(method, res)
+  if err != nil { return "", err }
+  if doc.kind != "string" { return "", bad_result(method, res) }
+  b, herr := web3.from_hex(doc.s)
+  if herr != nil { return "", bad_result(method, res) }
+  return b, nil
+}
+
+fn block_param(block: str) -> str {
+  if block == "" { return "latest" }
+  return block
+}
+
+# ---------------------------------------------------------------- simple reads
+
+# the chain id the node serves
+export fn (c: *Client) chain_id(cb: fn(int, error)) -> fn() {
+  return c.request("eth_chainId", nil, fn(res: str, err: error) {
+    if err != nil {
+      cb(0, err)
+      return
+    }
+    n, e := int_result("eth_chainId", res)
+    cb(n, e)
+  })
+}
+
+# the number of the latest block
+export fn (c: *Client) block_number(cb: fn(int, error)) -> fn() {
+  return c.request("eth_blockNumber", nil, fn(res: str, err: error) {
+    if err != nil {
+      cb(0, err)
+      return
+    }
+    n, e := int_result("eth_blockNumber", res)
+    cb(n, e)
+  })
+}
+
+fn (c: *Client) u256_call(method: str, params: []any, cb: fn(*web3.U256, error)) -> fn() {
+  return c.request(method, params, fn(res: str, err: error) {
+    if err != nil {
+      cb(nil, err)
+      return
+    }
+    v, e := u256_result(method, res)
+    cb(v, e)
+  })
+}
+
+fn (c: *Client) bytes_call(method: str, params: []any, cb: fn(str, error)) -> fn() {
+  return c.request(method, params, fn(res: str, err: error) {
+    if err != nil {
+      cb("", err)
+      return
+    }
+    v, e := bytes_result(method, res)
+    cb(v, e)
+  })
+}
+
+# the balance of address in wei
+export fn (c: *Client) get_balance(address: str, block: str, cb: fn(*web3.U256, error)) -> fn() {
+  return c.u256_call("eth_getBalance", []any{address, block_param(block)}, cb)
+}
+
+# the nonce of address (how many transactions it has sent; "pending" counts the ones waiting)
+export fn (c: *Client) get_transaction_count(address: str, block: str, cb: fn(int, error)) -> fn() {
+  return c.request("eth_getTransactionCount", []any{address, block_param(block)}, fn(res: str, err: error) {
+    if err != nil {
+      cb(0, err)
+      return
+    }
+    n, e := int_result("eth_getTransactionCount", res)
+    cb(n, e)
+  })
+}
+
+# the code at address (raw bytes; "" for an account without code)
+export fn (c: *Client) get_code(address: str, block: str, cb: fn(str, error)) -> fn() {
+  return c.bytes_call("eth_getCode", []any{address, block_param(block)}, cb)
+}
+
+# the 32 bytes (raw) of a storage slot; slot is a hex number or a 32-byte hex key
+export fn (c: *Client) get_storage_at(address: str, slot: str, block: str, cb: fn(str, error)) -> fn() {
+  return c.bytes_call("eth_getStorageAt", []any{address, slot, block_param(block)}, fn(v: str, err: error) {
+    if err != nil {
+      cb("", err)
+      return
+    }
+    cb(web3.pad_left(v, 32), nil)
+  })
+}
+
+# the gas price (legacy transactions), in wei
+export fn (c: *Client) gas_price(cb: fn(*web3.U256, error)) -> fn() {
+  return c.u256_call("eth_gasPrice", nil, cb)
+}
+
+# the node's suggestion for the priority fee (tip), in wei
+export fn (c: *Client) max_priority_fee_per_gas(cb: fn(*web3.U256, error)) -> fn() {
+  return c.u256_call("eth_maxPriorityFeePerGas", nil, cb)
+}
+
+# sends a signed transaction (raw bytes, as accounts signs it); cb gets its hash
+export fn (c: *Client) send_raw_transaction(raw: str, cb: fn(str, error)) -> fn() {
+  return c.request("eth_sendRawTransaction", []any{web3.to_hex(raw)}, fn(res: str, err: error) {
+    if err != nil {
+      cb("", err)
+      return
+    }
+    doc, perr := parse_result("eth_sendRawTransaction", res)
+    if perr != nil {
+      cb("", perr)
+      return
+    }
+    if doc.kind != "string" {
+      cb("", bad_result("eth_sendRawTransaction", res))
+      return
+    }
+    cb(doc.s, nil)
+  })
+}
+
+# ---------------------------------------------------------------- calls
+
+# a message call (eth_call, eth_estimateGas, eth_createAccessList, eth_simulateV1)
+export struct CallRequest {
+  from_: str                        # "from" (a reserved word in Caju)
+  to_: str                          # "to" (a reserved word); "" : contract creation
+  data: str                         # raw bytes
+  value: *web3.U256
+  gas: int                          # 0: not given
+  gas_price: *web3.U256
+  max_fee_per_gas: *web3.U256
+  max_priority_fee_per_gas: *web3.U256
+}
+
+fn call_object(r: *CallRequest) -> map[str]any {
+  m := map[str]any{}
+  if r == nil { return m }
+  if r.from_ != "" { m["from"] = r.from_ }
+  if r.to_ != "" { m["to"] = r.to_ }
+  if r.data != "" { m["data"] = web3.to_hex(r.data) }
+  if r.value != nil { m["value"] = r.value.hex() }
+  if r.gas > 0 { m["gas"] = quantity_int(r.gas) }
+  if r.gas_price != nil { m["gasPrice"] = r.gas_price.hex() }
+  if r.max_fee_per_gas != nil { m["maxFeePerGas"] = r.max_fee_per_gas.hex() }
+  if r.max_priority_fee_per_gas != nil { m["maxPriorityFeePerGas"] = r.max_priority_fee_per_gas.hex() }
+  return m
+}
+
+# runs a call without a transaction; cb gets the returned bytes (raw). A revert is an *RpcError
+# whose data is the revert data (revert_data(err) gives the bytes to decode)
+export fn (c: *Client) call(req: *CallRequest, block: str, cb: fn(str, error)) -> fn() {
+  return c.bytes_call("eth_call", []any{call_object(req), block_param(block)}, cb)
+}
+
+# the gas a transaction would use
+export fn (c: *Client) estimate_gas(req: *CallRequest, cb: fn(*web3.U256, error)) -> fn() {
+  return c.u256_call("eth_estimateGas", []any{call_object(req)}, cb)
+}
+
+# an entry of an access list (EIP-2930)
+export struct AccessListItem {
+  address: str
+  storage_keys: []str               # 32-byte hex keys
+}
+
+# what eth_createAccessList answers
+export struct AccessListResult {
+  access_list: []*AccessListItem
+  gas_used: int
+}
+
+# the access list a transaction would touch, and the gas it would use with it
+export fn (c: *Client) create_access_list(req: *CallRequest, block: str, cb: fn(*AccessListResult, error)) -> fn() {
+  return c.request("eth_createAccessList", []any{call_object(req), block_param(block)}, fn(res: str, err: error) {
+    if err != nil {
+      cb(nil, err)
+      return
+    }
+    doc, perr := parse_result("eth_createAccessList", res)
+    if perr != nil || doc.kind != "object" {
+      cb(nil, bad_result("eth_createAccessList", res))
+      return
+    }
+    e := doc.field("error")
+    if e != nil && e.kind == "string" {
+      cb(nil, &RpcError{code: 3, message: e.s})
+      return
+    }
+    out := &AccessListResult{access_list: []*AccessListItem{}, gas_used: jint(doc.field("gasUsed"))}
+    for _, it := range doc.get_array("accessList") {
+      out.access_list = append(out.access_list, &AccessListItem{address: jaddr(it.field("address")), storage_keys: jstrs(it.field("storageKeys"))})
+    }
+    cb(out, nil)
+  })
+}
+
+# the outcome of one call of simulate_calls
+export struct SimulateResult {
+  data: str                         # the returned bytes (raw)
+  status: int                       # 1 success, 0 reverted
+  gas_used: int
+  logs: []*Log
+  error: error                      # an *RpcError when the call failed (a revert carries its data)
+}
+
+# runs calls one after the other on top of block (eth_simulateV1), each seeing the state the
+# previous ones left; cb gets one result per call
+export fn (c: *Client) simulate_calls(calls: []*CallRequest, block: str, cb: fn([]*SimulateResult, error)) -> fn() {
+  objs := []any{}
+  for _, r := range calls { objs = append(objs, call_object(r)) }
+  payload := map[str]any{"blockStateCalls": []any{map[str]any{"calls": objs}}}
+  return c.request("eth_simulateV1", []any{payload, block_param(block)}, fn(res: str, err: error) {
+    if err != nil {
+      cb(nil, err)
+      return
+    }
+    doc, perr := parse_result("eth_simulateV1", res)
+    if perr != nil || doc.kind != "array" || len(doc.items) == 0 {
+      cb(nil, bad_result("eth_simulateV1", res))
+      return
+    }
+    out := []*SimulateResult{}
+    for _, item := range doc.items[0].get_array("calls") {
+      sr := &SimulateResult{data: jbytes(item.field("returnData")), status: jint(item.field("status")), gas_used: jint(item.field("gasUsed")), logs: logs_of(item.field("logs"))}
+      e := item.field("error")
+      if e != nil && !e.is_null() { sr.error = rpc_error_of(e) }
+      out = append(out, sr)
+    }
+    cb(out, nil)
+  })
+}
+
+# ---------------------------------------------------------------- blocks and transactions
+
+export struct Block {
+  number: int                       # 0 for a pending block
+  hash: str
+  parent_hash: str
+  timestamp: int                    # seconds since 1970
+  base_fee_per_gas: *web3.U256      # nil before London (and on chains without EIP-1559)
+  gas_used: int
+  gas_limit: int
+  miner: str
+  transactions: []str               # the hashes
+  full_transactions: []*TransactionInfo   # with full_txs
+}
+
+export struct TransactionInfo {
+  hash: str
+  tx_type: int                      # 0 legacy, 1 EIP-2930, 2 EIP-1559, 3 blob, 4 EIP-7702
+  chain_id: int
+  from_: str                        # "from" (a reserved word in Caju)
+  to_: str                          # "to" (a reserved word); "" : contract creation
+  nonce: int
+  value: *web3.U256
+  input: str                        # raw bytes
+  gas: int
+  gas_price: *web3.U256
+  max_fee_per_gas: *web3.U256       # nil for legacy transactions
+  max_priority_fee_per_gas: *web3.U256
+  block_hash: str                   # "" while pending
+  block_number: int                 # 0 while pending
+  transaction_index: int
+  v: int
+  r: str
+  s: str
+}
+
+export struct Log {
+  address: str
+  topics: []str                     # raw 32 bytes each
+  data: str                         # raw bytes
+  block_number: int
+  block_hash: str
+  transaction_hash: str
+  transaction_index: int
+  log_index: int
+  removed: bool
+}
+
+export struct Receipt {
+  transaction_hash: str
+  transaction_index: int
+  block_hash: str
+  block_number: int
+  from_: str                        # "from" (a reserved word in Caju)
+  to_: str
+  status: int                       # 1 success, 0 reverted
+  gas_used: int
+  cumulative_gas_used: int
+  effective_gas_price: *web3.U256
+  contract_address: str             # the contract a creation made, or ""
+  logs: []*Log
+  tx_type: int
+}
+
+fn tx_of(v: *json.Value) -> *TransactionInfo {
+  return &TransactionInfo{hash: jstr(v.field("hash")), tx_type: jint(v.field("type")), chain_id: jint(v.field("chainId")), from_: jaddr(v.field("from")), to_: jaddr(v.field("to")), nonce: jint(v.field("nonce")), value: ju256(v.field("value")), input: jbytes(v.field("input")), gas: jint(v.field("gas")), gas_price: ju256(v.field("gasPrice")), max_fee_per_gas: ju256(v.field("maxFeePerGas")), max_priority_fee_per_gas: ju256(v.field("maxPriorityFeePerGas")), block_hash: jstr(v.field("blockHash")), block_number: jint(v.field("blockNumber")), transaction_index: jint(v.field("transactionIndex")), v: jint(v.field("v")), r: jstr(v.field("r")), s: jstr(v.field("s"))}
+}
+
+fn log_of(v: *json.Value) -> *Log {
+  topics := []str{}
+  for _, t := range v.get_array("topics") { topics = append(topics, jbytes(t)) }
+  return &Log{address: jaddr(v.field("address")), topics: topics, data: jbytes(v.field("data")), block_number: jint(v.field("blockNumber")), block_hash: jstr(v.field("blockHash")), transaction_hash: jstr(v.field("transactionHash")), transaction_index: jint(v.field("transactionIndex")), log_index: jint(v.field("logIndex")), removed: v.get_bool("removed", false)}
+}
+
+fn logs_of(v: *json.Value) -> []*Log {
+  out := []*Log{}
+  if v == nil || v.kind != "array" { return out }
+  for _, x := range v.items { out = append(out, log_of(x)) }
+  return out
+}
+
+fn receipt_of(v: *json.Value) -> *Receipt {
+  return &Receipt{transaction_hash: jstr(v.field("transactionHash")), transaction_index: jint(v.field("transactionIndex")), block_hash: jstr(v.field("blockHash")), block_number: jint(v.field("blockNumber")), from_: jaddr(v.field("from")), to_: jaddr(v.field("to")), status: jint(v.field("status")), gas_used: jint(v.field("gasUsed")), cumulative_gas_used: jint(v.field("cumulativeGasUsed")), effective_gas_price: ju256(v.field("effectiveGasPrice")), contract_address: jaddr(v.field("contractAddress")), logs: logs_of(v.field("logs")), tx_type: jint(v.field("type"))}
+}
+
+fn block_of(v: *json.Value) -> *Block {
+  b := &Block{number: jint(v.field("number")), hash: jstr(v.field("hash")), parent_hash: jstr(v.field("parentHash")), timestamp: jint(v.field("timestamp")), base_fee_per_gas: ju256(v.field("baseFeePerGas")), gas_used: jint(v.field("gasUsed")), gas_limit: jint(v.field("gasLimit")), miner: jaddr(v.field("miner")), transactions: []str{}, full_transactions: []*TransactionInfo{}}
+  for _, t := range v.get_array("transactions") {
+    if t.kind == "string" {
+      b.transactions = append(b.transactions, t.s)
+    } else if t.kind == "object" {
+      tx := tx_of(t)
+      b.transactions = append(b.transactions, tx.hash)
+      b.full_transactions = append(b.full_transactions, tx)
+    }
+  }
+  return b
+}
+
+# an object result, or nil for null (not found)
+fn (c: *Client) object_call(method: str, params: []any, cb: fn(*json.Value, error)) -> fn() {
+  return c.request(method, params, fn(res: str, err: error) {
+    if err != nil {
+      cb(nil, err)
+      return
+    }
+    doc, perr := parse_result(method, res)
+    if perr != nil {
+      cb(nil, perr)
+      return
+    }
+    if doc.is_null() {
+      cb(nil, nil)
+      return
+    }
+    if doc.kind != "object" {
+      cb(nil, bad_result(method, res))
+      return
+    }
+    cb(doc, nil)
+  })
+}
+
+# a block by number or tag ("latest", quantity_int(n)...) or by its hash (32-byte hex); with
+# full_txs its transactions come whole (Block.full_transactions). nil, nil if there is no such block
+export fn (c: *Client) get_block(block: str, full_txs: bool, cb: fn(*Block, error)) -> fn() {
+  method := "eth_getBlockByNumber"
+  b := block_param(block)
+  if web3.is_hex(b, 32) { method = "eth_getBlockByHash" }
+  return c.object_call(method, []any{b, full_txs}, fn(v: *json.Value, err: error) {
+    if err != nil || v == nil {
+      cb(nil, err)
+      return
+    }
+    cb(block_of(v), nil)
+  })
+}
+
+# a transaction by hash; nil, nil if the node does not know it
+export fn (c: *Client) get_transaction(hash: str, cb: fn(*TransactionInfo, error)) -> fn() {
+  return c.object_call("eth_getTransactionByHash", []any{hash}, fn(v: *json.Value, err: error) {
+    if err != nil || v == nil {
+      cb(nil, err)
+      return
+    }
+    cb(tx_of(v), nil)
+  })
+}
+
+# the receipt of a mined transaction; nil, nil while it is pending (or unknown)
+export fn (c: *Client) get_transaction_receipt(hash: str, cb: fn(*Receipt, error)) -> fn() {
+  return c.object_call("eth_getTransactionReceipt", []any{hash}, fn(v: *json.Value, err: error) {
+    if err != nil || v == nil {
+      cb(nil, err)
+      return
+    }
+    cb(receipt_of(v), nil)
+  })
+}
+
+# ---------------------------------------------------------------- logs
+
+# which logs: by contract address(es) and topics. topics[i] nil matches anything at position i;
+# several values at one position match any of them. Topics are raw 32 bytes
+export struct LogFilter {
+  address: []str
+  topics: [][]str
+  from_block: str                   # "" : "latest"
+  to_block: str                     # "" : "latest"
+  block_hash: str                   # instead of from/to: the logs of one block
+}
+
+fn filter_object(f: *LogFilter) -> map[str]any {
+  m := map[str]any{}
+  if f == nil { return m }
+  if len(f.address) == 1 { m["address"] = f.address[0] }
+  if len(f.address) > 1 {
+    as := []any{}
+    for _, a := range f.address { as = append(as, a) }
+    m["address"] = as
+  }
+  # trailing wildcards are left out
+  n := len(f.topics)
+  while n > 0 && len(f.topics[n - 1]) == 0 { n-- }
+  if n > 0 {
+    ts := []any{}
+    for i := 0; i < n; i++ {
+      t := f.topics[i]
+      if len(t) == 0 {
+        ts = append(ts, nil)
+      } else if len(t) == 1 {
+        ts = append(ts, web3.to_hex(t[0]))
+      } else {
+        alt := []any{}
+        for _, x := range t { alt = append(alt, web3.to_hex(x)) }
+        ts = append(ts, alt)
+      }
+    }
+    m["topics"] = ts
+  }
+  if f.block_hash != "" {
+    m["blockHash"] = f.block_hash
+  } else {
+    if f.from_block != "" { m["fromBlock"] = f.from_block }
+    if f.to_block != "" { m["toBlock"] = f.to_block }
+  }
+  return m
+}
+
+# the logs that match the filter
+export fn (c: *Client) get_logs(filter: *LogFilter, cb: fn([]*Log, error)) -> fn() {
+  return c.request("eth_getLogs", []any{filter_object(filter)}, fn(res: str, err: error) {
+    if err != nil {
+      cb(nil, err)
+      return
+    }
+    doc, perr := parse_result("eth_getLogs", res)
+    if perr != nil || doc.kind != "array" {
+      cb(nil, bad_result("eth_getLogs", res))
+      return
+    }
+    cb(logs_of(doc), nil)
+  })
+}
+
+# ---------------------------------------------------------------- proofs
+
+export struct StorageProof {
+  key: str
+  value: *web3.U256
+  proof: []str
+}
+
+# what eth_getProof answers (EIP-1186); hashes and proof nodes are hex
+export struct Proof {
+  address: str
+  balance: *web3.U256
+  nonce: int
+  code_hash: str
+  storage_hash: str
+  account_proof: []str
+  storage_proof: []*StorageProof
+}
+
+# the Merkle proof of an account and some of its storage slots (32-byte hex keys)
+export fn (c: *Client) get_proof(address: str, keys: []str, block: str, cb: fn(*Proof, error)) -> fn() {
+  ks := []any{}
+  for _, k := range keys { ks = append(ks, k) }
+  return c.object_call("eth_getProof", []any{address, ks, block_param(block)}, fn(v: *json.Value, err: error) {
+    if err != nil || v == nil {
+      cb(nil, err)
+      return
+    }
+    p := &Proof{address: jaddr(v.field("address")), balance: ju256(v.field("balance")), nonce: jint(v.field("nonce")), code_hash: jstr(v.field("codeHash")), storage_hash: jstr(v.field("storageHash")), account_proof: jstrs(v.field("accountProof")), storage_proof: []*StorageProof{}}
+    for _, sp := range v.get_array("storageProof") {
+      p.storage_proof = append(p.storage_proof, &StorageProof{key: jstr(sp.field("key")), value: ju256(sp.field("value")), proof: jstrs(sp.field("proof"))})
+    }
+    cb(p, nil)
+  })
+}
+
+# ---------------------------------------------------------------- fees
+
+export struct FeeHistory {
+  oldest_block: int
+  base_fee_per_gas: []*web3.U256    # one per block, plus the next block's
+  gas_used_ratio: []num
+  reward: [][]*web3.U256            # per block, one per percentile asked for
+}
+
+# EIP-1559 fees. base_fee nil means a chain without EIP-1559: use max_fee_per_gas as the gas price
+export struct Fees {
+  base_fee: *web3.U256
+  max_fee_per_gas: *web3.U256
+  max_priority_fee_per_gas: *web3.U256
+}
+
+# the base fees, gas use and priority fees (at the percentiles, 0 to 100) of the block_count
+# blocks up to newest
+export fn (c: *Client) fee_history(block_count: int, newest: str, percentiles: []int, cb: fn(*FeeHistory, error)) -> fn() {
+  ps := []any{}
+  for _, p := range percentiles { ps = append(ps, p) }
+  return c.request("eth_feeHistory", []any{quantity_int(block_count), block_param(newest), ps}, fn(res: str, err: error) {
+    if err != nil {
+      cb(nil, err)
+      return
+    }
+    doc, perr := parse_result("eth_feeHistory", res)
+    if perr != nil || doc.kind != "object" {
+      cb(nil, bad_result("eth_feeHistory", res))
+      return
+    }
+    h := &FeeHistory{oldest_block: jint(doc.field("oldestBlock")), base_fee_per_gas: []*web3.U256{}, gas_used_ratio: []num{}, reward: [][]*web3.U256{}}
+    for _, x := range doc.get_array("baseFeePerGas") {
+      u := ju256(x)
+      if u == nil { u = web3.zero() }
+      h.base_fee_per_gas = append(h.base_fee_per_gas, u)
+    }
+    for _, x := range doc.get_array("gasUsedRatio") {
+      if x.kind == "number" { h.gas_used_ratio = append(h.gas_used_ratio, x.n) } else { h.gas_used_ratio = append(h.gas_used_ratio, 0.0) }
+    }
+    for _, row := range doc.get_array("reward") {
+      r := []*web3.U256{}
+      for _, x := range row.items {
+        u := ju256(x)
+        if u == nil { u = web3.zero() }
+        r = append(r, u)
+      }
+      h.reward = append(h.reward, r)
+    }
+    cb(h, nil)
+  })
+}
+
+# fees for a base fee and a tip: max_fee_per_gas = 2 * base_fee + priority (room for the base fee
+# to double, as it can in about six full blocks)
+export fn fees_for(base_fee: *web3.U256, priority: *web3.U256) -> *Fees {
+  if priority == nil { priority = web3.zero() }
+  if base_fee == nil { return &Fees{max_fee_per_gas: priority, max_priority_fee_per_gas: priority} }
+  return &Fees{base_fee: base_fee, max_fee_per_gas: base_fee.add(base_fee).add(priority), max_priority_fee_per_gas: priority}
+}
+
+# slow, average and fast fees from a fee history asked at the percentiles 10, 50 and 90: the
+# next block's base fee (the last of base_fee_per_gas) and, as the tip, the mean of each
+# percentile over the blocks (zero tips, from empty blocks, are left out)
+export fn fee_levels(h: *FeeHistory) -> (*Fees, *Fees, *Fees) {
+  base := web3.zero()
+  if len(h.base_fee_per_gas) > 0 { base = h.base_fee_per_gas[len(h.base_fee_per_gas) - 1] }
+  tips := []*web3.U256{}
+  for k := 0; k < 3; k++ {
+    sum := web3.zero()
+    n := 0
+    for _, row := range h.reward {
+      if k < len(row) && !row[k].is_zero() {
+        sum = sum.add(row[k])
+        n++
+      }
+    }
+    if n > 0 { tips = append(tips, sum.div(web3.u256(n))) } else { tips = append(tips, web3.zero()) }
+  }
+  # a lower percentile never asks for more than a higher one
+  if tips[1].lt(tips[0]) { tips[1] = tips[0] }
+  if tips[2].lt(tips[1]) { tips[2] = tips[1] }
+  return fees_for(base, tips[0]), fees_for(base, tips[1]), fees_for(base, tips[2])
+}
+
+# fees for a transaction now: the latest block's base fee and the node's suggested tip
+# (eth_maxPriorityFeePerGas; gas price minus base fee where that method is missing). On a chain
+# without EIP-1559 (no base fee) the gas price, with base_fee nil
+export fn (c: *Client) estimate_fees_per_gas(cb: fn(*Fees, error)) -> fn() {
+  return c.get_block("latest", false, fn(b: *Block, err: error) {
+    if err != nil {
+      cb(nil, err)
+      return
+    }
+    if b == nil || b.base_fee_per_gas == nil {
+      c.gas_price(fn(gp: *web3.U256, gerr: error) {
+        if gerr != nil {
+          cb(nil, gerr)
+          return
+        }
+        cb(fees_for(nil, gp), nil)
+      })
+      return
+    }
+    base := b.base_fee_per_gas
+    c.max_priority_fee_per_gas(fn(tip: *web3.U256, terr: error) {
+      if terr == nil {
+        cb(fees_for(base, tip), nil)
+        return
+      }
+      c.gas_price(fn(gp: *web3.U256, gerr: error) {
+        if gerr != nil {
+          cb(nil, gerr)
+          return
+        }
+        t := web3.zero()
+        if gp.gt(base) { t = gp.sub(base) }
+        cb(fees_for(base, t), nil)
+      })
+    })
+  })
+}
+
+# slow, average and fast fees from the last 20 blocks' priority fees (percentiles 10, 50, 90;
+# see fee_levels). Without priority fees in the history, all three are estimate_fees_per_gas
+export fn (c: *Client) estimate_fee_levels(cb: fn(*Fees, *Fees, *Fees, error)) -> fn() {
+  return c.fee_history(20, "latest", []int{10, 50, 90}, fn(h: *FeeHistory, err: error) {
+    if err == nil && len(h.reward) > 0 && len(h.reward[0]) >= 3 && len(h.base_fee_per_gas) > 0 {
+      slow, avg, fast := fee_levels(h)
+      cb(slow, avg, fast, nil)
+      return
+    }
+    c.estimate_fees_per_gas(fn(f: *Fees, ferr: error) {
+      if ferr != nil {
+        cb(nil, nil, nil, ferr)
+        return
+      }
+      cb(f, f, f, nil)
+    })
+  })
+}
+
+# ---------------------------------------------------------------- polling
+
+# how watch_blocks and watch_event poll.
+#
+# Where they run: in the page, on a caju-ui timer (they return at once). On the server, with
+# every set (std/http's every, inside a server: they poll between requests and return at once);
+# without it they BLOCK, polling in a loop with sleep until stopped: by the max_polls limit, or by
+# stop() on these options from inside a callback (the cancel function they return can only be
+# called once they have returned).
+export struct WatchOptions {
+  poll_ms: int                      # 0: the client's (ClientConfig.poll_ms)
+  every: fn(int, fn())              # server: a scheduler that runs f every ms (http.every); nil: block
+  max_polls: int                    # stop after this many polls (0: no limit)
+  stopped: bool
+}
+
+# stops the watcher these options were given to (from any callback, or any time)
+export fn (o: *WatchOptions) stop() { o.stopped = true }
+
+struct Poller {
+  poll_ms: int
+  every: fn(int, fn())
+  max_polls: int
+  polls: int
+  busy: bool
+  stopped: bool
+  timer: int
+  opts: *WatchOptions
+}
+
+fn (c: *Client) poller(o: *WatchOptions) -> *Poller {
+  p := &Poller{poll_ms: c.poll_ms, opts: o}
+  if o != nil {
+    if o.poll_ms > 0 { p.poll_ms = o.poll_ms }
+    p.every = o.every
+    p.max_polls = o.max_polls
+  }
+  return p
+}
+
+fn (p: *Poller) is_stopped() -> bool {
+  if p.stopped { return true }
+  if p.opts != nil && p.opts.stopped { return true }
+  return p.max_polls > 0 && p.polls >= p.max_polls
+}
+
+# one poll, unless the previous one has not finished
+fn (p: *Poller) step(tick: fn(fn())) {
+  if p.busy || p.is_stopped() { return }
+  p.busy = true
+  p.polls++
+  tick(fn() { p.busy = false })
+}
+
+# polls with tick (which calls its argument when its work is done) until stopped; see WatchOptions
+fn (p: *Poller) run(tick: fn(fn())) -> fn() {
+  if ui.in_page() {
+    p.step(tick)
+    if p.is_stopped() { return fn() { p.stopped = true } }
+    p.timer = ui.set_interval(p.poll_ms, fn() {
+      if p.is_stopped() {
+        ui.clear_timer(p.timer)
+        return
+      }
+      p.step(tick)
+    })
+    return fn() {
+      p.stopped = true
+      ui.clear_timer(p.timer)
+    }
+  }
+  if p.every != nil {
+    p.step(tick)
+    e := p.every
+    e(p.poll_ms, fn() { p.step(tick) })
+    return fn() { p.stopped = true }
+  }
+  while true {
+    p.step(tick)
+    if p.is_stopped() { break }
+    sleep(num(p.poll_ms) / 1000.0)
+    if p.is_stopped() { break }
+  }
+  return fn() { p.stopped = true }
+}
+
+# calls on_block with the number of each new latest block (the current one first). Blocks that
+# come between two polls are not reported one by one: on_block gets the latest
+export fn (c: *Client) watch_blocks(opts: *WatchOptions, on_block: fn(int), on_error: fn(error)) -> fn() {
+  p := c.poller(opts)
+  last := -1
+  return p.run(fn(done: fn()) {
+    c.block_number(fn(n: int, err: error) {
+      if err != nil {
+        if on_error != nil { on_error(err) }
+      } else if n > last {
+        last = n
+        on_block(n)
+      }
+      run0(done)
+    })
+  })
+}
+
+# calls on_logs with the logs matching filter in each new block range (from the block after the
+# current one; or from filter.from_block, a hex number, to catch up first). filter's to_block and
+# block_hash are ignored
+export fn (c: *Client) watch_event(filter: *LogFilter, opts: *WatchOptions, on_logs: fn([]*Log), on_error: fn(error)) -> fn() {
+  p := c.poller(opts)
+  last := -1
+  if filter != nil && web3.is_hex(filter.from_block, -1) {
+    if u, err := web3.parse_u256(filter.from_block); err == nil {
+      n, _ := u.to_int()
+      last = n - 1
+    }
+  }
+  return p.run(fn(done: fn()) {
+    c.block_number(fn(head: int, err: error) {
+      if err != nil {
+        if on_error != nil { on_error(err) }
+        run0(done)
+        return
+      }
+      if last < 0 { last = head }
+      if head <= last {
+        run0(done)
+        return
+      }
+      f := &LogFilter{from_block: quantity_int(last + 1), to_block: quantity_int(head)}
+      if filter != nil {
+        f.address = filter.address
+        f.topics = filter.topics
+      }
+      c.get_logs(f, fn(logs: []*Log, lerr: error) {
+        if lerr != nil {
+          if on_error != nil { on_error(lerr) }
+        } else {
+          last = head
+          if len(logs) > 0 { on_logs(logs) }
+        }
+        run0(done)
+      })
+    })
+  })
+}
+
+# how wait_for_transaction_receipt waits
+export struct WaitOptions {
+  confirmations: int                # blocks including the transaction's (0: 1)
+  poll_ms: int                      # 0: the client's
+  timeout_ms: int                   # 0: 180000; counted in polls (poll_ms each); negative: none
+}
+
+# polls for the receipt of hash until it is mined (and has the confirmations); cb gets it, or an
+# error: a node error, or the timeout. Network errors in between are retried until the timeout.
+# Polling as in WatchOptions: page timers in the page; on the server it blocks until done
+export fn (c: *Client) wait_for_transaction_receipt(hash: str, opts: *WaitOptions, cb: fn(*Receipt, error)) -> fn() {
+  o := WaitOptions{}
+  if opts != nil { o = *opts }
+  if o.confirmations <= 0 { o.confirmations = 1 }
+  if o.poll_ms <= 0 { o.poll_ms = c.poll_ms }
+  if o.timeout_ms == 0 { o.timeout_ms = 180000 }
+  p := &Poller{poll_ms: o.poll_ms}
+  finished := false
+  let last_err: error = nil
+  finish := fn(r: *Receipt, err: error) {
+    if finished { return }
+    finished = true
+    p.stopped = true
+    cb(r, err)
+  }
+  stop := p.run(fn(done: fn()) {
+    if o.timeout_ms > 0 && (p.polls - 1) * o.poll_ms >= o.timeout_ms {
+      msg := "rpc: timed out after " + str(o.timeout_ms) + " ms waiting for the receipt of " + hash
+      if last_err != nil { msg = msg + " (last error: " + last_err.Error() + ")" }
+      finish(nil, errors.New(msg))
+      run0(done)
+      return
+    }
+    c.get_transaction_receipt(hash, fn(r: *Receipt, err: error) {
+      if err != nil {
+        if _, isrpc := err.(*RpcError); isrpc {
+          finish(nil, err)
+        } else {
+          last_err = err
+        }
+        run0(done)
+        return
+      }
+      if r == nil {
+        run0(done)
+        return
+      }
+      if o.confirmations <= 1 {
+        finish(r, nil)
+        run0(done)
+        return
+      }
+      c.block_number(fn(head: int, berr: error) {
+        if berr == nil && head - r.block_number + 1 >= o.confirmations { finish(r, nil) }
+        run0(done)
+      })
+    })
+  })
+  return fn() {
+    finished = true
+    stop()
+  }
+}

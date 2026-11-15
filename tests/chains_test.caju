@@ -1,0 +1,83 @@
+# web3/chains: the networks and their lookups.
+import { describe, it, expect } from "std/testing"
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/chains"
+import "std/strings"
+
+describe("chains", fn() {
+  it("has the right chain ids", fn() {
+    expect(chains.ethereum.id).to_equal(1)
+    expect(chains.sepolia.id).to_equal(11155111)
+    expect(chains.holesky.id).to_equal(17000)
+    expect(chains.base.id).to_equal(8453)
+    expect(chains.base_sepolia.id).to_equal(84532)
+    expect(chains.arbitrum.id).to_equal(42161)
+    expect(chains.arbitrum_sepolia.id).to_equal(421614)
+    expect(chains.optimism.id).to_equal(10)
+    expect(chains.optimism_sepolia.id).to_equal(11155420)
+    expect(chains.polygon.id).to_equal(137)
+    expect(chains.polygon_amoy.id).to_equal(80002)
+    expect(chains.bsc.id).to_equal(56)
+    expect(chains.bsc_testnet.id).to_equal(97)
+    expect(chains.avalanche.id).to_equal(43114)
+    expect(chains.avalanche_fuji.id).to_equal(43113)
+    expect(chains.gnosis.id).to_equal(100)
+    expect(chains.linea.id).to_equal(59144)
+    expect(chains.scroll.id).to_equal(534352)
+    expect(chains.zksync.id).to_equal(324)
+  })
+
+  it("gives every chain https RPC URLs, a currency and valid contract addresses", fn() {
+    seen := map[int]bool{}
+    for _, c := range chains.all() {
+      expect(seen[c.id]).to_be_false()
+      seen[c.id] = true
+      expect(len(c.rpc_urls)).to_be_greater_than(0)
+      for _, u := range c.rpc_urls { expect(u).to_start_with("https://") }
+      expect(c.native_currency.decimals).to_equal(18)
+      expect(c.native_currency.symbol).not_().to_equal("")
+      expect(c.network).not_().to_equal("")
+      expect(c.explorer_url).to_start_with("https://")
+      expect(web3.is_address(c.multicall3)).to_be_true()
+      expect(web3.is_address(c.entry_point_v07)).to_be_true()
+      expect(c.block_time_ms).to_be_greater_than(0)
+      if c.ens_registry != "" { expect(web3.is_address(c.ens_registry)).to_be_true() }
+    }
+    expect(len(chains.all())).to_be_at_least(19)
+  })
+
+  it("marks testnets and keeps ENS on Ethereum and Sepolia", fn() {
+    expect(chains.sepolia.testnet).to_be_true()
+    expect(chains.ethereum.testnet).to_be_false()
+    expect(chains.base.testnet).to_be_false()
+    expect(chains.polygon_amoy.testnet).to_be_true()
+    expect(chains.ethereum.ens_registry).to_equal("0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e")
+    expect(chains.sepolia.ens_registry).to_equal("0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e")
+    expect(chains.base.ens_registry).to_equal("")
+    expect(chains.ethereum.multicall3).to_equal("0xcA11bde05977b3631167028862bE2a173976CA11")
+    expect(chains.arbitrum.entry_point_v07).to_equal("0x0000000071727De22E5E9d8BAf0edAc6f37da032")
+  })
+
+  it("finds a chain by id", fn() {
+    expect(chains.by_id(8453).name).to_equal("Base")
+    expect(chains.by_id(42161) == chains.arbitrum).to_be_true()
+    expect(chains.by_id(999999999) == nil).to_be_true()
+  })
+
+  it("defines any other EVM chain", fn() {
+    c := chains.define_chain(31337, "Local Anvil", "ETH", "http://127.0.0.1:8545")
+    expect(c.id).to_equal(31337)
+    expect(c.network).to_equal("local-anvil")
+    expect(c.rpc_urls).to_equal([]str{"http://127.0.0.1:8545"})
+    expect(c.native_currency.decimals).to_equal(18)
+    expect(c.explorer_tx("0xab")).to_equal("")
+  })
+
+  it("builds explorer links", fn() {
+    h := "0x" + strings.repeat("ab", 32)
+    expect(chains.ethereum.explorer_tx(h)).to_equal("https://etherscan.io/tx/" + h)
+    expect(chains.base.explorer_address("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")).to_equal("https://basescan.org/address/0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")
+    expect(chains.arbitrum.explorer_block(10)).to_equal("https://arbiscan.io/block/10")
+    expect(chains.polygon.explorer_api).to_equal("https://api.etherscan.io/v2/api?chainid=137")
+  })
+})
