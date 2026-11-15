@@ -1,0 +1,1660 @@
+# web3/accounts: local accounts (secp256k1 keys), signatures and transactions
+# (import "github.com/cajulang/web3/accounts").
+#
+#   acct, err := accounts.private_key_to_account("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+#   acct.address                                   # "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+#   sig := acct.sign_message("hello world")        # EIP-191, "0x" + 65 bytes of hex
+#   addr, err := accounts.recover_message_address("hello world", sig)
+#   digest, err := accounts.hash_typed_data(td)    # EIP-712
+#   raw, err := acct.sign_transaction(tx)          # legacy, EIP-2930, EIP-1559, EIP-7702
+#
+# Inside: secp256k1 field elements are ten 26-bit limbs (an unrolled multiplication with the
+# fast reduction 2^256 = 2^32 + 977 mod p); points use projective coordinates with the
+# complete addition formulas of Renes, Costello and Batina (no special cases, so the same
+# operations run whatever the operands); k*G walks a precomputed table of 64 windows of 4 bits,
+# reading every entry of each window with masks, so the memory accesses and the arithmetic do
+# not depend on the secret scalar. Nonces are deterministic (RFC 6979, HMAC-SHA256) and s is
+# always in the lower half (EIP-2). Arithmetic modulo the group order uses Montgomery
+# multiplication; verification and recovery work on public data and are not constant time.
+#
+# Byte strings are raw Caju strings; addresses are "0x" hex (EIP-55 on output).
+
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/rlp"
+import "std/crypto"
+import "std/hex"
+import "std/strings"
+
+const M26 = 0x3FFFFFF
+const M32 = 0xFFFFFFFF
+
+# ---------------------------------------------------------------- the field (mod p)
+#
+# p = 2^256 - 2^32 - 977. An element is []int of 10 limbs of 26 bits, least significant first.
+# "Weakly normalized" (what every operation returns): limbs 0..8 below 2^26, limb 9 at most
+# 2^22, so the value is below 2^256 + 2^34 but maybe not below p; fe_normalize makes it canonical.
+
+# 2p with every limb at least 2^26 (to subtract without going negative)
+let FE_2P = []int{0x7FFF85E, 0x7FFFF7E, 0x7FFFFFE, 0x7FFFFFE, 0x7FFFFFE, 0x7FFFFFE, 0x7FFFFFE, 0x7FFFFFE, 0x7FFFFFE, 0x7FFFFE}
+let FE_P = []int{0x3FFFC2F, 0x3FFFFBF, 0x3FFFFFF, 0x3FFFFFF, 0x3FFFFFF, 0x3FFFFFF, 0x3FFFFFF, 0x3FFFFFF, 0x3FFFFFF, 0x3FFFFF}
+# exponents: p - 2 (inverse) and (p + 1) / 4 (square root)
+let EXP_INV = web3.must_hex("0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2d")
+let EXP_SQRT = web3.must_hex("0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff0c")
+
+fn fe() -> []int { return make([]int, 10) }
+
+fn fe_small(v: int) -> []int {
+  r := fe()
+  r[0] = v
+  return r
+}
+
+fn fe_copy(a: []int) -> []int {
+  r := fe()
+  for i := 0; i < 10; i++ { r[i] = a[i] }
+  return r
+}
+
+# carries between limbs and folds the bits above 2^256 back (2^256 = 2^32 + 977 mod p)
+fn fe_carry(r: []int) {
+  for i := 0; i < 9; i++ {
+    r[i + 1] += r[i] >> 26
+    r[i] = r[i] & M26
+  }
+  t := r[9] >> 22
+  r[9] = r[9] & 0x3FFFFF
+  r[0] += t * 977
+  r[1] += t << 6
+  for j := 0; j < 9; j++ {
+    r[j + 1] += r[j] >> 26
+    r[j] = r[j] & M26
+  }
+}
+
+fn fe_add(r: []int, a: []int, b: []int) {
+  for i := 0; i < 10; i++ { r[i] = a[i] + b[i] }
+  fe_carry(r)
+}
+
+fn fe_sub(r: []int, a: []int, b: []int) {
+  for i := 0; i < 10; i++ { r[i] = a[i] + FE_2P[i] - b[i] }
+  fe_carry(r)
+}
+
+fn fe_mul_small(r: []int, a: []int, k: int) {
+  for i := 0; i < 10; i++ { r[i] = a[i] * k }
+  fe_carry(r)
+}
+
+fn fe_neg(r: []int, a: []int) { fe_sub(r, fe(), a) }
+
+# the canonical form (below p), in place
+fn fe_normalize(r: []int) {
+  fe_carry(r)
+  fe_carry(r)
+  # r - p, kept when it does not borrow (selected with a mask, not a branch)
+  s := fe()
+  br := 0
+  for i := 0; i < 10; i++ {
+    x := r[i] - FE_P[i] - br
+    br = (x >> 63) & 1
+    s[i] = x & M26
+  }
+  keep := br - 1           # all ones when there was no borrow
+  for j := 0; j < 10; j++ { r[j] = (s[j] & keep) | (r[j] & (keep ^ -1)) }
+}
+
+fn fe_is_zero(a: []int) -> bool {
+  t := fe_copy(a)
+  fe_normalize(t)
+  d := 0
+  for i := 0; i < 10; i++ { d = d | t[i] }
+  return d == 0
+}
+
+fn fe_eq(a: []int, b: []int) -> bool {
+  t := fe()
+  fe_sub(t, a, b)
+  return fe_is_zero(t)
+}
+
+fn fe_is_odd(a: []int) -> bool {
+  t := fe_copy(a)
+  fe_normalize(t)
+  return t[0] & 1 == 1
+}
+
+# 32 big-endian bytes (canonical)
+fn fe_to_bytes(a: []int) -> str {
+  t := fe_copy(a)
+  fe_normalize(t)
+  out := make([]byte, 32)
+  for j := 0; j < 32; j++ {
+    bit := 8 * j
+    limb := bit / 26
+    off := bit % 26
+    v := t[limb] >> off
+    if off > 18 && limb < 9 { v = v | (t[limb + 1] << (26 - off)) }
+    out[31 - j] = byte(v & 255)
+  }
+  return string(out)
+}
+
+# 32 big-endian bytes to an element; ok is false when the value is not below p
+fn fe_from_bytes(b: str) -> ([]int, bool) {
+  r := fe()
+  for j := 0; j < 32; j++ {
+    bit := 8 * j
+    r[bit / 26] += int(b[31 - j]) << (bit % 26)
+  }
+  for i := 0; i < 9; i++ {
+    r[i + 1] += r[i] >> 26
+    r[i] = r[i] & M26
+  }
+  t := fe_copy(r)
+  fe_normalize(t)
+  same := true
+  for k := 0; k < 10; k++ { if t[k] != r[k] { same = false } }
+  return r, same
+}
+
+# a^e for an exponent of 32 big-endian bytes (public: inversion and square roots)
+fn fe_pow(a: []int, e: str) -> []int {
+  r := fe_small(1)
+  for i := 0; i < 32; i++ {
+    byt := int(e[i])
+    bit := 7
+    while bit >= 0 {
+      fe_sqr(r, r)
+      if (byt >> bit) & 1 == 1 { fe_mul(r, r, a) }
+      bit--
+    }
+  }
+  return r
+}
+
+fn fe_inv(a: []int) -> []int { return fe_pow(a, EXP_INV) }
+
+# multiplication and squaring, unrolled (generated): the 19 columns of the product, carried
+# into 26-bit limbs, then the limbs above 2^260 folded back with 2^260 = 0x1000003D10 mod p
+
+fn fe_mul(r: []int, a: []int, b: []int) {
+  a0 := a[0]; a1 := a[1]; a2 := a[2]; a3 := a[3]; a4 := a[4]; a5 := a[5]; a6 := a[6]; a7 := a[7]; a8 := a[8]; a9 := a[9]
+  b0 := b[0]; b1 := b[1]; b2 := b[2]; b3 := b[3]; b4 := b[4]; b5 := b[5]; b6 := b[6]; b7 := b[7]; b8 := b[8]; b9 := b[9]
+  c0 := a0 * b0
+  c1 := a0 * b1 + a1 * b0
+  c2 := a0 * b2 + a1 * b1 + a2 * b0
+  c3 := a0 * b3 + a1 * b2 + a2 * b1 + a3 * b0
+  c4 := a0 * b4 + a1 * b3 + a2 * b2 + a3 * b1 + a4 * b0
+  c5 := a0 * b5 + a1 * b4 + a2 * b3 + a3 * b2 + a4 * b1 + a5 * b0
+  c6 := a0 * b6 + a1 * b5 + a2 * b4 + a3 * b3 + a4 * b2 + a5 * b1 + a6 * b0
+  c7 := a0 * b7 + a1 * b6 + a2 * b5 + a3 * b4 + a4 * b3 + a5 * b2 + a6 * b1 + a7 * b0
+  c8 := a0 * b8 + a1 * b7 + a2 * b6 + a3 * b5 + a4 * b4 + a5 * b3 + a6 * b2 + a7 * b1 + a8 * b0
+  c9 := a0 * b9 + a1 * b8 + a2 * b7 + a3 * b6 + a4 * b5 + a5 * b4 + a6 * b3 + a7 * b2 + a8 * b1 + a9 * b0
+  c10 := a1 * b9 + a2 * b8 + a3 * b7 + a4 * b6 + a5 * b5 + a6 * b4 + a7 * b3 + a8 * b2 + a9 * b1
+  c11 := a2 * b9 + a3 * b8 + a4 * b7 + a5 * b6 + a6 * b5 + a7 * b4 + a8 * b3 + a9 * b2
+  c12 := a3 * b9 + a4 * b8 + a5 * b7 + a6 * b6 + a7 * b5 + a8 * b4 + a9 * b3
+  c13 := a4 * b9 + a5 * b8 + a6 * b7 + a7 * b6 + a8 * b5 + a9 * b4
+  c14 := a5 * b9 + a6 * b8 + a7 * b7 + a8 * b6 + a9 * b5
+  c15 := a6 * b9 + a7 * b8 + a8 * b7 + a9 * b6
+  c16 := a7 * b9 + a8 * b8 + a9 * b7
+  c17 := a8 * b9 + a9 * b8
+  c18 := a9 * b9
+  c19 := 0
+  c1 += c0 >> 26
+  c0 = c0 & 0x3FFFFFF
+  c2 += c1 >> 26
+  c1 = c1 & 0x3FFFFFF
+  c3 += c2 >> 26
+  c2 = c2 & 0x3FFFFFF
+  c4 += c3 >> 26
+  c3 = c3 & 0x3FFFFFF
+  c5 += c4 >> 26
+  c4 = c4 & 0x3FFFFFF
+  c6 += c5 >> 26
+  c5 = c5 & 0x3FFFFFF
+  c7 += c6 >> 26
+  c6 = c6 & 0x3FFFFFF
+  c8 += c7 >> 26
+  c7 = c7 & 0x3FFFFFF
+  c9 += c8 >> 26
+  c8 = c8 & 0x3FFFFFF
+  c10 += c9 >> 26
+  c9 = c9 & 0x3FFFFFF
+  c11 += c10 >> 26
+  c10 = c10 & 0x3FFFFFF
+  c12 += c11 >> 26
+  c11 = c11 & 0x3FFFFFF
+  c13 += c12 >> 26
+  c12 = c12 & 0x3FFFFFF
+  c14 += c13 >> 26
+  c13 = c13 & 0x3FFFFFF
+  c15 += c14 >> 26
+  c14 = c14 & 0x3FFFFFF
+  c16 += c15 >> 26
+  c15 = c15 & 0x3FFFFFF
+  c17 += c16 >> 26
+  c16 = c16 & 0x3FFFFFF
+  c18 += c17 >> 26
+  c17 = c17 & 0x3FFFFFF
+  c19 += c18 >> 26
+  c18 = c18 & 0x3FFFFFF
+  c0 += c10 * 0x3D10
+  c1 += c11 * 0x3D10 + c10 * 0x400
+  c2 += c12 * 0x3D10 + c11 * 0x400
+  c3 += c13 * 0x3D10 + c12 * 0x400
+  c4 += c14 * 0x3D10 + c13 * 0x400
+  c5 += c15 * 0x3D10 + c14 * 0x400
+  c6 += c16 * 0x3D10 + c15 * 0x400
+  c7 += c17 * 0x3D10 + c16 * 0x400
+  c8 += c18 * 0x3D10 + c17 * 0x400
+  c9 += c19 * 0x3D10 + c18 * 0x400
+  c10 = c19 * 0x400
+  c1 += c0 >> 26
+  c0 = c0 & 0x3FFFFFF
+  c2 += c1 >> 26
+  c1 = c1 & 0x3FFFFFF
+  c3 += c2 >> 26
+  c2 = c2 & 0x3FFFFFF
+  c4 += c3 >> 26
+  c3 = c3 & 0x3FFFFFF
+  c5 += c4 >> 26
+  c4 = c4 & 0x3FFFFFF
+  c6 += c5 >> 26
+  c5 = c5 & 0x3FFFFFF
+  c7 += c6 >> 26
+  c6 = c6 & 0x3FFFFFF
+  c8 += c7 >> 26
+  c7 = c7 & 0x3FFFFFF
+  c9 += c8 >> 26
+  c8 = c8 & 0x3FFFFFF
+  t := (c9 >> 22) + (c10 << 4)
+  c9 = c9 & 0x3FFFFF
+  c0 += t * 977
+  c1 += t << 6
+  c1 += c0 >> 26
+  c0 = c0 & 0x3FFFFFF
+  c2 += c1 >> 26
+  c1 = c1 & 0x3FFFFFF
+  c3 += c2 >> 26
+  c2 = c2 & 0x3FFFFFF
+  c4 += c3 >> 26
+  c3 = c3 & 0x3FFFFFF
+  c5 += c4 >> 26
+  c4 = c4 & 0x3FFFFFF
+  c6 += c5 >> 26
+  c5 = c5 & 0x3FFFFFF
+  c7 += c6 >> 26
+  c6 = c6 & 0x3FFFFFF
+  c8 += c7 >> 26
+  c7 = c7 & 0x3FFFFFF
+  c9 += c8 >> 26
+  c8 = c8 & 0x3FFFFFF
+  r[0] = c0
+  r[1] = c1
+  r[2] = c2
+  r[3] = c3
+  r[4] = c4
+  r[5] = c5
+  r[6] = c6
+  r[7] = c7
+  r[8] = c8
+  r[9] = c9
+}
+
+fn fe_sqr(r: []int, a: []int) {
+  a0 := a[0]; a1 := a[1]; a2 := a[2]; a3 := a[3]; a4 := a[4]; a5 := a[5]; a6 := a[6]; a7 := a[7]; a8 := a[8]; a9 := a[9]
+  c0 := a0 * a0
+  c1 := (a0 * a1) * 2
+  c2 := (a0 * a2) * 2 + a1 * a1
+  c3 := (a0 * a3) * 2 + (a1 * a2) * 2
+  c4 := (a0 * a4) * 2 + (a1 * a3) * 2 + a2 * a2
+  c5 := (a0 * a5) * 2 + (a1 * a4) * 2 + (a2 * a3) * 2
+  c6 := (a0 * a6) * 2 + (a1 * a5) * 2 + (a2 * a4) * 2 + a3 * a3
+  c7 := (a0 * a7) * 2 + (a1 * a6) * 2 + (a2 * a5) * 2 + (a3 * a4) * 2
+  c8 := (a0 * a8) * 2 + (a1 * a7) * 2 + (a2 * a6) * 2 + (a3 * a5) * 2 + a4 * a4
+  c9 := (a0 * a9) * 2 + (a1 * a8) * 2 + (a2 * a7) * 2 + (a3 * a6) * 2 + (a4 * a5) * 2
+  c10 := (a1 * a9) * 2 + (a2 * a8) * 2 + (a3 * a7) * 2 + (a4 * a6) * 2 + a5 * a5
+  c11 := (a2 * a9) * 2 + (a3 * a8) * 2 + (a4 * a7) * 2 + (a5 * a6) * 2
+  c12 := (a3 * a9) * 2 + (a4 * a8) * 2 + (a5 * a7) * 2 + a6 * a6
+  c13 := (a4 * a9) * 2 + (a5 * a8) * 2 + (a6 * a7) * 2
+  c14 := (a5 * a9) * 2 + (a6 * a8) * 2 + a7 * a7
+  c15 := (a6 * a9) * 2 + (a7 * a8) * 2
+  c16 := (a7 * a9) * 2 + a8 * a8
+  c17 := (a8 * a9) * 2
+  c18 := a9 * a9
+  c19 := 0
+  c1 += c0 >> 26
+  c0 = c0 & 0x3FFFFFF
+  c2 += c1 >> 26
+  c1 = c1 & 0x3FFFFFF
+  c3 += c2 >> 26
+  c2 = c2 & 0x3FFFFFF
+  c4 += c3 >> 26
+  c3 = c3 & 0x3FFFFFF
+  c5 += c4 >> 26
+  c4 = c4 & 0x3FFFFFF
+  c6 += c5 >> 26
+  c5 = c5 & 0x3FFFFFF
+  c7 += c6 >> 26
+  c6 = c6 & 0x3FFFFFF
+  c8 += c7 >> 26
+  c7 = c7 & 0x3FFFFFF
+  c9 += c8 >> 26
+  c8 = c8 & 0x3FFFFFF
+  c10 += c9 >> 26
+  c9 = c9 & 0x3FFFFFF
+  c11 += c10 >> 26
+  c10 = c10 & 0x3FFFFFF
+  c12 += c11 >> 26
+  c11 = c11 & 0x3FFFFFF
+  c13 += c12 >> 26
+  c12 = c12 & 0x3FFFFFF
+  c14 += c13 >> 26
+  c13 = c13 & 0x3FFFFFF
+  c15 += c14 >> 26
+  c14 = c14 & 0x3FFFFFF
+  c16 += c15 >> 26
+  c15 = c15 & 0x3FFFFFF
+  c17 += c16 >> 26
+  c16 = c16 & 0x3FFFFFF
+  c18 += c17 >> 26
+  c17 = c17 & 0x3FFFFFF
+  c19 += c18 >> 26
+  c18 = c18 & 0x3FFFFFF
+  c0 += c10 * 0x3D10
+  c1 += c11 * 0x3D10 + c10 * 0x400
+  c2 += c12 * 0x3D10 + c11 * 0x400
+  c3 += c13 * 0x3D10 + c12 * 0x400
+  c4 += c14 * 0x3D10 + c13 * 0x400
+  c5 += c15 * 0x3D10 + c14 * 0x400
+  c6 += c16 * 0x3D10 + c15 * 0x400
+  c7 += c17 * 0x3D10 + c16 * 0x400
+  c8 += c18 * 0x3D10 + c17 * 0x400
+  c9 += c19 * 0x3D10 + c18 * 0x400
+  c10 = c19 * 0x400
+  c1 += c0 >> 26
+  c0 = c0 & 0x3FFFFFF
+  c2 += c1 >> 26
+  c1 = c1 & 0x3FFFFFF
+  c3 += c2 >> 26
+  c2 = c2 & 0x3FFFFFF
+  c4 += c3 >> 26
+  c3 = c3 & 0x3FFFFFF
+  c5 += c4 >> 26
+  c4 = c4 & 0x3FFFFFF
+  c6 += c5 >> 26
+  c5 = c5 & 0x3FFFFFF
+  c7 += c6 >> 26
+  c6 = c6 & 0x3FFFFFF
+  c8 += c7 >> 26
+  c7 = c7 & 0x3FFFFFF
+  c9 += c8 >> 26
+  c8 = c8 & 0x3FFFFFF
+  t := (c9 >> 22) + (c10 << 4)
+  c9 = c9 & 0x3FFFFF
+  c0 += t * 977
+  c1 += t << 6
+  c1 += c0 >> 26
+  c0 = c0 & 0x3FFFFFF
+  c2 += c1 >> 26
+  c1 = c1 & 0x3FFFFFF
+  c3 += c2 >> 26
+  c2 = c2 & 0x3FFFFFF
+  c4 += c3 >> 26
+  c3 = c3 & 0x3FFFFFF
+  c5 += c4 >> 26
+  c4 = c4 & 0x3FFFFFF
+  c6 += c5 >> 26
+  c5 = c5 & 0x3FFFFFF
+  c7 += c6 >> 26
+  c6 = c6 & 0x3FFFFFF
+  c8 += c7 >> 26
+  c7 = c7 & 0x3FFFFFF
+  c9 += c8 >> 26
+  c8 = c8 & 0x3FFFFFF
+  r[0] = c0
+  r[1] = c1
+  r[2] = c2
+  r[3] = c3
+  r[4] = c4
+  r[5] = c5
+  r[6] = c6
+  r[7] = c7
+  r[8] = c8
+  r[9] = c9
+}
+
+# ---------------------------------------------------------------- points
+#
+# Projective coordinates (X : Y : Z) for the point (X/Z, Y/Z); the point at infinity is
+# (0 : 1 : 0). The curve is y^2 = x^3 + 7, so 3b = 21.
+
+struct Pt {
+  x: []int
+  y: []int
+  z: []int
+}
+
+fn pt_inf() -> *Pt { return &Pt{x: fe(), y: fe_small(1), z: fe()} }
+
+fn pt_is_inf(p: *Pt) -> bool { return fe_is_zero(p.z) }
+
+let GX = fe_from_hex("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+let GY = fe_from_hex("483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8")
+
+fn fe_from_hex(h: str) -> []int {
+  r, _ := fe_from_bytes(web3.must_hex(h))
+  return r
+}
+
+fn pt_g() -> *Pt { return &Pt{x: fe_copy(GX), y: fe_copy(GY), z: fe_small(1)} }
+
+# p + q for any p, q (Renes-Costello-Batina 2015, algorithm 7: complete for a = 0)
+fn pt_add(p: *Pt, q: *Pt) -> *Pt {
+  x1 := p.x; y1 := p.y; z1 := p.z
+  x2 := q.x; y2 := q.y; z2 := q.z
+  t0 := fe(); t1 := fe(); t2 := fe(); t3 := fe(); t4 := fe()
+  x3 := fe(); y3 := fe(); z3 := fe()
+  fe_mul(t0, x1, x2)
+  fe_mul(t1, y1, y2)
+  fe_mul(t2, z1, z2)
+  fe_add(t3, x1, y1)
+  fe_add(t4, x2, y2)
+  fe_mul(t3, t3, t4)
+  fe_add(t4, t0, t1)
+  fe_sub(t3, t3, t4)
+  fe_add(t4, y1, z1)
+  fe_add(x3, y2, z2)
+  fe_mul(t4, t4, x3)
+  fe_add(x3, t1, t2)
+  fe_sub(t4, t4, x3)
+  fe_add(x3, x1, z1)
+  fe_add(y3, x2, z2)
+  fe_mul(x3, x3, y3)
+  fe_add(y3, t0, t2)
+  fe_sub(y3, x3, y3)
+  fe_add(x3, t0, t0)
+  fe_add(t0, x3, t0)
+  fe_mul_small(t2, t2, 21)
+  fe_add(z3, t1, t2)
+  fe_sub(t1, t1, t2)
+  fe_mul_small(y3, y3, 21)
+  fe_mul(x3, t4, y3)
+  fe_mul(t2, t3, t1)
+  fe_sub(x3, t2, x3)
+  fe_mul(y3, y3, t0)
+  fe_mul(t1, t1, z3)
+  fe_add(y3, t1, y3)
+  fe_mul(t0, t0, t3)
+  fe_mul(z3, z3, t4)
+  fe_add(z3, z3, t0)
+  return &Pt{x: x3, y: y3, z: z3}
+}
+
+# 2p (algorithm 9 of the same paper)
+fn pt_dbl(p: *Pt) -> *Pt {
+  x := p.x; y := p.y; z := p.z
+  t0 := fe(); t1 := fe(); t2 := fe()
+  x3 := fe(); y3 := fe(); z3 := fe()
+  fe_sqr(t0, y)
+  fe_add(z3, t0, t0)
+  fe_add(z3, z3, z3)
+  fe_add(z3, z3, z3)
+  fe_mul(t1, y, z)
+  fe_sqr(t2, z)
+  fe_mul_small(t2, t2, 21)
+  fe_mul(x3, t2, z3)
+  fe_add(y3, t0, t2)
+  fe_mul(z3, t1, z3)
+  fe_add(t1, t2, t2)
+  fe_add(t2, t1, t2)
+  fe_sub(t0, t0, t2)
+  fe_mul(y3, t0, y3)
+  fe_add(y3, x3, y3)
+  fe_mul(t1, x, y)
+  fe_mul(x3, t0, t1)
+  fe_add(x3, x3, x3)
+  return &Pt{x: x3, y: y3, z: z3}
+}
+
+# the affine coordinates as 32-byte strings; ok is false at infinity
+fn pt_affine(p: *Pt) -> (str, str, bool) {
+  if pt_is_inf(p) { return "", "", false }
+  zi := fe_inv(p.z)
+  ax := fe()
+  ay := fe()
+  fe_mul(ax, p.x, zi)
+  fe_mul(ay, p.y, zi)
+  return fe_to_bytes(ax), fe_to_bytes(ay), true
+}
+
+# the point with affine x (32 bytes) whose y has the given parity; ok is false when x is not on
+# the curve
+fn pt_lift_x(xb: str, odd: bool) -> (*Pt, bool) {
+  x, ok := fe_from_bytes(xb)
+  if !ok { return nil, false }
+  y2 := fe()
+  fe_sqr(y2, x)
+  fe_mul(y2, y2, x)
+  fe_add(y2, y2, fe_small(7))
+  y := fe_pow(y2, EXP_SQRT)
+  chk := fe()
+  fe_sqr(chk, y)
+  if !fe_eq(chk, y2) { return nil, false }
+  if fe_is_odd(y) != odd { fe_neg(y, y) }
+  return &Pt{x: x, y: y, z: fe_small(1)}, true
+}
+
+# is (x, y) (32 bytes each) on the curve?
+fn on_curve(xb: str, yb: str) -> (*Pt, bool) {
+  x, ok1 := fe_from_bytes(xb)
+  y, ok2 := fe_from_bytes(yb)
+  if !ok1 || !ok2 { return nil, false }
+  l := fe()
+  fe_sqr(l, y)
+  r := fe()
+  fe_sqr(r, x)
+  fe_mul(r, r, x)
+  fe_add(r, r, fe_small(7))
+  if !fe_eq(l, r) { return nil, false }
+  return &Pt{x: x, y: y, z: fe_small(1)}, true
+}
+
+# ---------------------------------------------------------------- k*G
+#
+# G_TABLE[16*i + j] = j * 16^i * G (j = 0 is the point at infinity), for the 64 windows of 4
+# bits of a 256-bit scalar. Built on first use (about 1000 point operations).
+
+let G_TABLE: []*Pt = nil
+
+fn g_table() -> []*Pt {
+  if G_TABLE != nil { return G_TABLE }
+  t := []*Pt{}
+  base := pt_g()
+  for i := 0; i < 64; i++ {
+    t = append(t, pt_inf())
+    t = append(t, base)
+    for j := 2; j < 16; j++ { t = append(t, pt_add(t[16 * i + j - 1], base)) }
+    base = pt_dbl(t[16 * i + 8])
+  }
+  G_TABLE = t
+  return t
+}
+
+# all ones when a == b, else 0 (no branch)
+fn eq_mask(a: int, b: int) -> int {
+  x := a ^ b
+  return ((x | (0 - x)) >> 63) ^ -1
+}
+
+# k*G for k as 32 big-endian bytes. Every window adds one table entry, read by scanning the
+# whole window with masks, with the complete formula: the same work for every k.
+fn mul_g(k: str) -> *Pt {
+  tab := g_table()
+  acc := pt_inf()
+  for i := 0; i < 64; i++ {
+    byt := int(k[31 - i / 2])
+    d := (byt >> (4 * (i % 2))) & 15
+    sx := fe(); sy := fe(); sz := fe()
+    for j := 0; j < 16; j++ {
+      m := eq_mask(j, d)
+      e := tab[16 * i + j]
+      for l := 0; l < 10; l++ {
+        sx[l] = sx[l] | (e.x[l] & m)
+        sy[l] = sy[l] | (e.y[l] & m)
+        sz[l] = sz[l] | (e.z[l] & m)
+      }
+    }
+    acc = pt_add(acc, &Pt{x: sx, y: sy, z: sz})
+  }
+  return acc
+}
+
+# k*P for public k and P (4-bit windows, variable time)
+fn mul_var(p: *Pt, k: str) -> *Pt {
+  t := []*Pt{pt_inf(), p}
+  for j := 2; j < 16; j++ { t = append(t, pt_add(t[j - 1], p)) }
+  acc := pt_inf()
+  for i := 0; i < 32; i++ {
+    byt := int(k[i])
+    if i > 0 { acc = pt_dbl(pt_dbl(pt_dbl(pt_dbl(acc)))) }
+    acc = pt_add(acc, t[byt >> 4])
+    acc = pt_dbl(pt_dbl(pt_dbl(pt_dbl(acc))))
+    acc = pt_add(acc, t[byt & 15])
+  }
+  return acc
+}
+
+# ---------------------------------------------------------------- scalars (mod n)
+#
+# Scalars are *web3.U256 (eight 32-bit limbs); products go through Montgomery multiplication
+# with R = 2^256.
+
+let N = web3.must_u256("0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
+let HALF_N = web3.must_u256("0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0")
+let N_R2 = web3.must_u256("0x9d671cd581c69bc5e697f5e45bcd07c6741496c20e7cf878896cf21467d7d140")
+let N_MINUS_2 = web3.must_hex("0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd036413f")
+const N_MINV = 0x5588b13f
+
+# the order of the secp256k1 group (n)
+export fn curve_order() -> *web3.U256 { return N.add(web3.zero()) }
+
+# a*b/R mod n (a, b < n)
+fn mont_mul(a: *web3.U256, b: *web3.U256) -> *web3.U256 {
+  m := N.w
+  t := make([]int, 10)
+  aw := a.w
+  bw := b.w
+  x := 0
+  c := 0
+  for i := 0; i < 8; i++ {
+    bi := bw[i]
+    c = 0
+    for j := 0; j < 8; j++ {
+      x = t[j] + aw[j] * bi + c
+      t[j] = x & M32
+      c = (x >> 32) & M32
+    }
+    x = t[8] + c
+    t[8] = x & M32
+    t[9] = (x >> 32) & M32
+    q := (t[0] * N_MINV) & M32
+    x = t[0] + q * m[0]
+    c = (x >> 32) & M32
+    for j2 := 1; j2 < 8; j2++ {
+      x = t[j2] + q * m[j2] + c
+      t[j2 - 1] = x & M32
+      c = (x >> 32) & M32
+    }
+    x = t[8] + c
+    t[7] = x & M32
+    t[8] = t[9] + ((x >> 32) & M32)
+  }
+  r := &web3.U256{w: []int{t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]}}
+  if t[8] != 0 || r.cmp(N) >= 0 { r = r.sub(N) }
+  return r
+}
+
+# x mod n for x < 2^256
+fn sc_reduce(x: *web3.U256) -> *web3.U256 {
+  if x.cmp(N) >= 0 { return x.sub(N) }
+  return x
+}
+
+fn sc_mul(a: *web3.U256, b: *web3.U256) -> *web3.U256 { return mont_mul(mont_mul(a, b), N_R2) }
+
+fn sc_add(a: *web3.U256, b: *web3.U256) -> *web3.U256 {
+  s := a.add(b)
+  if s.lt(a) || s.cmp(N) >= 0 { s = s.sub(N) }
+  return s
+}
+
+fn sc_neg(a: *web3.U256) -> *web3.U256 {
+  if a.is_zero() { return a }
+  return N.sub(a)
+}
+
+# a^-1 mod n (Fermat: a^(n-2))
+fn sc_inv(a: *web3.U256) -> *web3.U256 {
+  am := mont_mul(a, N_R2)
+  acc := mont_mul(web3.u256(1), N_R2)
+  for i := 0; i < 32; i++ {
+    byt := int(N_MINUS_2[i])
+    bit := 7
+    while bit >= 0 {
+      acc = mont_mul(acc, acc)
+      if (byt >> bit) & 1 == 1 { acc = mont_mul(acc, am) }
+      bit--
+    }
+  }
+  return mont_mul(acc, web3.u256(1))
+}
+
+# is 0 < k < n?
+fn valid_scalar(k: *web3.U256) -> bool { return !k.is_zero() && k.cmp(N) < 0 }
+
+# ---------------------------------------------------------------- ECDSA
+
+# an ECDSA signature. y_parity (0 or 1) is the recovery id; v is what the signature carries in
+# its encoding: 27 + y_parity for hashes and messages, chain_id * 2 + 35 + y_parity for EIP-155
+# legacy transactions, y_parity for typed transactions.
+export struct Signature {
+  r: *web3.U256
+  s: *web3.U256
+  y_parity: int
+  v: int
+}
+
+# a 32-byte hash given raw or as "0x" hex
+fn hash32(h: str) -> (str, error) {
+  if len(h) == 32 { return h, nil }
+  if web3.is_hex(h, 32) { return web3.from_hex(h) }
+  return "", errors.New("accounts: a hash must have 32 bytes")
+}
+
+# the ECDSA signature of a 32-byte hash with the scalar d (RFC 6979 nonce, low s)
+fn sign_with(d: *web3.U256, h: str) -> *Signature {
+  z := sc_reduce(web3.from_bytes(h))
+  x := d.bytes32()
+  h1 := z.bytes32()
+  zero := string([]byte{byte(0)})
+  one := string([]byte{byte(1)})
+  v := strings.repeat(one, 32)
+  k := web3.zeros(32)
+  k = crypto.hmac_sha256(k, v + zero + x + h1)
+  v = crypto.hmac_sha256(k, v)
+  k = crypto.hmac_sha256(k, v + one + x + h1)
+  v = crypto.hmac_sha256(k, v)
+  while true {
+    v = crypto.hmac_sha256(k, v)
+    kk := web3.from_bytes(v)
+    if valid_scalar(kk) {
+      rx, ry, ok := pt_affine(mul_g(v))
+      if ok {
+        rxi := web3.from_bytes(rx)
+        r := sc_reduce(rxi)
+        if !r.is_zero() {
+          s := sc_mul(sc_inv(kk), sc_add(z, sc_mul(r, d)))
+          if !s.is_zero() {
+            rec := int(ry[31]) & 1
+            if rxi.cmp(N) >= 0 { rec = rec | 2 }
+            if s.gt(HALF_N) {
+              s = N.sub(s)
+              rec = rec ^ 1
+            }
+            return &Signature{r: r, s: s, y_parity: rec, v: 27 + rec}
+          }
+        }
+      }
+    }
+    k = crypto.hmac_sha256(k, v + zero)
+    v = crypto.hmac_sha256(k, v)
+  }
+  return nil
+}
+
+# the public point of a signature over a 32-byte hash
+fn recover_point(h: str, r: *web3.U256, s: *web3.U256, rec: int) -> (*Pt, error) {
+  if r == nil || s == nil || !valid_scalar(r) || !valid_scalar(s) { return nil, errors.New("accounts: invalid signature (r or s out of range)") }
+  if rec < 0 || rec > 3 { return nil, errors.New("accounts: invalid recovery id") }
+  x := r
+  if rec & 2 != 0 {
+    x = r.add(N)
+    if x.lt(r) { return nil, errors.New("accounts: invalid recovery id") }
+  }
+  rp, ok := pt_lift_x(x.bytes32(), rec & 1 == 1)
+  if !ok { return nil, errors.New("accounts: invalid signature (r is not a point)") }
+  z := sc_reduce(web3.from_bytes(h))
+  ri := sc_inv(r)
+  u1 := sc_neg(sc_mul(z, ri))
+  u2 := sc_mul(s, ri)
+  q := pt_add(mul_g(u1.bytes32()), mul_var(rp, u2.bytes32()))
+  if pt_is_inf(q) { return nil, errors.New("accounts: invalid signature (recovers infinity)") }
+  return q, nil
+}
+
+# the recovery id from a v: 0/1, 27/28 or an EIP-155 v (35 + 2 * chain id + y)
+fn recovery_id(v: int) -> (int, error) {
+  if v == 0 || v == 1 { return v, nil }
+  if v == 27 || v == 28 { return v - 27, nil }
+  if v >= 35 { return (v - 35) % 2, nil }
+  return 0, errors.New("accounts: invalid v " + str(v))
+}
+
+fn point_bytes(q: *Pt) -> str {
+  x, y, _ := pt_affine(q)
+  return string([]byte{byte(4)}) + x + y
+}
+
+# the 65-byte public key (0x04 || x || y) that made the signature of a 32-byte hash
+export fn recover_public_key(hash: str, sig: *Signature) -> (str, error) {
+  h, err := hash32(hash)
+  if err != nil { return "", err }
+  if sig == nil { return "", errors.New("accounts: nil signature") }
+  q, err2 := recover_point(h, sig.r, sig.s, sig.y_parity)
+  if err2 != nil { return "", err2 }
+  return point_bytes(q), nil
+}
+
+# the address that made the signature of a 32-byte hash
+export fn recover_address(hash: str, sig: *Signature) -> (str, error) {
+  pub, err := recover_public_key(hash, sig)
+  if err != nil { return "", err }
+  return public_key_to_address(pub), nil
+}
+
+# like the EVM's ecrecover: the address that signed the 32-byte hash, with v as 0/1, 27/28 or
+# an EIP-155 v
+export fn ecrecover(hash: str, r: *web3.U256, s: *web3.U256, v: int) -> (str, error) {
+  rec, err := recovery_id(v)
+  if err != nil { return "", err }
+  return recover_address(hash, &Signature{r: r, s: s, y_parity: rec, v: v})
+}
+
+# does sig over the 32-byte hash come from address?
+export fn verify_hash(address: str, hash: str, sig: *Signature) -> bool {
+  got, err := recover_address(hash, sig)
+  if err != nil { return false }
+  return web3.same_address(got, address)
+}
+
+# ---------------------------------------------------------------- signature encoding
+
+# the 65 bytes r || s || v, with v 27 or 28
+export fn serialize_signature(sig: *Signature) -> str {
+  return sig.r.bytes32() + sig.s.bytes32() + string([]byte{byte(27 + (sig.y_parity & 1))})
+}
+
+# a 65-byte signature (raw or "0x" hex) with v 27/28 or 0/1; also the 64-byte compact form of
+# EIP-2098 (the top bit of s is y_parity)
+export fn parse_signature(b: str) -> (*Signature, error) {
+  raw := b
+  if strings.has_prefix(b, "0x") || strings.has_prefix(b, "0X") {
+    if !web3.is_hex(b, 65) && !web3.is_hex(b, 64) { return nil, errors.New("accounts: a signature must have 64 or 65 bytes") }
+    raw, _ = web3.from_hex(b)
+  }
+  if len(raw) == 64 {
+    r2 := web3.from_bytes(raw[0:32])
+    ys := web3.from_bytes(raw[32:64])
+    y2 := 0
+    if ys.w[7] >> 31 == 1 { y2 = 1 }
+    ys.w[7] = ys.w[7] & 0x7FFFFFFF
+    return &Signature{r: r2, s: ys, y_parity: y2, v: 27 + y2}, nil
+  }
+  if len(raw) != 65 { return nil, errors.New("accounts: a signature must have 64 or 65 bytes") }
+  v := int(raw[64])
+  y := 0
+  if v == 27 || v == 28 { y = v - 27 } else if v == 0 || v == 1 { y = v } else { return nil, errors.New("accounts: invalid signature v " + str(v)) }
+  return &Signature{r: web3.from_bytes(raw[0:32]), s: web3.from_bytes(raw[32:64]), y_parity: y, v: 27 + y}, nil
+}
+
+# the 64-byte compact form of EIP-2098 (r || s with y_parity in the top bit of s)
+export fn compact_signature(sig: *Signature) -> str {
+  s := sig.s.bytes32()
+  if sig.y_parity & 1 == 1 { s = string([]byte{byte(int(s[0]) | 0x80)}) + s[1:] }
+  return sig.r.bytes32() + s
+}
+
+# ---------------------------------------------------------------- keys and accounts
+
+# an account made from a private key. private_key holds the raw 32 bytes: keep the struct out
+# of logs.
+export struct Account {
+  address: str      # EIP-55
+  public_key: str   # 65 bytes: 0x04 || x || y
+  private_key: str  # 32 bytes
+}
+
+# the 32 bytes of a private key given raw (32 bytes) or as hex (64 digits, "0x" optional)
+fn key_bytes(key: str) -> (str, error) {
+  raw := key
+  if len(key) != 32 {
+    h := key
+    if !strings.has_prefix(h, "0x") && !strings.has_prefix(h, "0X") { h = "0x" + h }
+    if !web3.is_hex(h, 32) { return "", errors.New("accounts: a private key must have 32 bytes") }
+    raw, _ = web3.from_hex(h)
+  }
+  if !valid_scalar(web3.from_bytes(raw)) { return "", errors.New("accounts: private key out of range") }
+  return raw, nil
+}
+
+# the account of a private key (32 raw bytes or hex)
+export fn private_key_to_account(key: str) -> (*Account, error) {
+  raw, err := key_bytes(key)
+  if err != nil { return nil, err }
+  pub := point_bytes(mul_g(raw))
+  return &Account{address: public_key_to_address(pub), public_key: pub, private_key: raw}, nil
+}
+
+# the public key of a private key: 65 bytes uncompressed, or 33 compressed
+export fn private_key_to_public_key(key: str, compressed: bool) -> (str, error) {
+  raw, err := key_bytes(key)
+  if err != nil { return "", err }
+  pub := point_bytes(mul_g(raw))
+  if compressed { return compress_public_key(pub) }
+  return pub, nil
+}
+
+# a new random private key, "0x" + 64 hex digits
+export fn generate_private_key() -> str {
+  while true {
+    b, err := crypto.random_bytes(32)
+    if err != nil { panic("accounts: no secure randomness: " + err.Error()) }
+    if valid_scalar(web3.from_bytes(b)) { return web3.to_hex(b) }
+  }
+  return ""
+}
+
+# the 64 bytes x || y of a public key given as 65 bytes (0x04...), 64 bytes or 33 compressed
+# bytes (raw or "0x" hex); it must be a point of the curve
+fn public_xy(pub: str) -> (str, error) {
+  b := pub
+  if strings.has_prefix(pub, "0x") {
+    d, err := web3.from_hex(pub)
+    if err != nil { return "", errors.New("accounts: invalid public key") }
+    b = d
+  }
+  if len(b) == 65 && int(b[0]) == 4 { b = b[1:] }
+  if len(b) == 64 {
+    _, ok := on_curve(b[0:32], b[32:64])
+    if !ok { return "", errors.New("accounts: public key not on the curve") }
+    return b, nil
+  }
+  if len(b) == 33 && (int(b[0]) == 2 || int(b[0]) == 3) {
+    p, ok2 := pt_lift_x(b[1:33], int(b[0]) == 3)
+    if !ok2 { return "", errors.New("accounts: public key not on the curve") }
+    return fe_to_bytes(p.x) + fe_to_bytes(p.y), nil
+  }
+  return "", errors.New("accounts: a public key must have 65, 64 or 33 bytes")
+}
+
+# the address (EIP-55) of a public key (65, 64 or 33 bytes, raw or hex); "" if it is invalid
+export fn public_key_to_address(pub: str) -> str {
+  xy, err := public_xy(pub)
+  if err != nil { return "" }
+  return web3.address_from_bytes(web3.keccak256(xy)[12:32])
+}
+
+# the 33-byte compressed form of a public key
+export fn compress_public_key(pub: str) -> (str, error) {
+  xy, err := public_xy(pub)
+  if err != nil { return "", err }
+  prefix := 2 + (int(xy[63]) & 1)
+  return string([]byte{byte(prefix)}) + xy[0:32], nil
+}
+
+# the 65-byte uncompressed form of a public key
+export fn decompress_public_key(pub: str) -> (str, error) {
+  xy, err := public_xy(pub)
+  if err != nil { return "", err }
+  return string([]byte{byte(4)}) + xy, nil
+}
+
+# signs a 32-byte hash (raw or "0x" hex) as it is: no prefix is added
+export fn (a: *Account) sign_hash(h: str) -> (*Signature, error) {
+  hb, err := hash32(h)
+  if err != nil { return nil, err }
+  return sign_with(web3.from_bytes(a.private_key), hb), nil
+}
+
+# ---------------------------------------------------------------- EIP-191 (personal_sign)
+
+# keccak256("\x19Ethereum Signed Message:\n" + len(msg) + msg), 32 bytes
+export fn hash_message(msg: str) -> str {
+  prefix := string([]byte{byte(0x19)}) + "Ethereum Signed Message:\n" + str(len(msg))
+  return web3.keccak256(prefix + msg)
+}
+
+# the EIP-191 signature of msg, "0x" + 65 bytes of hex (v 27/28)
+export fn (a: *Account) sign_message(msg: str) -> str {
+  sig := sign_with(web3.from_bytes(a.private_key), hash_message(msg))
+  return web3.to_hex(serialize_signature(sig))
+}
+
+# the address that signed msg (EIP-191)
+export fn recover_message_address(msg: str, sig_hex: str) -> (str, error) {
+  sig, err := parse_signature(sig_hex)
+  if err != nil { return "", err }
+  return recover_address(hash_message(msg), sig)
+}
+
+# did address sign msg (EIP-191)?
+export fn verify_message(address: str, msg: str, sig_hex: str) -> bool {
+  got, err := recover_message_address(msg, sig_hex)
+  if err != nil { return false }
+  return web3.same_address(got, address)
+}
+
+# ---------------------------------------------------------------- EIP-712 (typed data)
+
+export struct TypedField {
+  name: str
+  type: str
+}
+
+# typed data to sign. Values in domain and message: uintN/intN as *web3.U256, int or a str
+# (decimal, "0x" hex, "-..."); address as a "0x" str; bool; string as str; bytes as raw str;
+# bytesN as raw str of N bytes (or "0x" hex of N bytes); arrays as []any; structs as
+# map[str]any. The EIP712Domain type comes from the domain keys present (name, version,
+# chainId, verifyingContract, salt) unless types has its own.
+export struct TypedData {
+  domain: map[str]any
+  types: map[str][]*TypedField
+  primary_type: str
+  message: map[str]any
+}
+
+let DOMAIN_FIELDS = []str{"name", "version", "chainId", "verifyingContract", "salt"}
+let DOMAIN_TYPES = []str{"string", "string", "uint256", "address", "bytes32"}
+
+# the types with EIP712Domain filled in
+fn typed_types(td: *TypedData) -> map[str][]*TypedField {
+  types := map[str][]*TypedField{}
+  for k, v := range td.types { types[k] = v }
+  _, has := types["EIP712Domain"]
+  if !has {
+    fs := []*TypedField{}
+    for i, name := range DOMAIN_FIELDS {
+      if td.domain != nil {
+        _, present := td.domain[name]
+        if present { fs = append(fs, &TypedField{name: name, type: DOMAIN_TYPES[i]}) }
+      }
+    }
+    types["EIP712Domain"] = fs
+  }
+  return types
+}
+
+# the type without array suffixes ("Person[][2]" -> "Person")
+fn base_type(t: str) -> str {
+  while strings.has_suffix(t, "]") {
+    i := strings.last_index(t, "[")
+    if i < 0 { return t }
+    t = t[0:i]
+  }
+  return t
+}
+
+fn find_deps(types: map[str][]*TypedField, name: str, found: map[str]bool, depth: int) -> error {
+  if depth > 64 { return errors.New("accounts: typed data nested too deep") }
+  if found[name] { return nil }
+  fields, ok := types[name]
+  if !ok { return nil }
+  found[name] = true
+  for _, f := range fields {
+    bt := base_type(f.type)
+    _, is_struct := types[bt]
+    if is_struct {
+      err := find_deps(types, bt, found, depth + 1)
+      if err != nil { return err }
+    }
+  }
+  return nil
+}
+
+fn sort_strs(a: []str) {
+  for i := 1; i < len(a); i++ {
+    j := i
+    while j > 0 && a[j - 1] > a[j] {
+      t := a[j]
+      a[j] = a[j - 1]
+      a[j - 1] = t
+      j--
+    }
+  }
+}
+
+fn type_sig(types: map[str][]*TypedField, name: str) -> str {
+  parts := []str{}
+  for _, f := range types[name] { parts = append(parts, f.type + " " + f.name) }
+  return name + "(" + strings.join(parts, ",") + ")"
+}
+
+# encodeType: the primary type, then the types it references, sorted by name
+fn encode_type(types: map[str][]*TypedField, primary: str) -> (str, error) {
+  _, ok := types[primary]
+  if !ok { return "", errors.New("accounts: unknown typed data type " + primary) }
+  found := map[str]bool{}
+  err := find_deps(types, primary, found, 0)
+  if err != nil { return "", err }
+  deps := []str{}
+  for k, _ := range found { if k != primary { deps = append(deps, k) } }
+  sort_strs(deps)
+  out := type_sig(types, primary)
+  for _, d := range deps { out += type_sig(types, d) }
+  return out, nil
+}
+
+# hashStruct: keccak256(typeHash || encodeData)
+fn hash_struct(types: map[str][]*TypedField, name: str, data: map[str]any, depth: int) -> (str, error) {
+  if depth > 64 { return "", errors.New("accounts: typed data nested too deep") }
+  et, err := encode_type(types, name)
+  if err != nil { return "", err }
+  enc := web3.keccak256(et)
+  for _, f := range types[name] {
+    v, present := data[f.name]
+    if !present { return "", errors.New("accounts: typed data " + name + " is missing " + f.name) }
+    e, err2 := encode_value(types, f.type, v, depth)
+    if err2 != nil { return "", errors.New("accounts: " + name + "." + f.name + ": " + err2.Error()) }
+    enc += e
+  }
+  return web3.keccak256(enc), nil
+}
+
+# an integer value of a typed field
+fn to_u256(v: any) -> (*web3.U256, error) {
+  switch x := v.(type) {
+  case *web3.U256:
+    if x == nil { return nil, errors.New("nil number") }
+    return x, nil
+  case int:
+    return web3.from_int(x), nil
+  case str:
+    return web3.parse_u256(x)
+  case num:
+    if x != num(int(x)) || x > 9007199254740992.0 || x < -9007199254740992.0 { return nil, errors.New("not an integer") }
+    return web3.from_int(int(x)), nil
+  }
+  return nil, errors.New("not a number")
+}
+
+fn parse_size(s: str) -> int {
+  if s == "" || len(s) > 3 { return -1 }
+  n := 0
+  for i := 0; i < len(s); i++ {
+    c := int(s[i])
+    if c < 48 || c > 57 { return -1 }
+    n = n * 10 + c - 48
+  }
+  if len(s) > 1 && int(s[0]) == 48 { return -1 }
+  return n
+}
+
+# the 32-byte encoding of one value
+fn encode_value(types: map[str][]*TypedField, t: str, v: any, depth: int) -> (str, error) {
+  if strings.has_suffix(t, "]") {
+    i := strings.last_index(t, "[")
+    if i < 0 { return "", errors.New("bad type " + t) }
+    elem := t[0:i]
+    size_s := t[i + 1:len(t) - 1]
+    arr, ok := v.([]any)
+    if !ok { return "", errors.New("expected an array ([]any) for " + t) }
+    if size_s != "" {
+      n := parse_size(size_s)
+      if n < 0 { return "", errors.New("bad type " + t) }
+      if len(arr) != n { return "", errors.New(t + " needs " + str(n) + " items") }
+    }
+    enc := ""
+    for _, e := range arr {
+      ev, err := encode_value(types, elem, e, depth + 1)
+      if err != nil { return "", err }
+      enc += ev
+    }
+    return web3.keccak256(enc), nil
+  }
+  _, is_struct := types[t]
+  if is_struct {
+    m, ok2 := v.(map[str]any)
+    if !ok2 { return "", errors.New("expected a struct (map[str]any) for " + t) }
+    return hash_struct(types, t, m, depth + 1)
+  }
+  if t == "string" {
+    s, ok3 := v.(str)
+    if !ok3 { return "", errors.New("expected a str") }
+    return web3.keccak256(s), nil
+  }
+  if t == "bytes" {
+    b, ok4 := v.(str)
+    if !ok4 { return "", errors.New("expected raw bytes (str)") }
+    return web3.keccak256(b), nil
+  }
+  if t == "bool" {
+    bv, ok5 := v.(bool)
+    if !ok5 { return "", errors.New("expected a bool") }
+    if bv { return web3.from_int(1).bytes32(), nil }
+    return web3.zeros(32), nil
+  }
+  if t == "address" {
+    a, ok6 := v.(str)
+    if !ok6 { return "", errors.New("expected an address (str)") }
+    ab, err := web3.address_bytes(a)
+    if err != nil { return "", err }
+    return web3.pad_left(ab, 32), nil
+  }
+  if strings.has_prefix(t, "bytes") {
+    n := parse_size(t[5:])
+    if n < 1 || n > 32 { return "", errors.New("bad type " + t) }
+    b2, ok7 := v.(str)
+    if !ok7 { return "", errors.New("expected " + t + " (str)") }
+    if len(b2) != n {
+      if !web3.is_hex(b2, n) { return "", errors.New(t + " needs " + str(n) + " bytes") }
+      b2, _ = web3.from_hex(b2)
+    }
+    return web3.pad_right(b2, 32), nil
+  }
+  if strings.has_prefix(t, "uint") || strings.has_prefix(t, "int") {
+    signed := strings.has_prefix(t, "int")
+    bits_s := t[4:]
+    if signed { bits_s = t[3:] }
+    bits := 256
+    if bits_s != "" { bits = parse_size(bits_s) }
+    if bits < 8 || bits > 256 || bits % 8 != 0 { return "", errors.New("bad type " + t) }
+    u, err := to_u256(v)
+    if err != nil { return "", err }
+    if signed {
+      # in range when shifting out bits-1 bits leaves all zeros or all ones
+      hi := u.shr(bits - 1)
+      if bits < 256 && !hi.is_zero() && !hi.eq(web3.max_u256().shr(bits - 1)) { return "", errors.New("value out of range for " + t) }
+    } else {
+      neg := false
+      switch x := v.(type) {
+      case int: neg = x < 0
+      case str: neg = strings.has_prefix(strings.trim_space(x), "-")
+      case num: neg = x < 0.0
+      }
+      if neg { return "", errors.New("negative value for " + t) }
+      if bits < 256 && !u.shr(bits).is_zero() { return "", errors.New("value out of range for " + t) }
+    }
+    return u.bytes32(), nil
+  }
+  return "", errors.New("unknown type " + t)
+}
+
+# the EIP-712 domain separator (32 bytes)
+export fn domain_separator(td: *TypedData) -> (str, error) {
+  types := typed_types(td)
+  dom := td.domain
+  if dom == nil { dom = map[str]any{} }
+  return hash_struct(types, "EIP712Domain", dom, 0)
+}
+
+# keccak256(0x19 0x01 || domainSeparator || hashStruct(message)), 32 bytes
+export fn hash_typed_data(td: *TypedData) -> (str, error) {
+  if td == nil { return "", errors.New("accounts: nil typed data") }
+  types := typed_types(td)
+  dom := td.domain
+  if dom == nil { dom = map[str]any{} }
+  ds, err := hash_struct(types, "EIP712Domain", dom, 0)
+  if err != nil { return "", err }
+  pre := string([]byte{byte(0x19), byte(0x01)}) + ds
+  if td.primary_type == "EIP712Domain" { return web3.keccak256(pre), nil }
+  msg := td.message
+  if msg == nil { msg = map[str]any{} }
+  hs, err2 := hash_struct(types, td.primary_type, msg, 0)
+  if err2 != nil { return "", err2 }
+  return web3.keccak256(pre + hs), nil
+}
+
+# the EIP-712 signature, "0x" + 65 bytes of hex
+export fn (a: *Account) sign_typed_data(td: *TypedData) -> (str, error) {
+  h, err := hash_typed_data(td)
+  if err != nil { return "", err }
+  return web3.to_hex(serialize_signature(sign_with(web3.from_bytes(a.private_key), h))), nil
+}
+
+# the address that signed the typed data
+export fn recover_typed_data_address(td: *TypedData, sig_hex: str) -> (str, error) {
+  h, err := hash_typed_data(td)
+  if err != nil { return "", err }
+  sig, err2 := parse_signature(sig_hex)
+  if err2 != nil { return "", err2 }
+  return recover_address(h, sig)
+}
+
+# did address sign the typed data?
+export fn verify_typed_data(address: str, td: *TypedData, sig_hex: str) -> bool {
+  got, err := recover_typed_data_address(td, sig_hex)
+  if err != nil { return false }
+  return web3.same_address(got, address)
+}
+
+# ---------------------------------------------------------------- transactions
+
+export const TX_LEGACY = 0
+export const TX_EIP2930 = 1
+export const TX_EIP1559 = 2
+export const TX_EIP7702 = 4
+
+# an access list entry (EIP-2930): an address and storage keys ("0x" + 32 bytes of hex; raw
+# 32-byte strings are accepted too)
+export struct AccessTuple {
+  address: str
+  storage_keys: []str
+}
+
+# an EIP-7702 authorization: the account delegates its code to address
+export struct Authorization {
+  chain_id: int
+  address: str
+  nonce: int
+  y_parity: int
+  r: *web3.U256
+  s: *web3.U256
+}
+
+# a transaction. type_: 0 legacy, 1 EIP-2930, 2 EIP-1559, 4 EIP-7702. Amounts left nil are
+# zero. to_ ("to" is a keyword) is "" to create a contract; data is raw bytes. Legacy and EIP-2930 use gas_price;
+# EIP-1559 and EIP-7702 use max_fee_per_gas and max_priority_fee_per_gas. A legacy transaction
+# with chain_id 0 is signed without replay protection (pre EIP-155).
+export struct Transaction {
+  type_: int
+  chain_id: int
+  nonce: int
+  gas: int
+  gas_price: *web3.U256
+  max_fee_per_gas: *web3.U256
+  max_priority_fee_per_gas: *web3.U256
+  to_: str
+  value: *web3.U256
+  data: str
+  access_list: []*AccessTuple
+  authorization_list: []*Authorization
+}
+
+fn uint_or_zero(u: *web3.U256) -> *web3.U256 {
+  if u == nil { return web3.zero() }
+  return u
+}
+
+fn nonneg(n: int, what: str) -> error {
+  if n < 0 { return errors.New("accounts: negative " + what) }
+  return nil
+}
+
+fn storage_key(k: str) -> (str, error) {
+  if len(k) == 32 { return k, nil }
+  if web3.is_hex(k, 32) { return web3.from_hex(k) }
+  return "", errors.New("accounts: a storage key must have 32 bytes")
+}
+
+fn access_list_items(al: []*AccessTuple) -> ([]any, error) {
+  items := []any{}
+  for _, t := range al {
+    if t == nil { return nil, errors.New("accounts: nil access list entry") }
+    a, err := web3.address_bytes(t.address)
+    if err != nil { return nil, err }
+    keys := []any{}
+    for _, k := range t.storage_keys {
+      kb, err2 := storage_key(k)
+      if err2 != nil { return nil, err2 }
+      keys = append(keys, kb)
+    }
+    items = append(items, []any{a, keys})
+  }
+  return items, nil
+}
+
+fn authorization_items(al: []*Authorization) -> ([]any, error) {
+  items := []any{}
+  for _, au := range al {
+    if au == nil { return nil, errors.New("accounts: nil authorization") }
+    a, err := web3.address_bytes(au.address)
+    if err != nil { return nil, err }
+    if au.chain_id < 0 || au.nonce < 0 || au.y_parity < 0 || au.y_parity > 1 { return nil, errors.New("accounts: invalid authorization") }
+    items = append(items, []any{au.chain_id, a, au.nonce, au.y_parity, uint_or_zero(au.r), uint_or_zero(au.s)})
+  }
+  return items, nil
+}
+
+# the encoding of a transaction: with sig nil, the payload whose keccak256 is signed; with a
+# signature, the raw signed transaction (what eth_sendRawTransaction takes)
+export fn serialize_transaction(tx: *Transaction, sig: *Signature) -> (str, error) {
+  if tx == nil { return "", errors.New("accounts: nil transaction") }
+  err := nonneg(tx.chain_id, "chain id")
+  if err == nil { err = nonneg(tx.nonce, "nonce") }
+  if err == nil { err = nonneg(tx.gas, "gas") }
+  if err != nil { return "", err }
+  to_b := ""
+  if tx.to_ != "" {
+    tb, err2 := web3.address_bytes(tx.to_)
+    if err2 != nil { return "", err2 }
+    to_b = tb
+  }
+  value := uint_or_zero(tx.value)
+  if tx.type_ == TX_LEGACY {
+    items := []any{tx.nonce, uint_or_zero(tx.gas_price), tx.gas, to_b, value, tx.data}
+    if sig == nil {
+      if tx.chain_id > 0 { items = append(items, tx.chain_id, 0, 0) }
+      return rlp.encode(items), nil
+    }
+    v := 27 + (sig.y_parity & 1)
+    if tx.chain_id > 0 { v = tx.chain_id * 2 + 35 + (sig.y_parity & 1) }
+    items = append(items, v, uint_or_zero(sig.r), uint_or_zero(sig.s))
+    return rlp.encode(items), nil
+  }
+  al, err3 := access_list_items(tx.access_list)
+  if err3 != nil { return "", err3 }
+  items2 := []any{}
+  if tx.type_ == TX_EIP2930 {
+    items2 = []any{tx.chain_id, tx.nonce, uint_or_zero(tx.gas_price), tx.gas, to_b, value, tx.data, al}
+  } else if tx.type_ == TX_EIP1559 || tx.type_ == TX_EIP7702 {
+    items2 = []any{tx.chain_id, tx.nonce, uint_or_zero(tx.max_priority_fee_per_gas), uint_or_zero(tx.max_fee_per_gas), tx.gas, to_b, value, tx.data, al}
+    if tx.type_ == TX_EIP7702 {
+      if to_b == "" { return "", errors.New("accounts: an EIP-7702 transaction needs a to address") }
+      auths, err4 := authorization_items(tx.authorization_list)
+      if err4 != nil { return "", err4 }
+      items2 = append(items2, auths)
+    }
+  } else {
+    return "", errors.New("accounts: unsupported transaction type " + str(tx.type_))
+  }
+  if sig != nil { items2 = append(items2, sig.y_parity & 1, uint_or_zero(sig.r), uint_or_zero(sig.s)) }
+  return string([]byte{byte(tx.type_)}) + rlp.encode(items2), nil
+}
+
+# the 32-byte hash an account signs for the transaction
+export fn transaction_signing_hash(tx: *Transaction) -> (str, error) {
+  payload, err := serialize_transaction(tx, nil)
+  if err != nil { return "", err }
+  return web3.keccak256(payload), nil
+}
+
+# the raw signed transaction (bytes; web3.to_hex gives what eth_sendRawTransaction takes)
+export fn (a: *Account) sign_transaction(tx: *Transaction) -> (str, error) {
+  h, err := transaction_signing_hash(tx)
+  if err != nil { return "", err }
+  sig := sign_with(web3.from_bytes(a.private_key), h)
+  return serialize_transaction(tx, sig)
+}
+
+# the hash of a raw signed transaction, "0x" + 32 bytes of hex (its id on the chain)
+export fn transaction_hash(raw: str) -> str { return web3.keccak256_hex(raw) }
+
+fn item_int(items: []any, i: int, what: str) -> (int, error) {
+  n, err := rlp.as_int(items[i])
+  if err != nil { return 0, errors.New("accounts: bad " + what + ": " + err.Error()) }
+  return n, nil
+}
+
+fn item_uint(items: []any, i: int, what: str) -> (*web3.U256, error) {
+  u, err := rlp.as_uint(items[i])
+  if err != nil { return nil, errors.New("accounts: bad " + what + ": " + err.Error()) }
+  return u, nil
+}
+
+fn item_address(item: any, allow_empty: bool) -> (str, error) {
+  b, err := rlp.as_bytes(item)
+  if err != nil { return "", errors.New("accounts: bad address") }
+  if len(b) == 0 && allow_empty { return "", nil }
+  if len(b) != 20 { return "", errors.New("accounts: an address must have 20 bytes") }
+  return web3.address_from_bytes(b), nil
+}
+
+fn parse_access_list(item: any) -> ([]*AccessTuple, error) {
+  l, err := rlp.as_list(item)
+  if err != nil { return nil, errors.New("accounts: bad access list") }
+  out := []*AccessTuple{}
+  for _, e := range l {
+    pair, err2 := rlp.as_list(e)
+    if err2 != nil || len(pair) != 2 { return nil, errors.New("accounts: bad access list entry") }
+    a, err3 := item_address(pair[0], false)
+    if err3 != nil { return nil, err3 }
+    keys, err4 := rlp.as_list(pair[1])
+    if err4 != nil { return nil, errors.New("accounts: bad storage keys") }
+    ks := []str{}
+    for _, k := range keys {
+      kb, err5 := rlp.as_bytes(k)
+      if err5 != nil || len(kb) != 32 { return nil, errors.New("accounts: a storage key must have 32 bytes") }
+      ks = append(ks, web3.to_hex(kb))
+    }
+    out = append(out, &AccessTuple{address: a, storage_keys: ks})
+  }
+  return out, nil
+}
+
+fn parse_authorizations(item: any) -> ([]*Authorization, error) {
+  l, err := rlp.as_list(item)
+  if err != nil { return nil, errors.New("accounts: bad authorization list") }
+  out := []*Authorization{}
+  for _, e := range l {
+    f, err2 := rlp.as_list(e)
+    if err2 != nil || len(f) != 6 { return nil, errors.New("accounts: bad authorization") }
+    cid, err3 := item_int(f, 0, "authorization chain id")
+    if err3 != nil { return nil, err3 }
+    a, err4 := item_address(f[1], false)
+    if err4 != nil { return nil, err4 }
+    nonce, err5 := item_int(f, 2, "authorization nonce")
+    if err5 != nil { return nil, err5 }
+    y, err6 := item_int(f, 3, "authorization y parity")
+    if err6 != nil { return nil, err6 }
+    if y > 1 { return nil, errors.New("accounts: bad authorization y parity") }
+    r, err7 := item_uint(f, 4, "authorization r")
+    if err7 != nil { return nil, err7 }
+    s, err8 := item_uint(f, 5, "authorization s")
+    if err8 != nil { return nil, err8 }
+    out = append(out, &Authorization{chain_id: cid, address: a, nonce: nonce, y_parity: y, r: r, s: s})
+  }
+  return out, nil
+}
+
+# the signature at items[i:i+3] (v or y_parity, r, s)
+fn parse_sig_items(items: []any, i: int) -> (*Signature, int, error) {
+  v, err := item_int(items, i, "v")
+  if err != nil { return nil, 0, err }
+  r, err2 := item_uint(items, i + 1, "r")
+  if err2 != nil { return nil, 0, err2 }
+  s, err3 := item_uint(items, i + 2, "s")
+  if err3 != nil { return nil, 0, err3 }
+  return &Signature{r: r, s: s, y_parity: v, v: v}, v, nil
+}
+
+# a transaction (signed or not) from its encoding; the signature is nil when it is unsigned
+export fn parse_transaction(raw: str) -> (*Transaction, *Signature, error) {
+  if len(raw) == 0 { return nil, nil, errors.New("accounts: empty transaction") }
+  t := int(raw[0])
+  if t >= 0xc0 {
+    item, err := rlp.decode(raw)
+    if err != nil { return nil, nil, err }
+    items, _ := rlp.as_list(item)
+    if len(items) != 6 && len(items) != 9 { return nil, nil, errors.New("accounts: a legacy transaction has 6 or 9 fields") }
+    tx := &Transaction{type_: TX_LEGACY}
+    e := parse_common(tx, items, 0, false)
+    if e != nil { return nil, nil, e }
+    if len(items) == 6 { return tx, nil, nil }
+    sig, v, err2 := parse_sig_items(items, 6)
+    if err2 != nil { return nil, nil, err2 }
+    if sig.r.is_zero() && sig.s.is_zero() {
+      # an unsigned EIP-155 payload: [..., chain_id, 0, 0]
+      tx.chain_id = v
+      return tx, nil, nil
+    }
+    if v == 27 || v == 28 {
+      sig.y_parity = v - 27
+    } else if v >= 35 {
+      tx.chain_id = (v - 35) / 2
+      sig.y_parity = (v - 35) % 2
+    } else {
+      return nil, nil, errors.New("accounts: invalid legacy v " + str(v))
+    }
+    return tx, sig, nil
+  }
+  if t != TX_EIP2930 && t != TX_EIP1559 && t != TX_EIP7702 { return nil, nil, errors.New("accounts: unsupported transaction type " + str(t)) }
+  item2, err3 := rlp.decode(raw[1:])
+  if err3 != nil { return nil, nil, err3 }
+  f, err4 := rlp.as_list(item2)
+  if err4 != nil { return nil, nil, errors.New("accounts: a typed transaction must be a list") }
+  n := 8
+  if t == TX_EIP1559 { n = 9 }
+  if t == TX_EIP7702 { n = 10 }
+  if len(f) != n && len(f) != n + 3 { return nil, nil, errors.New("accounts: transaction of type " + str(t) + " has " + str(len(f)) + " fields") }
+  tx2 := &Transaction{type_: t}
+  cid, err5 := item_int(f, 0, "chain id")
+  if err5 != nil { return nil, nil, err5 }
+  tx2.chain_id = cid
+  e2 := parse_common(tx2, f, 1, true)
+  if e2 != nil { return nil, nil, e2 }
+  al, err6 := parse_access_list(f[n - 1 - btoi(t == TX_EIP7702)])
+  if err6 != nil { return nil, nil, err6 }
+  tx2.access_list = al
+  if t == TX_EIP7702 {
+    auths, err7 := parse_authorizations(f[n - 1])
+    if err7 != nil { return nil, nil, err7 }
+    tx2.authorization_list = auths
+    if tx2.to_ == "" { return nil, nil, errors.New("accounts: an EIP-7702 transaction needs a to address") }
+  }
+  if len(f) == n { return tx2, nil, nil }
+  sig2, y, err8 := parse_sig_items(f, n)
+  if err8 != nil { return nil, nil, err8 }
+  if y > 1 { return nil, nil, errors.New("accounts: invalid y parity") }
+  sig2.v = y
+  return tx2, sig2, nil
+}
+
+fn btoi(b: bool) -> int {
+  if b { return 1 }
+  return 0
+}
+
+# nonce, fees, gas, to, value, data from items[i:]
+fn parse_common(tx: *Transaction, f: []any, i: int, typed: bool) -> error {
+  nonce, err := item_int(f, i, "nonce")
+  if err != nil { return err }
+  tx.nonce = nonce
+  j := i + 1
+  if tx.type_ == TX_EIP1559 || tx.type_ == TX_EIP7702 {
+    tip, err2 := item_uint(f, j, "max priority fee")
+    if err2 != nil { return err2 }
+    fee, err3 := item_uint(f, j + 1, "max fee")
+    if err3 != nil { return err3 }
+    tx.max_priority_fee_per_gas = tip
+    tx.max_fee_per_gas = fee
+    j += 2
+  } else {
+    gp, err4 := item_uint(f, j, "gas price")
+    if err4 != nil { return err4 }
+    tx.gas_price = gp
+    j++
+  }
+  gas, err5 := item_int(f, j, "gas")
+  if err5 != nil { return err5 }
+  tx.gas = gas
+  to_b, err6 := item_address(f[j + 1], true)
+  if err6 != nil { return err6 }
+  tx.to_ = to_b
+  value, err7 := item_uint(f, j + 2, "value")
+  if err7 != nil { return err7 }
+  tx.value = value
+  data, err8 := rlp.as_bytes(f[j + 3])
+  if err8 != nil { return errors.New("accounts: bad data") }
+  tx.data = data
+  return nil
+}
+
+# the address that signed a raw transaction
+export fn recover_transaction_address(raw: str) -> (str, error) {
+  tx, sig, err := parse_transaction(raw)
+  if err != nil { return "", err }
+  if sig == nil { return "", errors.New("accounts: the transaction is not signed") }
+  h, err2 := transaction_signing_hash(tx)
+  if err2 != nil { return "", err2 }
+  return recover_address(h, sig)
+}
+
+# ---------------------------------------------------------------- EIP-7702 authorizations
+
+# keccak256(0x05 || rlp([chain_id, address, nonce])), 32 bytes
+export fn hash_authorization(chain_id: int, contract_address: str, nonce: int) -> (str, error) {
+  a, err := web3.address_bytes(contract_address)
+  if err != nil { return "", err }
+  if chain_id < 0 || nonce < 0 { return "", errors.New("accounts: negative chain id or nonce") }
+  return web3.keccak256(string([]byte{byte(5)}) + rlp.encode([]any{chain_id, a, nonce})), nil
+}
+
+# signs an EIP-7702 authorization delegating this account to contract_address (chain_id 0: any
+# chain)
+export fn (a: *Account) sign_authorization(chain_id: int, contract_address: str, nonce: int) -> (*Authorization, error) {
+  h, err := hash_authorization(chain_id, contract_address, nonce)
+  if err != nil { return nil, err }
+  sig := sign_with(web3.from_bytes(a.private_key), h)
+  addr, _ := web3.get_address(contract_address)
+  return &Authorization{chain_id: chain_id, address: addr, nonce: nonce, y_parity: sig.y_parity, r: sig.r, s: sig.s}, nil
+}
+
+# the address that signed an authorization (the account that delegates)
+export fn recover_authorization_address(auth: *Authorization) -> (str, error) {
+  if auth == nil { return "", errors.New("accounts: nil authorization") }
+  h, err := hash_authorization(auth.chain_id, auth.address, auth.nonce)
+  if err != nil { return "", err }
+  return recover_address(h, &Signature{r: auth.r, s: auth.s, y_parity: auth.y_parity, v: 27 + auth.y_parity})
+}
