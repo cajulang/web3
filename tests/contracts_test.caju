@@ -1,0 +1,460 @@
+# web3/contracts against a mock node (fake contracts answer eth_call) and a fake page for the wallet.
+import { describe, it, expect } from "std/testing"
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/abi"
+import "github.com/cajulang/web3/chains"
+import "github.com/cajulang/web3/rpc"
+import "github.com/cajulang/web3/accounts"
+import "github.com/cajulang/web3/wallet"
+import "github.com/cajulang/web3/contracts"
+import "github.com/cajulang/web3/erc"
+import "github.com/cajulang/ui"
+import "github.com/cajulang/ui/testdata/fakedom"
+import "std/json"
+import "std/strings"
+import "./mocknode"
+
+let KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+let ME = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+let BOB = "0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B"
+let TOKEN = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+let VAULT = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+let HASH = "0x6d54978373a88961e590170ea6e3bdab3494d47be1f1b12b8b2baf45cc4d3021"
+
+let VAULT_ABI = abi.must_human([]str{
+  "function deposit() payable returns (uint256 shares)",
+  "function withdraw(uint256 amount)",
+  "function owner() view returns (address)",
+  "function get(uint256 id) view returns (uint256)",
+  "function get(uint256 id, bool raw) view returns (uint256)",
+  "function info() view returns (string name, uint8 level, bool open)",
+  "error NotOwner(address caller, bytes32 role)",
+  "error Paused()",
+  "event Deposit(address indexed who, uint256 amount, string memo)",
+})
+
+fn q(s: str) -> str { return "\"" + s + "\"" }
+
+fn node() -> *mocknode.Node {
+  m := mocknode.new_node()
+  m.add_token(TOKEN, &mocknode.Token{name: "USD Coin", symbol: "USDC", decimals: 6, supply: web3.u256(1000000000), balances: map[str]*web3.U256{strings.to_lower(ME): web3.u256(100)}})
+  m.on_call(VAULT, fn(data: str, from_: str) -> (str, error) {
+    fit, args, err := abi.decode_function_data(VAULT_ABI, data)
+    if err != nil { return "", mocknode.revert("") }
+    switch abi.signature(fit) {
+    case "owner()": return mocknode.ret([]str{"address"}, []any{ME}), nil
+    case "get(uint256)": return mocknode.ret([]str{"uint256"}, []any{args[0]}), nil
+    case "get(uint256,bool)": return mocknode.ret([]str{"uint256"}, []any{web3.u256(7)}), nil
+    case "info()": return mocknode.ret([]str{"string", "uint8", "bool"}, []any{"main", 3, true}), nil
+    case "deposit()":
+      if from_ == "" { return "", mocknode.revert(web3.must_hex("0x9e87fac8")) }    # Paused()
+      return mocknode.ret([]str{"uint256"}, []any{web3.u256(5)}), nil
+    case "withdraw(uint256)":
+      if !web3.same_address(from_, ME) {
+        e, _ := abi.encode_function_data(VAULT_ABI.error_("NotOwner"), []any{from_, web3.keccak256("ADMIN")})
+        return "", mocknode.revert(e)
+      }
+      a := args[0].(*web3.U256)
+      if a.gt(web3.u256(1000)) {
+        e2, _ := abi.encode_types([]str{"string"}, []any{"vault: amount too large"})
+        return "", mocknode.revert(web3.must_hex("0x08c379a0") + e2)
+      }
+      if a.is_zero() {
+        e3, _ := abi.encode_types([]str{"uint256"}, []any{0x12})
+        return "", mocknode.revert(web3.must_hex("0x4e487b71") + e3)
+      }
+      return "", nil
+    }
+    return "", mocknode.revert("")
+  })
+  return m
+}
+
+fn token(m: *mocknode.Node) -> *contracts.Contract { return contracts.contract(TOKEN, erc.ERC20, m.client()) }
+fn vault(m: *mocknode.Node) -> *contracts.Contract { return contracts.contract(VAULT, VAULT_ABI, m.client()) }
+
+fn me() -> *accounts.Account {
+  a, err := accounts.private_key_to_account(KEY)
+  if err != nil { panic(err.Error()) }
+  return a
+}
+
+fn block_json(base_fee: str) -> str {
+  bf := ""
+  if base_fee != "" { bf = ",\"baseFeePerGas\":" + q(base_fee) }
+  return "{\"number\":\"0x10\",\"hash\":\"0xb282d21e36e06b967ee20a367a893098ca58971151fcb869bddaee352be2d9b0\",\"timestamp\":\"0x6af9eb1b\",\"gasLimit\":\"0x3938700\",\"gasUsed\":\"0x10528\"" + bf + ",\"transactions\":[]}"
+}
+
+# the raw transaction the mock got in eth_sendRawTransaction
+fn sent_raw(m: *mocknode.Node) -> str {
+  doc, _ := json.parse(m.last_params("eth_sendRawTransaction"))
+  raw, _ := web3.from_hex(doc.items[0].s)
+  return raw
+}
+
+describe("contracts: reads", fn() {
+  it("reads a view function and decodes its values", fn() {
+    m := node()
+    let got: []any = nil
+    token(m).read("balanceOf", []any{ME}, fn(v: []any, err: error) {
+      expect(err).to_be_nil()
+      got = v
+    })
+    expect(got[0].(*web3.U256).dec()).to_equal("100")
+    expect(m.last_params("eth_call")).to_contain("0x70a08231")
+  })
+
+  it("decodes several return values", fn() {
+    m := node()
+    let got: []any = nil
+    vault(m).read("info", []any{}, fn(v: []any, err: error) { got = v })
+    expect(got[0]).to_equal("main")
+    expect(got[1].(*web3.U256).dec()).to_equal("3")
+    expect(got[2]).to_equal(true)
+  })
+
+  it("picks overloads by argument count or signature", fn() {
+    m := node()
+    v := vault(m)
+    a := ""
+    b := ""
+    c := ""
+    v.read("get", []any{web3.u256(9)}, fn(vals: []any, err: error) { a = vals[0].(*web3.U256).dec() })
+    v.read("get", []any{web3.u256(9), true}, fn(vals: []any, err: error) { b = vals[0].(*web3.U256).dec() })
+    v.read("get(uint256,bool)", []any{web3.u256(9), false}, fn(vals: []any, err: error) { c = vals[0].(*web3.U256).dec() })
+    expect(a).to_equal("9")
+    expect(b).to_equal("7")
+    expect(c).to_equal("7")
+  })
+
+  it("explains an empty answer (no contract at the address)", fn() {
+    m := node()
+    let e: error = nil
+    contracts.contract(BOB, erc.ERC20, m.client()).read("decimals", []any{}, fn(v: []any, err: error) { e = err })
+    expect(e.Error()).to_contain("returned no data")
+  })
+
+  it("fails on an unknown function or bad arguments without a request", fn() {
+    m := node()
+    let e1: error = nil
+    let e2: error = nil
+    token(m).read("nope", []any{}, fn(v: []any, err: error) { e1 = err })
+    token(m).read("balanceOf", []any{"0x12"}, fn(v: []any, err: error) { e2 = err })
+    expect(e1.Error()).to_contain("no function nope")
+    expect(e2 == nil).to_be_false()
+    expect(len(m.methods)).to_equal(0)
+  })
+
+  it("passes through errors that are not reverts", fn() {
+    m := node()
+    m.on_call(BOB, fn(data: str, from_: str) -> (str, error) { return "", &rpc.RpcError{code: -32000, message: "header not found"} })
+    let e: error = nil
+    contracts.contract(BOB, erc.ERC20, m.client()).read("decimals", []any{}, fn(v: []any, err: error) { e = err })
+    _, isce := e.(*contracts.ContractError)
+    expect(isce).to_be_false()
+    expect(e.Error()).to_contain("header not found")
+  })
+})
+
+describe("contracts: reverts", fn() {
+  it("decodes an OpenZeppelin custom error (ERC20InsufficientBalance)", fn() {
+    m := node()
+    let e: error = nil
+    token(m).simulate("transfer", []any{BOB, web3.u256(250)}, &contracts.WriteOptions{from_: ME}, fn(v: []any, err: error) { e = err })
+    ce := e.(*contracts.ContractError)
+    expect(ce.name).to_equal("ERC20InsufficientBalance")
+    expect(ce.args[0]).to_equal(ME)
+    expect(ce.args[1].(*web3.U256).dec()).to_equal("100")
+    expect(ce.args[2].(*web3.U256).dec()).to_equal("250")
+    expect(ce.message).to_equal("ERC20InsufficientBalance(" + ME + ", 100, 250)")
+    expect(ce.function).to_equal("transfer")
+    expect(e.Error()).to_equal("contracts: transfer reverted: ERC20InsufficientBalance(" + ME + ", 100, 250)")
+    expect(web3.to_hex(ce.data[0:4])).to_equal("0xe450d38c")
+    expect(rpc.is_revert(ce.cause)).to_be_true()
+  })
+
+  it("decodes Error(string)", fn() {
+    m := node()
+    let e: error = nil
+    vault(m).simulate("withdraw", []any{web3.u256(5000)}, &contracts.WriteOptions{from_: ME}, fn(v: []any, err: error) { e = err })
+    ce := e.(*contracts.ContractError)
+    expect(ce.name).to_equal("Error")
+    expect(ce.args[0]).to_equal("vault: amount too large")
+    expect(ce.message).to_equal("Error(\"vault: amount too large\")")
+  })
+
+  it("decodes Panic(uint256) with its meaning", fn() {
+    m := node()
+    let e: error = nil
+    vault(m).simulate("withdraw", []any{web3.u256(0)}, &contracts.WriteOptions{from_: ME}, fn(v: []any, err: error) { e = err })
+    expect(e.(*contracts.ContractError).message).to_equal("Panic(0x12: division or modulo by zero)")
+  })
+
+  it("formats bytes32 and address arguments, and errors without arguments", fn() {
+    m := node()
+    let e1: error = nil
+    let e2: error = nil
+    vault(m).simulate("withdraw", []any{web3.u256(1)}, &contracts.WriteOptions{from_: BOB}, fn(v: []any, err: error) { e1 = err })
+    vault(m).simulate("deposit", []any{}, nil, fn(v: []any, err: error) { e2 = err })
+    expect(e1.(*contracts.ContractError).message).to_equal("NotOwner(" + BOB + ", " + web3.keccak256_hex("ADMIN") + ")")
+    expect(e2.(*contracts.ContractError).message).to_equal("Paused()")
+  })
+
+  it("reads unknown and empty revert data", fn() {
+    ce := contracts.decode_revert(VAULT_ABI, web3.must_hex("0x12345678"))
+    expect(ce.name).to_equal("")
+    expect(ce.message).to_equal("unknown error 0x12345678")
+    expect(contracts.decode_revert(nil, "").message).to_contain("no data")
+    e := contracts.contract_error(nil, "f", VAULT, &rpc.RpcError{code: 3, message: "execution reverted: nope"})
+    expect(e.(*contracts.ContractError).message).to_equal("execution reverted: nope")
+  })
+})
+
+describe("contracts: simulate, gas and calldata", fn() {
+  it("simulates from an account with a value", fn() {
+    m := node()
+    let got: []any = nil
+    vault(m).simulate("deposit", []any{}, &contracts.WriteOptions{from_: ME, value: web3.parse_ether("1")}, fn(v: []any, err: error) {
+      expect(err).to_be_nil()
+      got = v
+    })
+    expect(got[0].(*web3.U256).dec()).to_equal("5")
+    p := m.last_params("eth_call")
+    expect(p).to_contain("\"from\":\"" + ME + "\"")
+    expect(p).to_contain("\"value\":\"0xde0b6b3a7640000\"")
+  })
+
+  it("estimates gas, and decodes a revert while estimating", fn() {
+    m := node()
+    m.on("eth_estimateGas", q("0xb411"))
+    let g: *web3.U256 = nil
+    token(m).estimate_gas("transfer", []any{BOB, web3.u256(5)}, &contracts.WriteOptions{from_: ME}, fn(v: *web3.U256, err: error) { g = v })
+    expect(g.dec()).to_equal("46097")
+    let e: error = nil
+    token(m).estimate_gas("transfer", []any{BOB, web3.u256(500)}, &contracts.WriteOptions{from_: ME}, fn(v: *web3.U256, err: error) { e = err })
+    expect(e.(*contracts.ContractError).name).to_equal("ERC20InsufficientBalance")
+  })
+
+  it("encodes write calldata", fn() {
+    m := node()
+    data, err := token(m).encode_write("transfer", []any{BOB, web3.u256(1000000)})
+    expect(err).to_be_nil()
+    expect(web3.to_hex(data)).to_equal("0xa9059cbb000000000000000000000000ab5801a7d398351b8be11c439e05c5b3259aec9b00000000000000000000000000000000000000000000000000000000000f4240")
+  })
+})
+
+describe("contracts: writes with a local account", fn() {
+  it("fills nonce, gas (+20%) and EIP-1559 fees, signs and sends", fn() {
+    m := node()
+    m.on("eth_getTransactionCount", q("0x7"))
+    m.on("eth_estimateGas", q("0xc350"))                  # 50000
+    m.on("eth_getBlockByNumber", block_json("0x3b9aca00")) # base fee 1 gwei
+    m.on("eth_maxPriorityFeePerGas", q("0x77359400"))    # 2 gwei
+    m.on("eth_sendRawTransaction", q(HASH))
+    hash := ""
+    contracts.write_with_account(token(m), me(), "transfer", []any{BOB, web3.u256(40)}, nil, fn(h: str, err: error) {
+      expect(err).to_be_nil()
+      hash = h
+    })
+    expect(hash).to_equal(HASH)
+    expect(m.count("eth_chainId")).to_equal(0)            # the client's chain says 1
+    expect(m.last_params("eth_getTransactionCount")).to_contain("pending")
+    raw := sent_raw(m)
+    tx, sig, err := accounts.parse_transaction(raw)
+    expect(err).to_be_nil()
+    expect(sig == nil).to_be_false()
+    expect(tx.type_).to_equal(accounts.TX_EIP1559)
+    expect(tx.chain_id).to_equal(1)
+    expect(tx.nonce).to_equal(7)
+    expect(tx.gas).to_equal(60000)
+    expect(tx.max_fee_per_gas.dec()).to_equal("4000000000")
+    expect(tx.max_priority_fee_per_gas.dec()).to_equal("2000000000")
+    expect(web3.same_address(tx.to_, TOKEN)).to_be_true()
+    want, _ := token(m).encode_write("transfer", []any{BOB, web3.u256(40)})
+    expect(tx.data).to_equal(want)
+    from_, rerr := accounts.recover_transaction_address(raw)
+    expect(rerr).to_be_nil()
+    expect(from_).to_equal(ME)
+  })
+
+  it("uses the options' gas, nonce, value and fees as given", fn() {
+    m := node()
+    m.on("eth_sendRawTransaction", q(HASH))
+    opts := &contracts.WriteOptions{gas: 90000, nonce: web3.u256(3), value: web3.parse_ether("0.5"), max_fee_per_gas: web3.u256(30), max_priority_fee_per_gas: web3.u256(2)}
+    contracts.write_with_account(vault(m), me(), "deposit", []any{}, opts, fn(h: str, err: error) { expect(err).to_be_nil() })
+    expect(m.count("eth_estimateGas")).to_equal(0)
+    expect(m.count("eth_getTransactionCount")).to_equal(0)
+    expect(m.count("eth_getBlockByNumber")).to_equal(0)
+    tx, _, _ := accounts.parse_transaction(sent_raw(m))
+    expect(tx.gas).to_equal(90000)
+    expect(tx.nonce).to_equal(3)
+    expect(web3.format_ether(tx.value)).to_equal("0.5")
+    expect(tx.max_fee_per_gas.dec()).to_equal("30")
+  })
+
+  it("sends a legacy transaction on a chain without a base fee", fn() {
+    m := node()
+    m.chain = chains.bsc
+    m.on("eth_getTransactionCount", q("0x0"))
+    m.on("eth_getBlockByNumber", block_json(""))
+    m.on("eth_gasPrice", q("0xb2d05e00"))                 # 3 gwei
+    m.on("eth_sendRawTransaction", q(HASH))
+    contracts.write_with_account(token(m), me(), "transfer", []any{BOB, web3.u256(1)}, nil, fn(h: str, err: error) { expect(err).to_be_nil() })
+    tx, _, _ := accounts.parse_transaction(sent_raw(m))
+    expect(tx.type_).to_equal(accounts.TX_LEGACY)
+    expect(tx.chain_id).to_equal(56)
+    expect(tx.gas_price.dec()).to_equal("3000000000")
+    expect(tx.gas).to_equal(120000)                        # the mock's default estimate (100000) + 20%
+  })
+
+  it("asks eth_chainId when the client has no chain", fn() {
+    m := node()
+    m.on("eth_chainId", q("0x2105"))
+    m.on("eth_getTransactionCount", q("0x1"))
+    m.on("eth_getBlockByNumber", block_json("0x1"))
+    m.on("eth_maxPriorityFeePerGas", q("0x1"))
+    m.on("eth_sendRawTransaction", q(HASH))
+    c := rpc.create_public_client(&rpc.ClientConfig{transport: m.transport()})
+    contracts.write_with_account(contracts.contract(TOKEN, erc.ERC20, c), me(), "transfer", []any{BOB, web3.u256(1)}, nil, fn(h: str, err: error) { expect(err).to_be_nil() })
+    tx, _, _ := accounts.parse_transaction(sent_raw(m))
+    expect(tx.chain_id).to_equal(8453)
+  })
+
+  it("stops at a revert while estimating, as a ContractError", fn() {
+    m := node()
+    m.on("eth_getTransactionCount", q("0x7"))
+    m.on("eth_sendRawTransaction", q(HASH))
+    let e: error = nil
+    contracts.write_with_account(token(m), me(), "transfer", []any{BOB, web3.u256(1000)}, nil, fn(h: str, err: error) { e = err })
+    expect(e.(*contracts.ContractError).name).to_equal("ERC20InsufficientBalance")
+    expect(m.count("eth_sendRawTransaction")).to_equal(0)
+  })
+
+  it("passes a node error from eth_sendRawTransaction through", fn() {
+    m := node()
+    m.on("eth_getTransactionCount", q("0x7"))
+    m.on("eth_getBlockByNumber", block_json("0x1"))
+    m.on("eth_maxPriorityFeePerGas", q("0x1"))
+    m.fail("eth_sendRawTransaction", &rpc.RpcError{code: -32000, message: "nonce too low"})
+    let e: error = nil
+    contracts.write_with_account(token(m), me(), "transfer", []any{BOB, web3.u256(1)}, nil, fn(h: str, err: error) { e = err })
+    expect(e.Error()).to_contain("nonce too low")
+  })
+
+  it("sends native value", fn() {
+    m := node()
+    m.on("eth_getTransactionCount", q("0x2"))
+    m.on("eth_estimateGas", q("0x5208"))
+    m.on("eth_getBlockByNumber", block_json("0x3b9aca00"))
+    m.on("eth_maxPriorityFeePerGas", q("0x3b9aca00"))
+    m.on("eth_sendRawTransaction", q(HASH))
+    hash := ""
+    contracts.send_value_with_account(m.client(), me(), BOB, web3.parse_ether("0.25"), fn(h: str, err: error) {
+      expect(err).to_be_nil()
+      hash = h
+    })
+    expect(hash).to_equal(HASH)
+    raw := sent_raw(m)
+    tx, _, _ := accounts.parse_transaction(raw)
+    expect(tx.to_).to_equal(BOB)
+    expect(web3.format_ether(tx.value)).to_equal("0.25")
+    expect(tx.data).to_equal("")
+    expect(tx.gas).to_equal(25200)
+    a, _ := accounts.recover_transaction_address(raw)
+    expect(a).to_equal(ME)
+    let e: error = nil
+    contracts.send_value_with_account(m.client(), me(), "0xbad", web3.u256(1), fn(h: str, err: error) { e = err })
+    expect(e.Error()).to_contain("invalid address")
+  })
+})
+
+let TRANSFER_LOG = "{\"address\":\"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48\",\"topics\":[\"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef\",\"0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266\",\"0x000000000000000000000000ab5801a7d398351b8be11c439e05c5b3259aec9b\"],\"data\":\"0x00000000000000000000000000000000000000000000000000000000000012a9\",\"blockNumber\":\"0x11\",\"transactionHash\":\"0x6d54978373a88961e590170ea6e3bdab3494d47be1f1b12b8b2baf45cc4d3021\",\"logIndex\":\"0x0\"}"
+let OTHER_LOG = "{\"address\":\"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48\",\"topics\":[\"0x1111111111111111111111111111111111111111111111111111111111111111\"],\"data\":\"0x\",\"blockNumber\":\"0x11\"}"
+
+describe("contracts: events", fn() {
+  it("gets and decodes events filtered by indexed arguments", fn() {
+    m := node()
+    m.on("eth_getLogs", "[" + TRANSFER_LOG + "," + OTHER_LOG + "]")
+    let got: []*contracts.DecodedLog = nil
+    contracts.get_events(token(m), "Transfer", map[str]any{"from": ME}, rpc.quantity_int(16), "latest", fn(ls: []*contracts.DecodedLog, err: error) {
+      expect(err).to_be_nil()
+      got = ls
+    })
+    p := m.last_params("eth_getLogs")
+    expect(p).to_contain("\"topics\":[\"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef\",\"0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266\"]")
+    expect(p).to_contain("\"fromBlock\":\"0x10\"")
+    expect(len(got)).to_equal(1)
+    expect(got[0].name).to_equal("Transfer")
+    expect(got[0].args["from"]).to_equal(ME)
+    expect(got[0].args["to"]).to_equal(BOB)
+    expect(got[0].args["value"].(*web3.U256).dec()).to_equal("4777")
+    expect(got[0].log.block_number).to_equal(17)
+  })
+
+  it("puts a wildcard for a missing indexed argument", fn() {
+    m := node()
+    m.on("eth_getLogs", "[]")
+    contracts.get_events(token(m), "Transfer", map[str]any{"to": BOB}, "", "", fn(ls: []*contracts.DecodedLog, err: error) { expect(err).to_be_nil() })
+    expect(m.last_params("eth_getLogs")).to_contain("\"topics\":[\"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef\",null,\"0x000000000000000000000000ab5801a7d398351b8be11c439e05c5b3259aec9b\"]")
+  })
+
+  it("gets every event of the contract with an empty name, and refuses unknown events", fn() {
+    m := node()
+    m.on("eth_getLogs", "[" + TRANSFER_LOG + "]")
+    n := 0
+    contracts.get_events(token(m), "", nil, "", "", fn(ls: []*contracts.DecodedLog, err: error) { n = len(ls) })
+    expect(n).to_equal(1)
+    expect(m.last_params("eth_getLogs")).not_().to_contain("topics")
+    let e: error = nil
+    contracts.get_events(token(m), "Nope", nil, "", "", fn(ls: []*contracts.DecodedLog, err: error) { e = err })
+    expect(e.Error()).to_contain("no event Nope")
+  })
+
+  it("watches new events", fn() {
+    m := node()
+    m.on("eth_blockNumber", q("0x10"))
+    m.on("eth_blockNumber", q("0x11"))
+    m.on("eth_getLogs", "[" + TRANSFER_LOG + "]")
+    got := []*contracts.DecodedLog{}
+    contracts.watch_contract_event(token(m), "Transfer", nil, &rpc.WatchOptions{poll_ms: 1, max_polls: 2}, fn(ls: []*contracts.DecodedLog) {
+      for _, l := range ls { got = append(got, l) }
+    }, nil)
+    expect(len(got)).to_equal(1)
+    expect(got[0].args["to"]).to_equal(BOB)
+    expect(m.last_params("eth_getLogs")).to_contain("\"fromBlock\":\"0x11\"")
+  })
+})
+
+# (last: the fake page stays active for the rest of the program)
+describe("contracts: writes with the browser wallet", fn() {
+  it("fails outside the page", fn() {
+    m := node()
+    w := wallet.connect(&wallet.ProviderInfo{id: "x"})
+    let e: error = nil
+    contracts.write_with_wallet(token(m), w, "transfer", []any{BOB, web3.u256(40)}, &contracts.WriteOptions{from_: ME}, fn(h: str, err: error) { e = err })
+    expect(e.Error()).to_contain("no page")
+  })
+  it("sends eth_sendTransaction with the calldata", fn() {
+    d := fakedom.new_dom()
+    r := ui.new_renderer("#app", fn(b: str) { d.apply(b) })
+    r.render(ui.h("div", nil, nil))
+    m := node()
+    w := wallet.connect(&wallet.ProviderInfo{id: "uuid-mm", name: "MetaMask", rdns: "io.metamask", is_metamask: true})
+    hash := ""
+    contracts.write_with_wallet(token(m), w, "transfer", []any{BOB, web3.u256(40)}, &contracts.WriteOptions{from_: ME, gas: 60000}, fn(h: str, err: error) {
+      expect(err).to_be_nil()
+      hash = h
+    })
+    r.work()
+    id, name, arg := d.call_at(0)
+    expect(name).to_equal("ui.eth.request")
+    expect(arg).to_contain("eth_sendTransaction")
+    expect(arg).to_contain("\"to\":\"" + TOKEN + "\"")
+    expect(arg).to_contain("\"data\":\"0xa9059cbb000000000000000000000000ab5801a7d398351b8be11c439e05c5b3259aec9b0000000000000000000000000000000000000000000000000000000000000028\"")
+    expect(arg).to_contain("\"gas\":\"0xea60\"")
+    r.handle(fakedom.reply_msg(id, "{\"result\":\"" + HASH + "\"}"))
+    r.work()
+    expect(hash).to_equal(HASH)
+  })
+
+})

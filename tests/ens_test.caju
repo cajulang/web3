@@ -1,0 +1,311 @@
+# web3/ens: names and hashes, and lookups against a mock Universal Resolver and mock CCIP gateways.
+import { describe, it, expect } from "std/testing"
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/abi"
+import "github.com/cajulang/web3/chains"
+import "github.com/cajulang/web3/rpc"
+import "github.com/cajulang/web3/ens"
+import "github.com/cajulang/fetch"
+import "std/json"
+import "std/strings"
+import "./mocknode"
+
+let VITALIK = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+let BOB = "0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B"
+let RESOLVER = "0x231b0Ee14048e9dCcD1d247744d114a4EB5E8E63"
+let OFFCHAIN_RESOLVER = "0x7CE6Cf740075B5AF6b1681d67136B84431B43AbD"
+let UR_ABI = abi.must_human(ens.UNIVERSAL_RESOLVER_ABI)
+let RES_ABI = abi.must_human(ens.RESOLVER_ABI)
+let BATCH_ABI = abi.must_human(ens.BATCH_GATEWAY_ABI)
+let CALLBACK = abi.must_human([]str{"function resolveCallback(bytes response, bytes extraData) view returns (bytes, address)"}).function("resolveCallback")
+let EXTRA = "extra-data"
+
+fn hx(b: str) -> str { return web3.to_hex(b) }
+
+fn rcall(sig: str, args: []any) -> str {
+  d, err := abi.encode_function_data(RES_ABI.function(sig), args)
+  if err != nil { panic(err.Error()) }
+  return d
+}
+
+fn ur_error(name: str, args: []any) -> error {
+  d, _ := abi.encode_function_data(UR_ABI.error_(name), args)
+  return mocknode.revert(d)
+}
+
+# a Universal Resolver with records: dns name + resolver calldata -> the answer
+struct Ens {
+  m: *mocknode.Node
+  records: map[str]str
+  offchain: map[str][]str        # dns name -> gateway URLs (an OffchainLookup)
+  batch: bool                    # offchain names through the local batch gateway
+  requests: []*fetch.Request
+  gateway: map[str]*fetch.Response
+}
+
+fn (e: *Ens) set(name: str, call: str, answer: str) { e.records[hx(ens.dns_encode(name)) + hx(call)] = answer }
+
+fn (e: *Ens) handle(data: str, from_: str) -> (str, error) {
+  if len(data) >= 4 && data[0:4] == abi.selector(CALLBACK) {
+    args, _ := abi.decode(CALLBACK.inputs, data[4:])
+    if args[1].(str) != EXTRA { return "", mocknode.revert("") }
+    resp := args[0].(str)
+    if e.batch {
+      out, err := abi.decode(BATCH_ABI.function("query").outputs, resp)
+      if err != nil { return "", mocknode.revert("") }
+      if out[0].([]any)[0].(bool) { return "", ur_error("ResolverError", []any{out[1].([]any)[0].(str)}) }
+      resp = out[1].([]any)[0].(str)
+    }
+    return mocknode.ret([]str{"bytes", "address"}, []any{resp, OFFCHAIN_RESOLVER}), nil
+  }
+  fit, args, err := abi.decode_function_data(UR_ABI, data)
+  if err != nil || fit.name != "resolve" { return "", mocknode.revert("") }
+  name := args[0].(str)
+  call := args[1].(str)
+  if urls, ok := e.offchain[hx(name)]; ok {
+    sender := chains.ENS_UNIVERSAL_RESOLVER
+    lookup_urls := []any{}
+    for _, u := range urls { lookup_urls = append(lookup_urls, u) }
+    call_data := call
+    if e.batch {
+      q, _ := abi.encode_function_data(BATCH_ABI.function("query"), []any{[]any{[]any{OFFCHAIN_RESOLVER, lookup_urls, call}}})
+      call_data = q
+      lookup_urls = []any{ens.LOCAL_BATCH_GATEWAY}
+    }
+    d, _ := abi.encode_function_data(UR_ABI.error_("OffchainLookup"), []any{sender, lookup_urls, call_data, abi.selector(CALLBACK), EXTRA})
+    return "", mocknode.revert(d)
+  }
+  ans, has := e.records[hx(name) + hx(call)]
+  if !has {
+    if strings.contains(name, "broken") { return "", ur_error("ResolverError", []any{web3.must_hex("0x08c379a0") + mocknode.ret([]str{"string"}, []any{"boom"})}) }
+    return "", ur_error("ResolverNotFound", []any{name})
+  }
+  return mocknode.ret([]str{"bytes", "address"}, []any{ans, RESOLVER}), nil
+}
+
+fn setup() -> (*Ens, *rpc.Client) {
+  e := &Ens{m: mocknode.new_node(), records: map[str]str{}, offchain: map[str][]str{}, gateway: map[str]*fetch.Response{}}
+  e.m.on_call(chains.ENS_UNIVERSAL_RESOLVER, fn(data: str, from_: str) -> (str, error) { return e.handle(data, from_) })
+  gw := fn(req: *fetch.Request, cb: fn(*fetch.Response, error)) -> fn() {
+    e.requests = append(e.requests, req)
+    for prefix, r := range e.gateway {
+      if strings.has_prefix(req.url, prefix) {
+        cb(r, nil)
+        return nil
+      }
+    }
+    cb(nil, fetch.new_error("network", req, "connection refused"))
+    return nil
+  }
+  c := rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum, transport: e.m.transport(), http_client: fetch.create(&fetch.Config{transport: gw, headers: map[str]str{"Authorization": "Bearer rpc-key"}})})
+  return e, c
+}
+
+fn addr_answer(a: str) -> str { return mocknode.ret([]str{"address"}, []any{a}) }
+fn str_answer(s: str) -> str { return mocknode.ret([]str{"string"}, []any{s}) }
+fn gw_ok(b: str) -> *fetch.Response { return &fetch.Response{status: 200, body: "{\"data\":\"" + hx(b) + "\"}"} }
+
+describe("ens: names", fn() {
+  it("hashes names (namehash vectors)", fn() {
+    expect(hx(ens.namehash(""))).to_equal("0x0000000000000000000000000000000000000000000000000000000000000000")
+    expect(hx(ens.namehash("eth"))).to_equal("0x93cdeb708b7545dc668eb9280176169d1c33cfd8ed6f04690a0bcc88a93fc4ae")
+    expect(hx(ens.namehash("foo.eth"))).to_equal("0xde9b09fd7c5f901e23a3f19fecc54828e9c848539801e86591bd9801b019f84f")
+    expect(hx(ens.namehash("vitalik.eth"))).to_equal("0xee6c4522aab0003e8d14cd40a6af439055fd2577951148c14b6cea9a53475835")
+    expect(hx(ens.namehash("addr.reverse"))).to_equal("0x91d1777781884d03a6757a803996e38de2a42967fb37eeaca72729271025a9e2")
+  })
+
+  it("hashes labels, also given as [hash]", fn() {
+    expect(hx(ens.labelhash("eth"))).to_equal("0x4f5b812789fc606be1b3b16908db13fc7a9adf7ca72641f84d75b47069d3d7f0")
+    expect(ens.labelhash("[4f5b812789fc606be1b3b16908db13fc7a9adf7ca72641f84d75b47069d3d7f0]")).to_equal(ens.labelhash("eth"))
+    expect(ens.namehash("foo.[4f5b812789fc606be1b3b16908db13fc7a9adf7ca72641f84d75b47069d3d7f0]")).to_equal(ens.namehash("foo.eth"))
+  })
+
+  it("normalizes ASCII names and refuses invalid ones", fn() {
+    n, err := ens.normalize("Vitalik.ETH")
+    expect(err).to_be_nil()
+    expect(n).to_equal("vitalik.eth")
+    n2, _ := ens.normalize("_dmarc.my-name.eth")
+    expect(n2).to_equal("_dmarc.my-name.eth")
+    n3, _ := ens.normalize("")
+    expect(n3).to_equal("")
+    _, e1 := ens.normalize("a..eth")
+    _, e2 := ens.normalize("bad name.eth")
+    _, e3 := ens.normalize("a_b.eth")
+    _, e4 := ens.normalize("xn--abc.eth")
+    _, e5 := ens.normalize("café.eth")
+    _, e6 := ens.normalize(".eth")
+    expect(e1.Error()).to_contain("empty label")
+    expect(e2.Error()).to_contain("invalid character")
+    expect(e3.Error()).to_contain("underscore")
+    expect(e4.Error()).to_contain("--")
+    expect(e5.Error()).to_contain("non-ASCII")
+    expect(e6 == nil).to_be_false()
+  })
+
+  it("DNS-encodes names", fn() {
+    expect(hx(ens.dns_encode("vitalik.eth"))).to_equal("0x07766974616c696b0365746800")
+    expect(hx(ens.dns_encode(""))).to_equal("0x00")
+    long := strings.repeat("a", 300)
+    enc := ens.dns_encode(long + ".eth")
+    expect(int(enc[0])).to_equal(66)
+    expect(enc[1:67]).to_equal("[" + hx(web3.keccak256(long))[2:] + "]")
+  })
+})
+
+describe("ens: resolution", fn() {
+  it("resolves an address through the Universal Resolver", fn() {
+    e, c := setup()
+    e.set("vitalik.eth", rcall("addr(bytes32)", []any{ens.namehash("vitalik.eth")}), addr_answer(VITALIK))
+    got := ""
+    ens.resolve_address(c, "Vitalik.eth", fn(a: str, err: error) {
+      expect(err).to_be_nil()
+      got = a
+    })
+    expect(got).to_equal(VITALIK)
+    p := e.m.last_params("eth_call")
+    expect(p).to_contain("\"to\":\"" + chains.ENS_UNIVERSAL_RESOLVER + "\"")
+    expect(p).to_contain("07766974616c696b0365746800")
+  })
+
+  it("gives \"\" without error for unknown names, unset or zero addresses", fn() {
+    e, c := setup()
+    e.set("zero.eth", rcall("addr(bytes32)", []any{ens.namehash("zero.eth")}), addr_answer(web3.ZERO_ADDRESS))
+    e.set("empty.eth", rcall("addr(bytes32)", []any{ens.namehash("empty.eth")}), "")
+    for _, n := range []str{"nobody.eth", "zero.eth", "empty.eth"} {
+      got := "x"
+      let ge: error = nil
+      ens.resolve_address(c, n, fn(a: str, err: error) {
+        got = a
+        ge = err
+      })
+      expect(got).to_equal("")
+      expect(ge).to_be_nil()
+    }
+  })
+
+  it("reports a resolver's revert", fn() {
+    _, c := setup()
+    let ge: error = nil
+    ens.resolve_address(c, "broken.eth", fn(a: str, err: error) { ge = err })
+    expect(ge.Error()).to_equal("ens: the resolver reverted: Error(\"boom\")")
+  })
+
+  it("refuses invalid names and chains without ENS", fn() {
+    e, c := setup()
+    let e1: error = nil
+    ens.resolve_address(c, "café.eth", fn(a: str, err: error) { e1 = err })
+    expect(e1.Error()).to_contain("non-ASCII")
+    expect(len(e.m.methods)).to_equal(0)
+    base := rpc.create_public_client(&rpc.ClientConfig{chain: chains.base, transport: e.m.transport()})
+    let e2: error = nil
+    ens.resolve_address(base, "vitalik.eth", fn(a: str, err: error) { e2 = err })
+    expect(e2.Error()).to_contain("no ENS Universal Resolver on Base")
+  })
+
+  it("reads text records and the avatar", fn() {
+    e, c := setup()
+    node := ens.namehash("vitalik.eth")
+    e.set("vitalik.eth", rcall("text", []any{node, "url"}), str_answer("https://vitalik.ca"))
+    e.set("vitalik.eth", rcall("text", []any{node, "avatar"}), str_answer("eip155:1/erc1155:0xb32979486938aa9694bfc898f35dbed459f44424/10063"))
+    url := ""
+    av := ""
+    none := "x"
+    ens.get_text(c, "vitalik.eth", "url", fn(v: str, err: error) { url = v })
+    ens.get_avatar_url(c, "vitalik.eth", fn(v: str, err: error) { av = v })
+    ens.get_text(c, "vitalik.eth", "com.twitter", fn(v: str, err: error) { none = v })
+    expect(url).to_equal("https://vitalik.ca")
+    expect(av).to_equal("eip155:1/erc1155:0xb32979486938aa9694bfc898f35dbed459f44424/10063")
+    expect(none).to_equal("")
+  })
+
+  it("looks up the primary name and verifies it forward", fn() {
+    e, c := setup()
+    rev := "d8da6bf26964af9d7eed9e03e53415d37aa96045.addr.reverse"
+    e.set(rev, rcall("name", []any{ens.namehash(rev)}), str_answer("vitalik.eth"))
+    e.set("vitalik.eth", rcall("addr(bytes32)", []any{ens.namehash("vitalik.eth")}), addr_answer(VITALIK))
+    got := ""
+    ens.lookup_name(c, VITALIK, fn(n: str, err: error) {
+      expect(err).to_be_nil()
+      got = n
+    })
+    expect(got).to_equal("vitalik.eth")
+    # a reverse record that claims a name pointing elsewhere is not trusted
+    rev2 := "ab5801a7d398351b8be11c439e05c5b3259aec9b.addr.reverse"
+    e.set(rev2, rcall("name", []any{ens.namehash(rev2)}), str_answer("vitalik.eth"))
+    got2 := "x"
+    ens.lookup_name(c, BOB, fn(n: str, err: error) { got2 = n })
+    expect(got2).to_equal("")
+    got3 := "x"
+    ens.lookup_name(c, "0x1111111111111111111111111111111111111111", fn(n: str, err: error) { got3 = n })
+    expect(got3).to_equal("")
+  })
+})
+
+describe("ens: offchain names (CCIP-read)", fn() {
+  it("follows an OffchainLookup through a GET gateway", fn() {
+    e, c := setup()
+    e.offchain[hx(ens.dns_encode("jesse.base.eth"))] = []str{"https://gw.example/{sender}/{data}.json"}
+    e.gateway["https://gw.example/"] = gw_ok(addr_answer(BOB))
+    got := ""
+    ens.resolve_address(c, "jesse.base.eth", fn(a: str, err: error) {
+      expect(err).to_be_nil()
+      got = a
+    })
+    expect(got).to_equal(BOB)
+    expect(len(e.requests)).to_equal(1)
+    r := e.requests[0]
+    expect(r.method).to_equal("GET")
+    expect(r.url).to_start_with("https://gw.example/" + strings.to_lower(chains.ENS_UNIVERSAL_RESOLVER) + "/0x3b3b57de")
+    expect(r.headers["Authorization"]).to_equal("")
+    expect(e.m.count("eth_call")).to_equal(2)
+  })
+
+  it("POSTs when the URL has no {data}, and tries the next URL after a failure", fn() {
+    e, c := setup()
+    e.offchain[hx(ens.dns_encode("off.eth"))] = []str{"https://down.example/", "https://gw.example/lookup"}
+    e.gateway["https://down.example/"] = &fetch.Response{status: 503, body: "busy"}
+    e.gateway["https://gw.example/"] = gw_ok(addr_answer(BOB))
+    got := ""
+    ens.resolve_address(c, "off.eth", fn(a: str, err: error) { got = a })
+    expect(got).to_equal(BOB)
+    expect(len(e.requests)).to_equal(2)
+    r := e.requests[1]
+    expect(r.method).to_equal("POST")
+    doc, _ := json.parse(r.body)
+    expect(doc.get_str("sender", "")).to_equal(strings.to_lower(chains.ENS_UNIVERSAL_RESOLVER))
+    expect(doc.get_str("data", "")).to_start_with("0x3b3b57de")
+  })
+
+  it("stops at a 4xx from a gateway", fn() {
+    e, c := setup()
+    e.offchain[hx(ens.dns_encode("off.eth"))] = []str{"https://gw.example/{data}", "https://other.example/{data}"}
+    e.gateway["https://gw.example/"] = &fetch.Response{status: 404, body: "{\"message\":\"not found\"}"}
+    let ge: error = nil
+    ens.resolve_address(c, "off.eth", fn(a: str, err: error) { ge = err })
+    expect(ge.Error()).to_contain("gateway https://gw.example/{data}")
+    expect(len(e.requests)).to_equal(1)
+  })
+
+  it("runs the local batch gateway (x-batch-gateway:true)", fn() {
+    e, c := setup()
+    e.batch = true
+    e.offchain[hx(ens.dns_encode("batch.eth"))] = []str{"https://gw.example/{sender}/{data}"}
+    e.gateway["https://gw.example/"] = gw_ok(addr_answer(BOB))
+    got := ""
+    ens.resolve_address(c, "batch.eth", fn(a: str, err: error) {
+      expect(err).to_be_nil()
+      got = a
+    })
+    expect(got).to_equal(BOB)
+    expect(e.requests[0].url).to_start_with("https://gw.example/" + strings.to_lower(OFFCHAIN_RESOLVER) + "/0x3b3b57de")
+  })
+
+  it("reports a failed request inside a batch as an HttpError for the resolver", fn() {
+    e, c := setup()
+    e.batch = true
+    e.offchain[hx(ens.dns_encode("batch.eth"))] = []str{"https://nowhere.example/{data}"}
+    let ge: error = nil
+    ens.resolve_address(c, "batch.eth", fn(a: str, err: error) { ge = err })
+    expect(ge.Error()).to_contain("HttpError(500")
+  })
+})

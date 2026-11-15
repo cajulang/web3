@@ -1,0 +1,230 @@
+# web3/multicall: many contract reads in one eth_call through Multicall3
+# (import "github.com/cajulang/web3/multicall").
+#
+#   calls := []*multicall.Call{&multicall.Call{target: usdc, data: calldata, allow_failure: true}, ...}
+#   multicall.aggregate(client, calls, "latest", fn(rs: []*multicall.Result, err: error) {
+#     # one Result per call, in order: success and the returned bytes (raw)
+#   })
+#   multicall.erc20_balances(client, owner, []str{usdc, usdt, dai}, fn(bs: []*web3.U256, err: error) {
+#     # one balance per token; nil where the call failed
+#   })
+#
+# Multicall3's aggregate3 runs every call even when one fails (allow_failure); a call with
+# allow_failure false that fails makes the whole eth_call revert. Long lists go in chunks of
+# CHUNK_SIZE calls, one eth_call after the other. The contract is the chain's multicall3
+# (chains.Chain.multicall3, 0xcA11bde05977b3631167028862bE2a173976CA11 on almost every chain).
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/abi"
+import "github.com/cajulang/web3/rpc"
+
+# calls per eth_call when the list is long
+export const CHUNK_SIZE = 500
+
+# one call: the contract, its calldata (raw bytes) and whether it may fail without failing all
+export struct Call {
+  target: str
+  data: str
+  allow_failure: bool
+}
+
+# the outcome of one call: success, and the bytes it returned (raw; the revert data on failure)
+export struct Result {
+  success: bool
+  data: str
+}
+
+export let MULTICALL3_ABI = []str{
+  "struct Call3 { address target; bool allowFailure; bytes callData; }",
+  "struct Result { bool success; bytes returnData; }",
+  "function aggregate3(Call3[] calls) payable returns (Result[] returnData)",
+  "function getEthBalance(address addr) view returns (uint256 balance)",
+  "function getBlockNumber() view returns (uint256 blockNumber)",
+  "function getCurrentBlockTimestamp() view returns (uint256 timestamp)",
+}
+
+export let MULTICALL3 = abi.must_human(MULTICALL3_ABI)
+
+let AGGREGATE3 = MULTICALL3.function("aggregate3")
+let GET_ETH_BALANCE = MULTICALL3.function("getEthBalance")
+let BALANCE_OF = abi.must_human([]str{"function balanceOf(address account) view returns (uint256)"}).function("balanceOf")
+
+fn err_(msg: str) -> error { return errors.New("multicall: " + msg) }
+
+# the Multicall3 address of the client's chain, or an error
+export fn address_of(client: *rpc.Client) -> (str, error) {
+  if client == nil { return "", err_("nil client") }
+  if client.chain == nil || client.chain.multicall3 == "" {
+    name := "the client's chain"
+    if client.chain != nil { name = client.chain.name }
+    return "", err_("no Multicall3 address for " + name + " (set chains.Chain.multicall3, or use aggregate_at)")
+  }
+  return client.chain.multicall3, nil
+}
+
+# a call of function it on target with args
+export fn call_of(target: str, it: *abi.Item, args: []any, allow_failure: bool) -> (*Call, error) {
+  data, err := abi.encode_function_data(it, args)
+  if err != nil { return nil, err }
+  return &Call{target: target, data: data, allow_failure: allow_failure}, nil
+}
+
+# the values a successful result returned for function it; an error for a failed one, or for a
+# call that returned nothing (no contract at the target)
+export fn decode_result(it: *abi.Item, r: *Result) -> ([]any, error) {
+  if r == nil { return nil, err_("no result") }
+  if !r.success { return nil, err_(it.name + " failed") }
+  if len(r.data) == 0 && len(it.outputs) > 0 { return nil, err_(it.name + " returned no data") }
+  return abi.decode_function_result(it, r.data)
+}
+
+# the calldata of aggregate3 for calls
+export fn encode_aggregate3(calls: []*Call) -> (str, error) {
+  items := []any{}
+  for _, c := range calls {
+    if c == nil { return "", err_("nil call") }
+    items = append(items, []any{c.target, c.allow_failure, c.data})
+  }
+  return abi.encode_function_data(AGGREGATE3, []any{items})
+}
+
+# the results in what aggregate3 returned
+export fn decode_aggregate3(data: str) -> ([]*Result, error) {
+  vals, err := abi.decode_function_result(AGGREGATE3, data)
+  if err != nil { return nil, err }
+  out := []*Result{}
+  for _, x := range vals[0].([]any) {
+    t := x.([]any)
+    out = append(out, &Result{success: t[0].(bool), data: t[1].(str)})
+  }
+  return out, nil
+}
+
+# runs calls through the chain's Multicall3 at block ("" : "latest"); cb gets one Result per call
+export fn aggregate(client: *rpc.Client, calls: []*Call, block: str, cb: fn([]*Result, error)) -> fn() {
+  addr, err := address_of(client)
+  if err != nil {
+    cb(nil, err)
+    return nil
+  }
+  return aggregate_at(client, addr, calls, block, CHUNK_SIZE, cb)
+}
+
+struct Run {
+  canceled: bool
+  abort: fn()
+  results: []*Result
+}
+
+fn run0(f: fn()) { f() }
+
+# runs calls through the Multicall3 at address, chunk calls per eth_call (one chunk after the other)
+export fn aggregate_at(client: *rpc.Client, address: str, calls: []*Call, block: str, chunk: int, cb: fn([]*Result, error)) -> fn() {
+  if chunk <= 0 { chunk = CHUNK_SIZE }
+  st := &Run{results: []*Result{}}
+  if len(calls) == 0 {
+    cb(st.results, nil)
+    return nil
+  }
+  let step: fn(int) = nil
+  step = fn(start: int) {
+    end := start + chunk
+    if end > len(calls) { end = len(calls) }
+    part := calls[start:end]
+    data, eerr := encode_aggregate3(part)
+    if eerr != nil {
+      cb(nil, eerr)
+      return
+    }
+    a := client.call(&rpc.CallRequest{to_: address, data: data}, block, fn(out: str, cerr: error) {
+      if st.canceled { return }
+      if cerr != nil {
+        cb(nil, cerr)
+        return
+      }
+      if len(out) == 0 {
+        cb(nil, err_("no contract at " + address))
+        return
+      }
+      rs, derr := decode_aggregate3(out)
+      if derr == nil && len(rs) != len(part) { derr = err_("expected " + str(len(part)) + " results, got " + str(len(rs))) }
+      if derr != nil {
+        cb(nil, derr)
+        return
+      }
+      st.results = append(st.results, rs...)
+      if end >= len(calls) {
+        cb(st.results, nil)
+        return
+      }
+      step(end)
+    })
+    if a != nil && !st.canceled { st.abort = a }
+  }
+  step(0)
+  return fn() {
+    if st.canceled { return }
+    st.canceled = true
+    if st.abort != nil { run0(st.abort) }
+  }
+}
+
+# a uint256 from a result, or nil when the call failed or returned something else
+fn u256_of(r: *Result) -> *web3.U256 {
+  if r == nil || !r.success || len(r.data) != 32 { return nil }
+  return web3.from_bytes(r.data)
+}
+
+# the native balances (wei) of addresses, through Multicall3's getEthBalance; nil where it failed
+export fn get_eth_balances(client: *rpc.Client, addresses: []str, cb: fn([]*web3.U256, error)) -> fn() {
+  addr, err := address_of(client)
+  if err != nil {
+    cb(nil, err)
+    return nil
+  }
+  calls := []*Call{}
+  for _, a := range addresses {
+    c, cerr := call_of(addr, GET_ETH_BALANCE, []any{a}, true)
+    if cerr != nil {
+      cb(nil, cerr)
+      return nil
+    }
+    calls = append(calls, c)
+  }
+  return aggregate_at(client, addr, calls, "latest", CHUNK_SIZE, fn(rs: []*Result, aerr: error) {
+    if aerr != nil {
+      cb(nil, aerr)
+      return
+    }
+    out := []*web3.U256{}
+    for _, r := range rs { out = append(out, u256_of(r)) }
+    cb(out, nil)
+  })
+}
+
+# the ERC-20 balances of owner, one per token (balanceOf); nil where the call failed (not a
+# token, no contract at that address)
+export fn erc20_balances(client: *rpc.Client, owner: str, tokens: []str, cb: fn([]*web3.U256, error)) -> fn() {
+  addr, err := address_of(client)
+  if err != nil {
+    cb(nil, err)
+    return nil
+  }
+  calls := []*Call{}
+  for _, t := range tokens {
+    c, cerr := call_of(t, BALANCE_OF, []any{owner}, true)
+    if cerr != nil {
+      cb(nil, cerr)
+      return nil
+    }
+    calls = append(calls, c)
+  }
+  return aggregate_at(client, addr, calls, "latest", CHUNK_SIZE, fn(rs: []*Result, aerr: error) {
+    if aerr != nil {
+      cb(nil, aerr)
+      return
+    }
+    out := []*web3.U256{}
+    for _, r := range rs { out = append(out, u256_of(r)) }
+    cb(out, nil)
+  })
+}

@@ -1,0 +1,121 @@
+# web3/contracts, erc, multicall and ens against public Ethereum nodes. Runs only with
+# CAJU_NET_TESTS=1 (they need the network):
+#   CAJU_NET_TESTS=1 caju test ./tests
+# caju:platforms linux
+import { describe, it, skip, expect } from "std/testing"
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/chains"
+import "github.com/cajulang/web3/rpc"
+import "github.com/cajulang/web3/contracts"
+import "github.com/cajulang/web3/erc"
+import "github.com/cajulang/web3/multicall"
+import "github.com/cajulang/web3/ens"
+import "github.com/cajulang/fetch/native"
+import "std/os"
+
+let LIVE = os.getenv("CAJU_NET_TESTS") == "1"
+
+fn live(title: str, body: fn()) {
+  if LIVE {
+    it(title, body)
+  } else {
+    skip(title + " (set CAJU_NET_TESTS=1)", body)
+  }
+}
+
+let VITALIK = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+let USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+let USDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+let DAI = "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+let MKR = "0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2"
+
+fn eth() -> *rpc.Client { return rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum}) }
+
+describe("tokens on Ethereum", fn() {
+  live("reads USDC's metadata in one multicall", fn() {
+    let m: *erc.TokenMeta = nil
+    erc.erc20_metadata(eth(), USDC, fn(t: *erc.TokenMeta, err: error) {
+      expect(err).to_be_nil()
+      m = t
+    })
+    expect(m.symbol).to_equal("USDC")
+    expect(m.decimals).to_equal(6)
+    expect(m.name).to_equal("USD Coin")
+  })
+
+  live("reads MKR's bytes32 symbol", fn() {
+    sym := ""
+    erc.erc20_symbol(eth(), MKR, fn(s: str, err: error) {
+      expect(err).to_be_nil()
+      sym = s
+    })
+    expect(sym).to_equal("MKR")
+  })
+
+  live("reads vitalik's USDC, USDT and DAI balances with one multicall", fn() {
+    let bs: []*web3.U256 = nil
+    multicall.erc20_balances(eth(), VITALIK, []str{USDC, USDT, DAI}, fn(v: []*web3.U256, err: error) {
+      expect(err).to_be_nil()
+      bs = v
+    })
+    expect(len(bs)).to_equal(3)
+    for _, b := range bs { expect(b == nil).to_be_false() }
+  })
+
+  live("reads native balances through Multicall3", fn() {
+    let bs: []*web3.U256 = nil
+    multicall.get_eth_balances(eth(), []str{VITALIK}, fn(v: []*web3.U256, err: error) {
+      expect(err).to_be_nil()
+      bs = v
+    })
+    expect(bs[0].is_zero()).to_be_false()
+  })
+
+  live("decodes a real revert (USDC transfer beyond the balance)", fn() {
+    usdc := contracts.contract(USDC, erc.ERC20, eth())
+    let e: error = nil
+    usdc.simulate("transfer", []any{USDT, web3.must_u256("1000000000000000000000")}, &contracts.WriteOptions{from_: VITALIK}, fn(v: []any, err: error) { e = err })
+    ce, ok := e.(*contracts.ContractError)
+    expect(ok).to_be_true()
+    expect(ce.name).to_equal("Error")
+    expect(ce.message).to_contain("exceeds balance")
+  })
+})
+
+describe("ENS on Ethereum", fn() {
+  live("resolves vitalik.eth", fn() {
+    got := ""
+    ens.resolve_address(eth(), "vitalik.eth", fn(a: str, err: error) {
+      expect(err).to_be_nil()
+      got = a
+    })
+    expect(got).to_equal(VITALIK)
+  })
+
+  live("looks up vitalik's primary name", fn() {
+    got := ""
+    ens.lookup_name(eth(), VITALIK, fn(n: str, err: error) {
+      expect(err).to_be_nil()
+      got = n
+    })
+    expect(got).to_equal("vitalik.eth")
+  })
+
+  live("reads vitalik.eth's url text record", fn() {
+    got := ""
+    ens.get_text(eth(), "vitalik.eth", "url", fn(v: str, err: error) {
+      expect(err).to_be_nil()
+      got = v
+    })
+    expect(got).to_start_with("https://")
+  })
+
+  live("resolves an offchain name through CCIP-read (jesse.base.eth)", fn() {
+    got := ""
+    ens.resolve_address(eth(), "jesse.base.eth", fn(a: str, err: error) {
+      expect(err).to_be_nil()
+      got = a
+    })
+    expect(web3.is_address(got)).to_be_true()
+  })
+})
