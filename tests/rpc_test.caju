@@ -1,0 +1,789 @@
+# web3/rpc: the public client against mock transports (no network).
+import { describe, it, expect } from "std/testing"
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/chains"
+import "github.com/cajulang/web3/rpc"
+import "github.com/cajulang/fetch"
+import "std/strings"
+import "std/json"
+
+# ---------------------------------------------------------------- a mock node
+
+struct Reply {
+  result: str
+  err: error
+}
+
+struct Mock {
+  queue: map[str][]*Reply
+  methods: []str
+  params: []str
+}
+
+fn new_mock() -> *Mock { return &Mock{queue: map[str][]*Reply{}} }
+
+# the next answers to method (the last one repeats)
+fn (m: *Mock) on(method: str, result: str) { m.queue[method] = append(m.queue[method], &Reply{result: result}) }
+fn (m: *Mock) fail(method: str, err: error) { m.queue[method] = append(m.queue[method], &Reply{err: err}) }
+
+fn (m: *Mock) count(method: str) -> int {
+  n := 0
+  for _, x := range m.methods { if x == method { n++ } }
+  return n
+}
+
+fn (m: *Mock) last_params() -> str { return m.params[len(m.params) - 1] }
+
+fn (m: *Mock) transport() -> fn(str, str, fn(str, error)) -> fn() {
+  return fn(method: str, params_json: str, cb: fn(str, error)) -> fn() {
+    m.methods = append(m.methods, method)
+    m.params = append(m.params, params_json)
+    q := m.queue[method]
+    if len(q) == 0 {
+      cb("", &rpc.RpcError{code: -32601, message: "the method " + method + " does not exist/is not available"})
+      return nil
+    }
+    r := q[0]
+    if len(q) > 1 { m.queue[method] = q[1:] }
+    cb(r.result, r.err)
+    return nil
+  }
+}
+
+fn (m: *Mock) client() -> *rpc.Client {
+  return rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum, transport: m.transport()})
+}
+
+fn q(s: str) -> str { return "\"" + s + "\"" }
+
+let REVERT = "0x08c379a00000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000002545524332303a207472616e736665722066726f6d20746865207a65726f2061646472657373000000000000000000000000000000000000000000000000000000"
+let VITALIK = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+let USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+let TX = "0x6d54978373a88961e590170ea6e3bdab3494d47be1f1b12b8b2baf45cc4d3021"
+let TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+let RECEIPT = "{\"type\":\"0x2\",\"status\":\"0x1\",\"cumulativeGasUsed\":\"0x267cf\",\"logs\":[{\"address\":\"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48\",\"topics\":[\"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef\",\"0x000000000000000000000000000000000004444c5dc75cb358380d2e3de08a90\",\"0x0000000000000000000000000000000aa232009084bd71a5797d089aa4edfad4\"],\"data\":\"0x00000000000000000000000000000000000000000000000000000000000012a9\",\"blockHash\":\"0xb282d21e36e06b967ee20a367a893098ca58971151fcb869bddaee352be2d9b0\",\"blockNumber\":\"0x1932a7e\",\"transactionHash\":\"0x6d54978373a88961e590170ea6e3bdab3494d47be1f1b12b8b2baf45cc4d3021\",\"transactionIndex\":\"0x0\",\"logIndex\":\"0x0\",\"removed\":false}],\"logsBloom\":\"0x00\",\"transactionHash\":\"0x6d54978373a88961e590170ea6e3bdab3494d47be1f1b12b8b2baf45cc4d3021\",\"transactionIndex\":\"0x0\",\"blockHash\":\"0xb282d21e36e06b967ee20a367a893098ca58971151fcb869bddaee352be2d9b0\",\"blockNumber\":\"0x1932a7e\",\"gasUsed\":\"0x267cf\",\"effectiveGasPrice\":\"0xc392c87\",\"from\":\"0x5875db54cd9ae2b2a875e09bb731772297ae9d92\",\"to\":\"0x0000000aa232009084bd71a5797d089aa4edfad4\",\"contractAddress\":null}"
+
+let TXINFO = "{\"type\":\"0x2\",\"chainId\":\"0x1\",\"nonce\":\"0x33b04\",\"gas\":\"0x587f5\",\"maxFeePerGas\":\"0x19a7ff40\",\"maxPriorityFeePerGas\":\"0x0\",\"to\":\"0x0000000aa232009084bd71a5797d089aa4edfad4\",\"value\":\"0xde0b6b3a7640000\",\"accessList\":[],\"input\":\"0x09c5eabe\",\"r\":\"0x712836c681e11fc03d1f2292b9181351aa4f3c2f980f7cc31d022abf26585e1d\",\"s\":\"0x3a164ce58e802b74137d335ad855a1cc12a12110bf0cd3f75d899415ac66b0f1\",\"yParity\":\"0x0\",\"v\":\"0x0\",\"hash\":\"0x6d54978373a88961e590170ea6e3bdab3494d47be1f1b12b8b2baf45cc4d3021\",\"blockHash\":\"0xb282d21e36e06b967ee20a367a893098ca58971151fcb869bddaee352be2d9b0\",\"blockNumber\":\"0x1932a7e\",\"transactionIndex\":\"0x0\",\"from\":\"0x5875db54cd9ae2b2a875e09bb731772297ae9d92\",\"gasPrice\":\"0xc392c87\"}"
+
+fn block_json(number: int, base_fee: str) -> str {
+  bf := ""
+  if base_fee != "" { bf = ",\"baseFeePerGas\":" + q(base_fee) }
+  return "{\"number\":" + q(rpc.quantity_int(number)) + ",\"hash\":\"0xb282d21e36e06b967ee20a367a893098ca58971151fcb869bddaee352be2d9b0\",\"parentHash\":\"0x174e64533a3326decc947db9dd0900175ba29e2107a26f71114d53c3ad1d8d31\",\"miner\":\"0x4838b106fce9647bdf1e7877bf73ce8b0bad5f97\",\"timestamp\":\"0x6af9eb1b\",\"gasLimit\":\"0x3938700\",\"gasUsed\":\"0x10528\"" + bf + ",\"transactions\":[\"" + TX + "\"]}"
+}
+
+# ---------------------------------------------------------------- tests
+
+describe("rpc helpers", fn() {
+  it("writes quantities as JSON-RPC wants them", fn() {
+    expect(rpc.quantity_int(0)).to_equal("0x0")
+    expect(rpc.quantity_int(26)).to_equal("0x1a")
+    expect(rpc.quantity(web3.parse_ether("1"))).to_equal("0xde0b6b3a7640000")
+    expect(rpc.quantity(nil)).to_equal("0x0")
+  })
+
+  it("encodes U256 params as hex quantities", fn() {
+    m := new_mock()
+    m.on("eth_custom", "true")
+    c := m.client()
+    got := ""
+    c.request("eth_custom", []any{web3.u256(255), "latest", map[str]any{"value": web3.u256(16)}, []any{web3.u256(1)}, false}, fn(res: str, err: error) { got = res })
+    expect(got).to_equal("true")
+    expect(m.last_params()).to_equal("[\"0xff\",\"latest\",{\"value\":\"0x10\"},[\"0x1\"],false]")
+  })
+
+  it("uses the chain's first RPC URL and a poll interval from its block time", fn() {
+    c := rpc.create_public_client(&rpc.ClientConfig{chain: chains.base})
+    expect(c.url).to_equal("https://mainnet.base.org")
+    expect(c.poll_ms).to_equal(1000)
+    expect(rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum}).poll_ms).to_equal(4000)
+    expect(rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum, url: "https://example.org/rpc"}).url).to_equal("https://example.org/rpc")
+  })
+
+  it("fails a request without URL or transport", fn() {
+    c := rpc.create_public_client(nil)
+    let got: error = nil
+    c.chain_id(fn(id: int, err: error) { got = err })
+    expect(got.Error()).to_contain("no URL")
+  })
+})
+
+describe("rpc reads", fn() {
+  it("reads the chain id and the block number", fn() {
+    m := new_mock()
+    m.on("eth_chainId", q("0x2105"))
+    m.on("eth_blockNumber", q("0x1932a7e"))
+    c := m.client()
+    id := 0
+    bn := 0
+    c.chain_id(fn(v: int, err: error) { id = v })
+    c.block_number(fn(v: int, err: error) { bn = v })
+    expect(id).to_equal(8453)
+    expect(bn).to_equal(26421886)
+    expect(m.last_params()).to_equal("[]")
+  })
+
+  it("reads a balance as a U256", fn() {
+    m := new_mock()
+    m.on("eth_getBalance", q("0x1b1ae4d6e2ef5000000"))
+    c := m.client()
+    let bal: *web3.U256 = nil
+    c.get_balance(VITALIK, "", fn(v: *web3.U256, err: error) { bal = v })
+    expect(web3.format_ether(bal)).to_equal("8000")
+    expect(m.last_params()).to_equal("[\"" + VITALIK + "\",\"latest\"]")
+  })
+
+  it("reads nonces, code and storage", fn() {
+    m := new_mock()
+    m.on("eth_getTransactionCount", q("0x33b04"))
+    m.on("eth_getCode", q("0x6080604052"))
+    m.on("eth_getStorageAt", q("0x01"))
+    c := m.client()
+    nonce := 0
+    code := ""
+    slot := ""
+    c.get_transaction_count(VITALIK, "pending", fn(n: int, err: error) { nonce = n })
+    expect(m.last_params()).to_contain("pending")
+    c.get_code(USDC, "latest", fn(b: str, err: error) { code = b })
+    c.get_storage_at(USDC, "0x0", "latest", fn(b: str, err: error) { slot = b })
+    expect(nonce).to_equal(211716)
+    expect(web3.to_hex(code)).to_equal("0x6080604052")
+    expect(len(slot)).to_equal(32)
+    expect(int(slot[31])).to_equal(1)
+  })
+
+  it("reports a result of the wrong shape", fn() {
+    m := new_mock()
+    m.on("eth_blockNumber", "{\"a\":1}")
+    c := m.client()
+    let got: error = nil
+    c.block_number(fn(v: int, err: error) { got = err })
+    expect(got.Error()).to_contain("unexpected result for eth_blockNumber")
+  })
+
+  it("sends raw transactions and gives back the hash", fn() {
+    m := new_mock()
+    m.on("eth_sendRawTransaction", q(TX))
+    c := m.client()
+    h := ""
+    c.send_raw_transaction(web3.must_hex("0x02f8"), fn(v: str, err: error) { h = v })
+    expect(h).to_equal(TX)
+    expect(m.last_params()).to_equal("[\"0x02f8\"]")
+  })
+})
+
+describe("rpc calls", fn() {
+  it("encodes the call and returns raw bytes", fn() {
+    m := new_mock()
+    m.on("eth_call", q("0x0000000000000000000000000000000000000000000000000000000000000006"))
+    c := m.client()
+    out := ""
+    c.call(&rpc.CallRequest{from_: VITALIK, to_: USDC, data: web3.must_hex("0x313ce567"), value: web3.u256(0), gas: 100000}, "latest", fn(b: str, err: error) { out = b })
+    expect(web3.from_bytes(out).dec()).to_equal("6")
+    p, _ := json.parse(m.last_params())
+    expect(p.get_str("0.to", "")).to_equal(USDC)
+    expect(p.get_str("0.from", "")).to_equal(VITALIK)
+    expect(p.get_str("0.data", "")).to_equal("0x313ce567")
+    expect(p.get_str("0.value", "")).to_equal("0x0")
+    expect(p.get_str("0.gas", "")).to_equal("0x186a0")
+    expect(p.get_str("1", "")).to_equal("latest")
+  })
+
+  it("returns a revert as an RpcError carrying the revert data", fn() {
+    m := new_mock()
+    m.fail("eth_call", &rpc.RpcError{code: 3, message: "execution reverted: ERC20: transfer from the zero address", data: REVERT})
+    c := m.client()
+    let got: error = nil
+    out := "x"
+    c.call(&rpc.CallRequest{to_: USDC, data: web3.must_hex("0xa9059cbb")}, "", fn(b: str, err: error) {
+      out = b
+      got = err
+    })
+    expect(out).to_equal("")
+    expect(rpc.is_revert(got)).to_be_true()
+    data, ok := rpc.revert_data(got)
+    expect(ok).to_be_true()
+    expect(web3.to_hex(data[0:4])).to_equal("0x08c379a0")
+    e, _ := got.(*rpc.RpcError)
+    expect(e.code).to_equal(3)
+    expect(got.Error()).to_contain("transfer from the zero address")
+  })
+
+  it("finds revert data in the forms nodes use", fn() {
+    _, ok := rpc.revert_data(&rpc.RpcError{code: -32000, message: "execution reverted"})
+    expect(ok).to_be_false()
+    d, ok2 := rpc.revert_data(&rpc.RpcError{code: -32015, message: "VM execution error.", data: "Reverted 0x08c379a0"})
+    expect(ok2).to_be_true()
+    expect(web3.to_hex(d)).to_equal("0x08c379a0")
+    _, ok3 := rpc.revert_data(errors.New("other"))
+    expect(ok3).to_be_false()
+    expect(rpc.is_revert(&rpc.RpcError{code: -32000, message: "insufficient funds"})).to_be_false()
+  })
+
+  it("estimates gas", fn() {
+    m := new_mock()
+    m.on("eth_estimateGas", q("0x5208"))
+    c := m.client()
+    let g: *web3.U256 = nil
+    c.estimate_gas(&rpc.CallRequest{from_: VITALIK, to_: VITALIK, value: web3.parse_ether("1")}, fn(v: *web3.U256, err: error) { g = v })
+    expect(g.dec()).to_equal("21000")
+    expect(m.last_params()).to_contain("\"value\":\"0xde0b6b3a7640000\"")
+  })
+
+  it("simulates calls one after the other", fn() {
+    m := new_mock()
+    m.on("eth_simulateV1", "[{\"number\":\"0x1932a7f\",\"calls\":[{\"returnData\":\"0x0000000000000000000000000000000000000000000000000000000000000006\",\"logs\":[],\"gasUsed\":\"0x7808\",\"status\":\"0x1\"},{\"returnData\":\"0x\",\"logs\":[],\"gasUsed\":\"0x8d20\",\"status\":\"0x0\",\"error\":{\"code\":3,\"message\":\"execution reverted: ERC20: transfer from the zero address\",\"data\":\"" + REVERT + "\"}}]}]")
+    c := m.client()
+    let rs: []*rpc.SimulateResult = nil
+    calls := []*rpc.CallRequest{&rpc.CallRequest{to_: USDC, data: web3.must_hex("0x313ce567")}, &rpc.CallRequest{to_: USDC, data: web3.must_hex("0xa9059cbb")}}
+    c.simulate_calls(calls, "latest", fn(v: []*rpc.SimulateResult, err: error) { rs = v })
+    expect(len(rs)).to_equal(2)
+    expect(rs[0].status).to_equal(1)
+    expect(web3.from_bytes(rs[0].data).dec()).to_equal("6")
+    expect(rs[0].gas_used).to_equal(30728)
+    expect(rs[0].error == nil).to_be_true()
+    expect(rs[1].status).to_equal(0)
+    d, ok := rpc.revert_data(rs[1].error)
+    expect(ok).to_be_true()
+    expect(len(d)).to_equal(132)
+    expect(m.last_params()).to_start_with("[{\"blockStateCalls\":[{\"calls\":[{")
+  })
+
+  it("creates access lists", fn() {
+    m := new_mock()
+    m.on("eth_createAccessList", "{\"accessList\":[{\"address\":\"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48\",\"storageKeys\":[\"0x0000000000000000000000000000000000000000000000000000000000000003\"]}],\"gasUsed\":\"0x7808\"}")
+    c := m.client()
+    let r: *rpc.AccessListResult = nil
+    c.create_access_list(&rpc.CallRequest{to_: USDC}, "latest", fn(v: *rpc.AccessListResult, err: error) { r = v })
+    expect(r.gas_used).to_equal(30728)
+    expect(r.access_list[0].address).to_equal(USDC)
+    expect(len(r.access_list[0].storage_keys)).to_equal(1)
+  })
+
+  it("reads proofs", fn() {
+    m := new_mock()
+    m.on("eth_getProof", "{\"address\":\"0xd8da6bf26964af9d7eed9e03e53415d37aa96045\",\"balance\":\"0x10\",\"nonce\":\"0x5\",\"codeHash\":\"0xc5d2\",\"storageHash\":\"0x56e8\",\"accountProof\":[\"0xf9\",\"0xf8\"],\"storageProof\":[{\"key\":\"0x0\",\"value\":\"0x2a\",\"proof\":[\"0xe2\"]}]}")
+    c := m.client()
+    let p: *rpc.Proof = nil
+    c.get_proof(VITALIK, []str{"0x0"}, "latest", fn(v: *rpc.Proof, err: error) { p = v })
+    expect(p.address).to_equal(VITALIK)
+    expect(p.balance.dec()).to_equal("16")
+    expect(p.nonce).to_equal(5)
+    expect(len(p.account_proof)).to_equal(2)
+    expect(p.storage_proof[0].value.dec()).to_equal("42")
+  })
+})
+
+describe("rpc blocks, transactions and logs", fn() {
+  it("reads a block by number and by hash", fn() {
+    m := new_mock()
+    m.on("eth_getBlockByNumber", block_json(26421886, "0xba663c7"))
+    m.on("eth_getBlockByHash", block_json(26421886, ""))
+    c := m.client()
+    let b: *rpc.Block = nil
+    c.get_block("latest", false, fn(v: *rpc.Block, err: error) { b = v })
+    expect(b.number).to_equal(26421886)
+    expect(b.base_fee_per_gas.dec()).to_equal("195453895")
+    expect(b.timestamp).to_equal(1794763547)
+    expect(b.gas_limit).to_equal(60000000)
+    expect(b.miner).to_equal("0x4838B106FCe9647Bdf1E7877BF73cE8B0BAD5f97")
+    expect(b.transactions).to_equal([]str{TX})
+    expect(m.last_params()).to_equal("[\"latest\",false]")
+    c.get_block("0xb282d21e36e06b967ee20a367a893098ca58971151fcb869bddaee352be2d9b0", true, fn(v: *rpc.Block, err: error) { b = v })
+    expect(m.count("eth_getBlockByHash")).to_equal(1)
+    expect(b.base_fee_per_gas == nil).to_be_true()
+  })
+
+  it("reads full transactions in a block", fn() {
+    m := new_mock()
+    m.on("eth_getBlockByNumber", "{\"number\":\"0x10\",\"hash\":\"0x01\",\"transactions\":[" + TXINFO + "]}")
+    c := m.client()
+    let b: *rpc.Block = nil
+    c.get_block(rpc.quantity_int(16), true, fn(v: *rpc.Block, err: error) { b = v })
+    expect(b.transactions).to_equal([]str{TX})
+    expect(b.full_transactions[0].nonce).to_equal(211716)
+    expect(m.last_params()).to_equal("[\"0x10\",true]")
+  })
+
+  it("gives nil, nil for an unknown block or transaction", fn() {
+    m := new_mock()
+    m.on("eth_getBlockByNumber", "null")
+    m.on("eth_getTransactionByHash", "null")
+    c := m.client()
+    called := 0
+    c.get_block("0xffffffff", false, fn(v: *rpc.Block, err: error) {
+      called++
+      expect(v == nil).to_be_true()
+      expect(err).to_be_nil()
+    })
+    c.get_transaction(TX, fn(v: *rpc.TransactionInfo, err: error) {
+      called++
+      expect(v == nil).to_be_true()
+      expect(err).to_be_nil()
+    })
+    expect(called).to_equal(2)
+  })
+
+  it("reads a transaction", fn() {
+    m := new_mock()
+    m.on("eth_getTransactionByHash", TXINFO)
+    c := m.client()
+    let t: *rpc.TransactionInfo = nil
+    c.get_transaction(TX, fn(v: *rpc.TransactionInfo, err: error) { t = v })
+    expect(t.hash).to_equal(TX)
+    expect(t.tx_type).to_equal(2)
+    expect(t.chain_id).to_equal(1)
+    expect(t.from_).to_equal(web3.checksum_address("0x5875db54cd9ae2b2a875e09bb731772297ae9d92"))
+    expect(t.to_).to_equal(web3.checksum_address("0x0000000aa232009084bd71a5797d089aa4edfad4"))
+    expect(web3.format_ether(t.value)).to_equal("1")
+    expect(web3.to_hex(t.input)).to_equal("0x09c5eabe")
+    expect(t.gas).to_equal(362485)
+    expect(t.max_priority_fee_per_gas.is_zero()).to_be_true()
+    expect(t.block_number).to_equal(26421886)
+  })
+
+  it("reads a receipt, and nil, nil while pending", fn() {
+    m := new_mock()
+    m.on("eth_getTransactionReceipt", "null")
+    m.on("eth_getTransactionReceipt", RECEIPT)
+    c := m.client()
+    let r: *rpc.Receipt = nil
+    let e: error = errors.New("not called")
+    c.get_transaction_receipt(TX, fn(v: *rpc.Receipt, err: error) {
+      r = v
+      e = err
+    })
+    expect(r == nil).to_be_true()
+    expect(e).to_be_nil()
+    c.get_transaction_receipt(TX, fn(v: *rpc.Receipt, err: error) { r = v })
+    expect(r.status).to_equal(1)
+    expect(r.block_number).to_equal(26421886)
+    expect(r.gas_used).to_equal(157647)
+    expect(r.effective_gas_price.dec()).to_equal("205073543")
+    expect(r.contract_address).to_equal("")
+    expect(r.tx_type).to_equal(2)
+    expect(len(r.logs)).to_equal(1)
+    l := r.logs[0]
+    expect(l.address).to_equal(USDC)
+    expect(len(l.topics)).to_equal(3)
+    expect(web3.to_hex(l.topics[0])).to_equal(TRANSFER)
+    expect(web3.from_bytes(l.data).dec()).to_equal("4777")
+    expect(l.log_index).to_equal(0)
+    expect(l.transaction_hash).to_equal(TX)
+  })
+
+  it("encodes log filters (wildcards, alternatives) and reads logs", fn() {
+    m := new_mock()
+    m.on("eth_getLogs", "[{\"address\":\"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48\",\"topics\":[\"" + TRANSFER + "\"],\"data\":\"0x01\",\"blockNumber\":\"0x10\",\"transactionHash\":\"" + TX + "\",\"transactionIndex\":\"0x1\",\"logIndex\":\"0x2\",\"removed\":false}]")
+    c := m.client()
+    dest := web3.pad_left(web3.must_hex(VITALIK), 32)
+    let logs: []*rpc.Log = nil
+    f := &rpc.LogFilter{address: []str{USDC}, topics: [][]str{[]str{web3.must_hex(TRANSFER)}, nil, []str{dest, web3.pad_left(web3.must_hex(USDC), 32)}, nil}, from_block: rpc.quantity_int(16), to_block: "latest"}
+    c.get_logs(f, fn(v: []*rpc.Log, err: error) { logs = v })
+    p, _ := json.parse(m.last_params())
+    expect(p.get_str("0.address", "")).to_equal(USDC)
+    expect(p.get_str("0.fromBlock", "")).to_equal("0x10")
+    expect(p.get_str("0.toBlock", "")).to_equal("latest")
+    expect(p.get_str("0.topics.0", "")).to_equal(TRANSFER)
+    expect(p.get("0.topics.1").is_null()).to_be_true()
+    expect(len(p.get_array("0.topics.2"))).to_equal(2)
+    expect(len(p.get_array("0.topics"))).to_equal(3)
+    expect(len(logs)).to_equal(1)
+    expect(logs[0].block_number).to_equal(16)
+    expect(logs[0].log_index).to_equal(2)
+    expect(int(logs[0].data[0])).to_equal(1)
+  })
+})
+
+describe("rpc fees", fn() {
+  it("reads the gas price and the priority fee", fn() {
+    m := new_mock()
+    m.on("eth_gasPrice", q("0x3b9aca00"))
+    m.on("eth_maxPriorityFeePerGas", q("0x48c4"))
+    c := m.client()
+    gp := ""
+    tip := ""
+    c.gas_price(fn(v: *web3.U256, err: error) { gp = web3.format_gwei(v) })
+    c.max_priority_fee_per_gas(fn(v: *web3.U256, err: error) { tip = v.dec() })
+    expect(gp).to_equal("1")
+    expect(tip).to_equal("18628")
+  })
+
+  it("reads a fee history and turns it into slow, average and fast fees", fn() {
+    m := new_mock()
+    m.on("eth_feeHistory", "{\"baseFeePerGas\":[\"0xba663c7\",\"0xca477ec\",\"0xccc5e80\",\"0xc392c87\",\"0xc507cce\"],\"gasUsedRatio\":[0.84077195,0.5493138833333333,0.32029471666666665,0.5298015833333334],\"oldestBlock\":\"0x1932a7b\",\"reward\":[[\"0x4c59\",\"0x989680\",\"0x3b9aca00\"],[\"0x4d22\",\"0x21e3e9a\",\"0x3b9aca00\"],[\"0x53e0\",\"0x11c0f0e\",\"0x3b9aca00\"],[\"0x48c4\",\"0x2ad85f9\",\"0x3b9aca00\"]]}")
+    c := m.client()
+    let h: *rpc.FeeHistory = nil
+    c.fee_history(4, "latest", []int{10, 50, 90}, fn(v: *rpc.FeeHistory, err: error) { h = v })
+    expect(m.last_params()).to_equal("[\"0x4\",\"latest\",[10,50,90]]")
+    expect(h.oldest_block).to_equal(26421883)
+    expect(len(h.base_fee_per_gas)).to_equal(5)
+    expect(len(h.gas_used_ratio)).to_equal(4)
+    expect(h.reward[1][1].dec()).to_equal("35536538")
+    slow, avg, fast := rpc.fee_levels(h)
+    base := web3.must_u256("0xc507cce")
+    expect(slow.base_fee.eq(base)).to_be_true()
+    # slow tip: mean of 0x4c59, 0x4d22, 0x53e0, 0x48c4 = (19545 + 19746 + 21472 + 18628) / 4 = 19847
+    expect(slow.max_priority_fee_per_gas.dec()).to_equal("19847")
+    expect(slow.max_fee_per_gas.eq(base.add(base).add(web3.u256(19847)))).to_be_true()
+    # fast tip: 1 gwei in every block
+    expect(fast.max_priority_fee_per_gas.dec()).to_equal("1000000000")
+    expect(avg.max_priority_fee_per_gas.gt(slow.max_priority_fee_per_gas)).to_be_true()
+    expect(fast.max_fee_per_gas.gt(avg.max_fee_per_gas)).to_be_true()
+  })
+
+  it("leaves zero tips out and keeps the levels in order", fn() {
+    z := web3.zero()
+    h := &rpc.FeeHistory{base_fee_per_gas: []*web3.U256{web3.u256(100), web3.u256(200)}, reward: [][]*web3.U256{[]*web3.U256{z, z, z}, []*web3.U256{web3.u256(10), web3.u256(5), web3.u256(30)}}}
+    slow, avg, fast := rpc.fee_levels(h)
+    expect(slow.max_priority_fee_per_gas.dec()).to_equal("10")
+    expect(avg.max_priority_fee_per_gas.dec()).to_equal("10")
+    expect(fast.max_priority_fee_per_gas.dec()).to_equal("30")
+    expect(fast.max_fee_per_gas.dec()).to_equal("430")
+    f := rpc.fees_for(nil, web3.u256(7))
+    expect(f.base_fee == nil).to_be_true()
+    expect(f.max_fee_per_gas.dec()).to_equal("7")
+  })
+
+  it("estimates EIP-1559 fees from the latest block", fn() {
+    m := new_mock()
+    m.on("eth_getBlockByNumber", block_json(1, "0x3b9aca00"))
+    m.on("eth_maxPriorityFeePerGas", q("0x5f5e100"))
+    c := m.client()
+    let f: *rpc.Fees = nil
+    c.estimate_fees_per_gas(fn(v: *rpc.Fees, err: error) { f = v })
+    expect(web3.format_gwei(f.base_fee)).to_equal("1")
+    expect(web3.format_gwei(f.max_priority_fee_per_gas)).to_equal("0.1")
+    expect(web3.format_gwei(f.max_fee_per_gas)).to_equal("2.1")
+  })
+
+  it("falls back to the gas price without eth_maxPriorityFeePerGas, and without a base fee", fn() {
+    m := new_mock()
+    m.on("eth_getBlockByNumber", block_json(1, "0x3b9aca00"))
+    m.on("eth_gasPrice", q("0x4a817c80"))
+    c := m.client()
+    let f: *rpc.Fees = nil
+    c.estimate_fees_per_gas(fn(v: *rpc.Fees, err: error) { f = v })
+    expect(web3.format_gwei(f.max_priority_fee_per_gas)).to_equal("0.25")
+    m2 := new_mock()
+    m2.on("eth_getBlockByNumber", block_json(1, ""))
+    m2.on("eth_gasPrice", q("0x12a05f200"))
+    c2 := m2.client()
+    c2.estimate_fees_per_gas(fn(v: *rpc.Fees, err: error) { f = v })
+    expect(f.base_fee == nil).to_be_true()
+    expect(web3.format_gwei(f.max_fee_per_gas)).to_equal("5")
+  })
+
+  it("gives slow, average and fast levels", fn() {
+    m := new_mock()
+    m.on("eth_feeHistory", "{\"baseFeePerGas\":[\"0x64\",\"0x64\"],\"gasUsedRatio\":[0.5],\"oldestBlock\":\"0x1\",\"reward\":[[\"0x1\",\"0x2\",\"0x3\"]]}")
+    c := m.client()
+    out := []str{}
+    c.estimate_fee_levels(fn(s: *rpc.Fees, a: *rpc.Fees, f: *rpc.Fees, err: error) {
+      out = []str{s.max_fee_per_gas.dec(), a.max_fee_per_gas.dec(), f.max_fee_per_gas.dec()}
+    })
+    expect(out).to_equal([]str{"201", "202", "203"})
+    expect(m.last_params()).to_equal("[\"0x14\",\"latest\",[10,50,90]]")
+  })
+})
+
+describe("rpc retries", fn() {
+  it("retries 429 and 5xx, then succeeds", fn() {
+    m := new_mock()
+    m.fail("eth_chainId", &rpc.HttpError{status: 429})
+    m.fail("eth_chainId", &rpc.HttpError{status: 503})
+    m.on("eth_chainId", q("0x1"))
+    c := m.client()
+    id := 0
+    let e: error = nil
+    c.chain_id(fn(v: int, err: error) {
+      id = v
+      e = err
+    })
+    expect(e).to_be_nil()
+    expect(id).to_equal(1)
+    expect(m.count("eth_chainId")).to_equal(3)
+  })
+
+  it("gives up after the configured retries", fn() {
+    m := new_mock()
+    m.fail("eth_chainId", &rpc.HttpError{status: 429})
+    c := m.client()
+    let e: error = nil
+    c.chain_id(fn(v: int, err: error) { e = err })
+    expect(e.Error()).to_contain("HTTP 429")
+    expect(m.count("eth_chainId")).to_equal(3)
+  })
+
+  it("does not retry node errors, nor with retries < 0", fn() {
+    m := new_mock()
+    m.fail("eth_call", &rpc.RpcError{code: 3, message: "execution reverted"})
+    c := m.client()
+    c.call(&rpc.CallRequest{to_: USDC}, "", fn(b: str, err: error) {})
+    expect(m.count("eth_call")).to_equal(1)
+    m2 := new_mock()
+    m2.fail("eth_chainId", fetch.new_error("network", nil, "connection refused"))
+    c2 := rpc.create_public_client(&rpc.ClientConfig{retries: -1, transport: m2.transport()})
+    c2.chain_id(fn(v: int, err: error) {})
+    expect(m2.count("eth_chainId")).to_equal(1)
+  })
+
+  it("retries network errors", fn() {
+    m := new_mock()
+    m.fail("eth_chainId", fetch.new_error("network", nil, "connection refused"))
+    m.on("eth_chainId", q("0x89"))
+    c := m.client()
+    id := 0
+    c.chain_id(fn(v: int, err: error) { id = v })
+    expect(id).to_equal(137)
+  })
+
+  it("cancels: the callback is not called after cancel", fn() {
+    let pending: fn(str, error) = nil
+    c := rpc.create_public_client(&rpc.ClientConfig{transport: fn(method: str, params_json: str, cb: fn(str, error)) -> fn() {
+      pending = cb
+      return nil
+    }})
+    called := false
+    cancel := c.chain_id(fn(v: int, err: error) { called = true })
+    cancel()
+    pending(q("0x1"), nil)
+    expect(called).to_be_false()
+  })
+})
+
+# ---------------------------------------------------------------- HTTP (a mock fetch transport)
+
+struct Http {
+  statuses: []int
+  bodies: []str
+  requests: []*fetch.Request
+}
+
+fn (h: *Http) client(retries: int) -> *rpc.Client {
+  fc := fetch.create(&fetch.Config{transport: fn(req: *fetch.Request, done: fn(*fetch.Response, error)) -> fn() {
+    h.requests = append(h.requests, req)
+    i := len(h.requests) - 1
+    if i >= len(h.statuses) { i = len(h.statuses) - 1 }
+    if h.statuses[i] == 0 {
+      done(nil, fetch.new_error("network", req, "network error: connection refused"))
+      return nil
+    }
+    done(&fetch.Response{status: h.statuses[i], body: h.bodies[i], headers: map[str]str{}}, nil)
+    return nil
+  }})
+  return rpc.create_public_client(&rpc.ClientConfig{url: "https://node.example/rpc", http_client: fc, retries: retries})
+}
+
+describe("rpc over HTTP", fn() {
+  it("posts a JSON-RPC request and reads the result", fn() {
+    h := &Http{statuses: []int{200}, bodies: []str{"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x1\"}"}}
+    c := h.client(0)
+    id := 0
+    c.chain_id(fn(v: int, err: error) { id = v })
+    expect(id).to_equal(1)
+    r := h.requests[0]
+    expect(r.method).to_equal("POST")
+    expect(r.url).to_equal("https://node.example/rpc")
+    expect(r.headers["Content-Type"]).to_equal("application/json")
+    expect(r.body).to_equal("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\",\"params\":[]}")
+  })
+
+  it("retries a 429 and a network error", fn() {
+    h := &Http{statuses: []int{429, 0, 200}, bodies: []str{"rate limited", "", "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":\"0xa\"}"}}
+    c := h.client(0)
+    id := 0
+    c.chain_id(fn(v: int, err: error) { id = v })
+    expect(id).to_equal(10)
+    expect(len(h.requests)).to_equal(3)
+  })
+
+  it("maps HTTP statuses and JSON-RPC errors to errors", fn() {
+    h := &Http{statuses: []int{500}, bodies: []str{"internal"}}
+    let e: error = nil
+    h.client(-1).chain_id(fn(v: int, err: error) { e = err })
+    he, ok := e.(*rpc.HttpError)
+    expect(ok).to_be_true()
+    expect(he.status).to_equal(500)
+    expect(e.Error()).to_contain("HTTP 500 from https://node.example/rpc: internal")
+    h2 := &Http{statuses: []int{200}, bodies: []str{"{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":3,\"message\":\"execution reverted\",\"data\":\"0x08c379a0\"}}"}}
+    h2.client(0).chain_id(fn(v: int, err: error) { e = err })
+    re, ok2 := e.(*rpc.RpcError)
+    expect(ok2).to_be_true()
+    expect(re.data).to_equal("0x08c379a0")
+    h3 := &Http{statuses: []int{400}, bodies: []str{"{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602,\"message\":\"invalid argument\"}}"}}
+    h3.client(0).chain_id(fn(v: int, err: error) { e = err })
+    re3, ok3 := e.(*rpc.RpcError)
+    expect(ok3).to_be_true()
+    expect(re3.code).to_equal(-32602)
+    expect(len(h3.requests)).to_equal(1)
+    h4 := &Http{statuses: []int{200}, bodies: []str{"<html>"}}
+    h4.client(0).chain_id(fn(v: int, err: error) { e = err })
+    expect(e.Error()).to_contain("not a JSON-RPC response")
+  })
+
+  it("sends a batch in one request and matches answers by id", fn() {
+    h := &Http{statuses: []int{200}, bodies: []str{"[{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":\"0x1932a7e\"},{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32601,\"message\":\"method not found\"}},{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x1\"}]"}}
+    c := h.client(0)
+    calls := []*rpc.BatchCall{&rpc.BatchCall{method: "eth_chainId"}, &rpc.BatchCall{method: "eth_blockNumber"}, &rpc.BatchCall{method: "eth_nope", params: []any{web3.u256(1)}}}
+    let berr: error = errors.New("not called")
+    c.batch(calls, fn(cs: []*rpc.BatchCall, err: error) { berr = err })
+    expect(berr).to_be_nil()
+    expect(len(h.requests)).to_equal(1)
+    expect(h.requests[0].body).to_start_with("[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\"")
+    expect(h.requests[0].body).to_contain("\"method\":\"eth_nope\",\"params\":[\"0x1\"]")
+    expect(calls[0].result).to_equal("\"0x1\"")
+    expect(calls[1].result).to_equal("\"0x1932a7e\"")
+    expect(calls[2].error.Error()).to_contain("method not found")
+  })
+
+  it("fails the whole batch when the node answers it with one error", fn() {
+    h := &Http{statuses: []int{200}, bodies: []str{"{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"batch not supported\"}}"}}
+    calls := []*rpc.BatchCall{&rpc.BatchCall{method: "eth_chainId"}}
+    let berr: error = nil
+    h.client(0).batch(calls, fn(cs: []*rpc.BatchCall, err: error) { berr = err })
+    expect(berr.Error()).to_contain("batch not supported")
+    expect(calls[0].error).not_().to_be_nil()
+  })
+
+  it("runs a batch one by one through a transport", fn() {
+    m := new_mock()
+    m.on("eth_chainId", q("0x1"))
+    m.on("eth_blockNumber", q("0x2"))
+    c := m.client()
+    calls := []*rpc.BatchCall{&rpc.BatchCall{method: "eth_chainId"}, &rpc.BatchCall{method: "eth_blockNumber"}}
+    finished := false
+    c.batch(calls, fn(cs: []*rpc.BatchCall, err: error) { finished = true })
+    expect(finished).to_be_true()
+    expect(calls[1].result).to_equal("\"0x2\"")
+  })
+})
+
+describe("rpc waiting and watching", fn() {
+  it("polls for a receipt until it is mined", fn() {
+    m := new_mock()
+    m.on("eth_getTransactionReceipt", "null")
+    m.on("eth_getTransactionReceipt", "null")
+    m.on("eth_getTransactionReceipt", RECEIPT)
+    c := m.client()
+    let r: *rpc.Receipt = nil
+    let e: error = nil
+    c.wait_for_transaction_receipt(TX, &rpc.WaitOptions{poll_ms: 10}, fn(v: *rpc.Receipt, err: error) {
+      r = v
+      e = err
+    })
+    expect(e).to_be_nil()
+    expect(r.status).to_equal(1)
+    expect(m.count("eth_getTransactionReceipt")).to_equal(3)
+  })
+
+  it("waits for confirmations", fn() {
+    m := new_mock()
+    m.on("eth_getTransactionReceipt", RECEIPT)
+    m.on("eth_blockNumber", q(rpc.quantity_int(26421886)))
+    m.on("eth_blockNumber", q(rpc.quantity_int(26421887)))
+    m.on("eth_blockNumber", q(rpc.quantity_int(26421888)))
+    c := m.client()
+    got := 0
+    c.wait_for_transaction_receipt(TX, &rpc.WaitOptions{confirmations: 3, poll_ms: 10}, fn(v: *rpc.Receipt, err: error) { got++ })
+    expect(got).to_equal(1)
+    expect(m.count("eth_blockNumber")).to_equal(3)
+  })
+
+  it("times out, and keeps polling through network errors", fn() {
+    m := new_mock()
+    m.fail("eth_getTransactionReceipt", fetch.new_error("network", nil, "connection reset"))
+    m.on("eth_getTransactionReceipt", "null")
+    c := rpc.create_public_client(&rpc.ClientConfig{retries: -1, transport: m.transport()})
+    let e: error = nil
+    c.wait_for_transaction_receipt(TX, &rpc.WaitOptions{poll_ms: 100, timeout_ms: 1000}, fn(v: *rpc.Receipt, err: error) { e = err })
+    expect(e.Error()).to_contain("timed out after 1000 ms")
+    expect(e.Error()).to_contain("connection reset")
+    expect(m.count("eth_getTransactionReceipt")).to_equal(10)
+  })
+
+  it("stops at a node error", fn() {
+    m := new_mock()
+    m.fail("eth_getTransactionReceipt", &rpc.RpcError{code: -32602, message: "invalid argument 0: hex string has length 2"})
+    c := m.client()
+    let e: error = nil
+    c.wait_for_transaction_receipt("0x00", &rpc.WaitOptions{poll_ms: 10}, fn(v: *rpc.Receipt, err: error) { e = err })
+    expect(e.Error()).to_contain("invalid argument")
+    expect(m.count("eth_getTransactionReceipt")).to_equal(1)
+  })
+
+  it("watches new blocks until max_polls", fn() {
+    m := new_mock()
+    m.on("eth_blockNumber", q("0x10"))
+    m.on("eth_blockNumber", q("0x10"))
+    m.on("eth_blockNumber", q("0x12"))
+    m.fail("eth_blockNumber", &rpc.HttpError{status: 400})
+    m.on("eth_blockNumber", q("0x13"))
+    c := m.client()
+    seen := []int{}
+    errs := 0
+    c.watch_blocks(&rpc.WatchOptions{poll_ms: 10, max_polls: 5}, fn(n: int) { seen = append(seen, n) }, fn(err: error) { errs++ })
+    expect(seen).to_equal([]int{16, 18, 19})
+    expect(errs).to_equal(1)
+  })
+
+  it("stops a blocking watcher from its callback", fn() {
+    m := new_mock()
+    m.on("eth_blockNumber", q("0x1"))
+    m.on("eth_blockNumber", q("0x2"))
+    m.on("eth_blockNumber", q("0x3"))
+    c := m.client()
+    opts := &rpc.WatchOptions{poll_ms: 10}
+    seen := []int{}
+    c.watch_blocks(opts, fn(n: int) {
+      seen = append(seen, n)
+      if n == 3 { opts.stop() }
+    }, nil)
+    expect(seen).to_equal([]int{1, 2, 3})
+  })
+
+  it("polls with a scheduler (every) and returns at once", fn() {
+    m := new_mock()
+    m.on("eth_blockNumber", q("0x1"))
+    m.on("eth_blockNumber", q("0x2"))
+    c := m.client()
+    let tick: fn() = nil
+    every_ms := 0
+    seen := []int{}
+    stop := c.watch_blocks(&rpc.WatchOptions{poll_ms: 1500, every: fn(ms: int, f: fn()) {
+      every_ms = ms
+      tick = f
+    }}, fn(n: int) { seen = append(seen, n) }, nil)
+    expect(seen).to_equal([]int{1})
+    expect(every_ms).to_equal(1500)
+    tick()
+    expect(seen).to_equal([]int{1, 2})
+    stop()
+    tick()
+    expect(m.count("eth_blockNumber")).to_equal(2)
+  })
+
+  it("watches events in new block ranges", fn() {
+    m := new_mock()
+    m.on("eth_blockNumber", q("0x10"))
+    m.on("eth_blockNumber", q("0x12"))
+    m.on("eth_blockNumber", q("0x12"))
+    m.on("eth_blockNumber", q("0x13"))
+    m.on("eth_getLogs", "[{\"address\":\"" + USDC + "\",\"topics\":[\"" + TRANSFER + "\"],\"data\":\"0x\",\"blockNumber\":\"0x11\",\"logIndex\":\"0x0\"}]")
+    m.on("eth_getLogs", "[]")
+    c := m.client()
+    batches := 0
+    total := 0
+    c.watch_event(&rpc.LogFilter{address: []str{USDC}, topics: [][]str{[]str{web3.must_hex(TRANSFER)}}}, &rpc.WatchOptions{poll_ms: 10, max_polls: 4}, fn(logs: []*rpc.Log) {
+      batches++
+      total += len(logs)
+    }, nil)
+    expect(m.count("eth_getLogs")).to_equal(2)
+    expect(batches).to_equal(1)
+    expect(total).to_equal(1)
+    p, _ := json.parse(m.params[len(m.params) - 1])
+    expect(p.get_str("0.fromBlock", "")).to_equal("0x13")
+    expect(p.get_str("0.toBlock", "")).to_equal("0x13")
+    expect(strings.contains(m.params[2], "\"fromBlock\":\"0x11\",\"toBlock\":\"0x12\"")).to_be_true()
+  })
+})

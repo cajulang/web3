@@ -1,0 +1,113 @@
+# web3/rpc against public nodes. Runs only with CAJU_NET_TESTS=1 (they need the network):
+#   CAJU_NET_TESTS=1 caju test ./tests
+# caju:platforms linux
+import { describe, it, skip, expect } from "std/testing"
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/chains"
+import "github.com/cajulang/web3/rpc"
+import "github.com/cajulang/fetch/native"
+import "std/os"
+
+let LIVE = os.getenv("CAJU_NET_TESTS") == "1"
+
+fn live(title: str, body: fn()) {
+  if LIVE {
+    it(title, body)
+  } else {
+    skip(title + " (set CAJU_NET_TESTS=1)", body)
+  }
+}
+
+fn chain_id_of(c: *chains.Chain) -> int {
+  id := 0
+  let e: error = nil
+  rpc.create_public_client(&rpc.ClientConfig{chain: c}).chain_id(fn(v: int, err: error) {
+    id = v
+    e = err
+  })
+  if e != nil { print(c.name + ": " + e.Error()) }
+  return id
+}
+
+describe("rpc on public nodes", fn() {
+  live("reads Ethereum's chain id and a recent block number", fn() {
+    c := rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum})
+    id := 0
+    bn := 0
+    c.chain_id(fn(v: int, err: error) {
+      expect(err).to_be_nil()
+      id = v
+    })
+    c.block_number(fn(v: int, err: error) {
+      expect(err).to_be_nil()
+      bn = v
+    })
+    expect(id).to_equal(1)
+    expect(bn).to_be_greater_than(20000000)
+  })
+
+  live("reads a balance", fn() {
+    c := rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum})
+    let bal: *web3.U256 = nil
+    c.get_balance("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", "latest", fn(v: *web3.U256, err: error) {
+      expect(err).to_be_nil()
+      bal = v
+    })
+    expect(bal.is_zero()).to_be_false()
+  })
+
+  live("calls USDC's decimals()", fn() {
+    c := rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum})
+    out := ""
+    c.call(&rpc.CallRequest{to_: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", data: web3.must_hex("0x313ce567")}, "latest", fn(b: str, err: error) {
+      expect(err).to_be_nil()
+      out = b
+    })
+    expect(web3.from_bytes(out).dec()).to_equal("6")
+  })
+
+  live("gets a revert with its data", fn() {
+    c := rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum})
+    let e: error = nil
+    # transfer(0x...01, 2^256 - 1) from the zero address
+    data := web3.must_hex("0xa9059cbb0000000000000000000000000000000000000000000000000000000000000001ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+    c.call(&rpc.CallRequest{to_: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", data: data}, "latest", fn(b: str, err: error) { e = err })
+    expect(rpc.is_revert(e)).to_be_true()
+    d, ok := rpc.revert_data(e)
+    expect(ok).to_be_true()
+    expect(web3.to_hex(d[0:4])).to_equal("0x08c379a0")
+  })
+
+  live("reads the latest block and estimates fees", fn() {
+    c := rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum})
+    let b: *rpc.Block = nil
+    c.get_block("latest", false, fn(v: *rpc.Block, err: error) {
+      expect(err).to_be_nil()
+      b = v
+    })
+    expect(b.number).to_be_greater_than(20000000)
+    expect(b.base_fee_per_gas == nil).to_be_false()
+    let slow: *rpc.Fees = nil
+    let fast: *rpc.Fees = nil
+    c.estimate_fee_levels(fn(s: *rpc.Fees, a: *rpc.Fees, f: *rpc.Fees, err: error) {
+      expect(err).to_be_nil()
+      slow = s
+      fast = f
+    })
+    expect(fast.max_fee_per_gas.lt(slow.max_fee_per_gas)).to_be_false()
+  })
+
+  live("sends a batch", fn() {
+    c := rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum})
+    calls := []*rpc.BatchCall{&rpc.BatchCall{method: "eth_chainId"}, &rpc.BatchCall{method: "eth_blockNumber"}}
+    c.batch(calls, fn(cs: []*rpc.BatchCall, err: error) { expect(err).to_be_nil() })
+    expect(calls[0].result).to_equal("\"0x1\"")
+    expect(calls[1].error).to_be_nil()
+  })
+
+  live("reads the chain ids of Base, Arbitrum and Polygon", fn() {
+    expect(chain_id_of(chains.base)).to_equal(8453)
+    expect(chain_id_of(chains.arbitrum)).to_equal(42161)
+    expect(chain_id_of(chains.polygon)).to_equal(137)
+  })
+})
