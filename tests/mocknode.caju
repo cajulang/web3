@@ -1,0 +1,188 @@
+# a mock EVM node for the tests (not a test file): queued answers per JSON-RPC method, and
+# eth_call answered by Caju functions per contract address, with Multicall3's aggregate3 and
+# getEthBalance run against them.
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/abi"
+import "github.com/cajulang/web3/rpc"
+import "github.com/cajulang/web3/chains"
+import "github.com/cajulang/web3/multicall"
+import "github.com/cajulang/web3/erc"
+import "std/json"
+import "std/strings"
+
+export struct Reply {
+  result: str
+  err: error
+}
+
+# a contract: gets the calldata (raw) and the sender, answers the return data (raw) or a revert
+export struct Handler {
+  f: fn(str, str) -> (str, error)
+}
+
+export struct Node {
+  queue: map[str][]*Reply
+  targets: map[str]*Handler
+  balances: map[str]*web3.U256
+  methods: []str
+  params: []str
+  chain: *chains.Chain
+}
+
+export fn new_node() -> *Node {
+  return &Node{queue: map[str][]*Reply{}, targets: map[str]*Handler{}, balances: map[str]*web3.U256{}, chain: chains.ethereum}
+}
+
+# the next answers to method (the last one repeats)
+export fn (m: *Node) on(method: str, result: str) { m.queue[method] = append(m.queue[method], &Reply{result: result}) }
+export fn (m: *Node) fail(method: str, err: error) { m.queue[method] = append(m.queue[method], &Reply{err: err}) }
+
+# eth_call to address runs f(calldata, from)
+export fn (m: *Node) on_call(address: str, f: fn(str, str) -> (str, error)) { m.targets[strings.to_lower(address)] = &Handler{f: f} }
+
+# a revert with data (raw bytes), as a node reports it
+export fn revert(data: str) -> error {
+  return &rpc.RpcError{code: 3, message: "execution reverted", data: web3.to_hex(data)}
+}
+
+export fn (m: *Node) count(method: str) -> int {
+  n := 0
+  for _, x := range m.methods { if x == method { n++ } }
+  return n
+}
+
+export fn (m: *Node) last_params(method: str) -> str {
+  for i := len(m.methods) - 1; i >= 0; i-- { if m.methods[i] == method { return m.params[i] } }
+  return ""
+}
+
+fn (m: *Node) next(method: str) -> *Reply {
+  q := m.queue[method]
+  if len(q) == 0 { return nil }
+  r := q[0]
+  if len(q) > 1 { m.queue[method] = q[1:] }
+  return r
+}
+
+# runs a call against the registered contracts (no contract: empty return data, like an EOA)
+export fn (m: *Node) exec(to_: str, data: str, from_: str) -> (str, error) {
+  if web3.same_address(to_, chains.MULTICALL3) { return m.multicall(data) }
+  h := m.targets[strings.to_lower(to_)]
+  if h == nil { return "", nil }
+  f := h.f
+  return f(data, from_)
+}
+
+fn (m: *Node) multicall(data: str) -> (str, error) {
+  it, args, err := abi.decode_function_data(multicall.MULTICALL3, data)
+  if err != nil { return "", revert("") }
+  if it.name == "getEthBalance" {
+    b := m.balances[strings.to_lower(args[0].(str))]
+    if b == nil { b = web3.zero() }
+    return b.bytes32(), nil
+  }
+  if it.name != "aggregate3" { return "", revert("") }
+  results := []any{}
+  for _, x := range args[0].([]any) {
+    c := x.([]any)
+    out, cerr := m.exec(c[0].(str), c[2].(str), chains.MULTICALL3)
+    if cerr != nil {
+      rd, _ := rpc.revert_data(cerr)
+      if !c[1].(bool) { return "", cerr }
+      results = append(results, []any{false, rd})
+    } else {
+      results = append(results, []any{true, out})
+    }
+  }
+  return abi.encode(it.outputs, []any{results})
+}
+
+fn (m: *Node) answer(method: str, params_json: str) -> (str, error) {
+  r := m.next(method)
+  if method == "eth_call" || (method == "eth_estimateGas" && r == nil) {
+    doc, _ := json.parse(params_json)
+    obj := doc.items[0]
+    data, _ := web3.from_hex(obj.get_str("data", "0x"))
+    out, err := m.exec(obj.get_str("to", ""), data, obj.get_str("from", ""))
+    if err != nil { return "", err }
+    if method == "eth_estimateGas" { return "\"0x186a0\"", nil }
+    return json.quote(web3.to_hex(out)), nil
+  }
+  if method == "eth_estimateGas" {
+    # a queued estimate, unless the call reverts
+    doc2, _ := json.parse(params_json)
+    obj2 := doc2.items[0]
+    data2, _ := web3.from_hex(obj2.get_str("data", "0x"))
+    _, err2 := m.exec(obj2.get_str("to", ""), data2, obj2.get_str("from", ""))
+    if err2 != nil { return "", err2 }
+  }
+  if r == nil { return "", &rpc.RpcError{code: -32601, message: "the method " + method + " does not exist/is not available"} }
+  return r.result, r.err
+}
+
+export fn (m: *Node) transport() -> fn(str, str, fn(str, error)) -> fn() {
+  return fn(method: str, params_json: str, cb: fn(str, error)) -> fn() {
+    m.methods = append(m.methods, method)
+    m.params = append(m.params, params_json)
+    res, err := m.answer(method, params_json)
+    cb(res, err)
+    return nil
+  }
+}
+
+export fn (m: *Node) client() -> *rpc.Client {
+  return rpc.create_public_client(&rpc.ClientConfig{chain: m.chain, transport: m.transport()})
+}
+
+# a return value: ABI-encoded values of the types
+export fn ret(types: []str, values: []any) -> str {
+  out, err := abi.encode_types(types, values)
+  if err != nil { panic(err.Error()) }
+  return out
+}
+
+# a fake ERC-20 (OpenZeppelin 5 errors). bytes32_meta: name and symbol answered as bytes32 (MKR)
+export struct Token {
+  name: str
+  symbol: str
+  decimals: int
+  supply: *web3.U256
+  balances: map[str]*web3.U256
+  bytes32_meta: bool
+}
+
+fn (t: *Token) balance(a: str) -> *web3.U256 {
+  b := t.balances[strings.to_lower(a)]
+  if b == nil { return web3.zero() }
+  return b
+}
+
+fn (t: *Token) meta(s: str) -> str {
+  if t.bytes32_meta { return web3.pad_right(s, 32) }
+  return ret([]str{"string"}, []any{s})
+}
+
+export fn (m: *Node) add_token(address: str, t: *Token) {
+  if t.balances == nil { t.balances = map[str]*web3.U256{} }
+  m.on_call(address, fn(data: str, from_: str) -> (str, error) {
+    it, args, err := abi.decode_function_data(erc.ERC20, data)
+    if err != nil { return "", revert("") }
+    switch it.name {
+    case "name": return t.meta(t.name), nil
+    case "symbol": return t.meta(t.symbol), nil
+    case "decimals": return ret([]str{"uint8"}, []any{t.decimals}), nil
+    case "totalSupply": return ret([]str{"uint256"}, []any{t.supply}), nil
+    case "balanceOf": return ret([]str{"uint256"}, []any{t.balance(args[0].(str))}), nil
+    case "allowance": return ret([]str{"uint256"}, []any{web3.u256(42)}), nil
+    case "transfer":
+      amount := args[1].(*web3.U256)
+      bal := t.balance(from_)
+      if bal.lt(amount) {
+        e, _ := abi.encode_function_data(erc.ERC20.error_("ERC20InsufficientBalance"), []any{from_, bal, amount})
+        return "", revert(e)
+      }
+      return ret([]str{"bool"}, []any{true}), nil
+    }
+    return "", revert("")
+  })
+}

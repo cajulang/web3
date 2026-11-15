@@ -1,0 +1,154 @@
+# web3/multicall against a mock node that runs aggregate3 over fake contracts.
+import { describe, it, expect } from "std/testing"
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/abi"
+import "github.com/cajulang/web3/chains"
+import "github.com/cajulang/web3/rpc"
+import "github.com/cajulang/web3/erc"
+import "github.com/cajulang/web3/multicall"
+import "./mocknode"
+
+let OWNER = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+let USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+let DAI = "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+let NOTHING = "0x000000000000000000000000000000000000dEaD"
+
+fn node() -> *mocknode.Node {
+  m := mocknode.new_node()
+  m.add_token(USDC, &mocknode.Token{name: "USD Coin", symbol: "USDC", decimals: 6, balances: map[str]*web3.U256{"0xd8da6bf26964af9d7eed9e03e53415d37aa96045": web3.u256(1500000)}})
+  m.add_token(DAI, &mocknode.Token{name: "Dai Stablecoin", symbol: "DAI", decimals: 18, balances: map[str]*web3.U256{"0xd8da6bf26964af9d7eed9e03e53415d37aa96045": web3.parse_ether("2.5")}})
+  return m
+}
+
+fn balance_call(token: str, allow: bool) -> *multicall.Call {
+  c, err := multicall.call_of(token, erc.ERC20.function("balanceOf"), []any{OWNER}, allow)
+  if err != nil { panic(err.Error()) }
+  return c
+}
+
+describe("multicall.aggregate", fn() {
+  it("encodes aggregate3 and decodes the results in order", fn() {
+    m := node()
+    c := m.client()
+    let got: []*multicall.Result = nil
+    c2, _ := multicall.call_of(USDC, erc.ERC20.function("symbol"), []any{}, true)
+    multicall.aggregate(c, []*multicall.Call{balance_call(USDC, true), c2, balance_call(DAI, false)}, "latest", fn(rs: []*multicall.Result, err: error) {
+      expect(err).to_be_nil()
+      got = rs
+    })
+    expect(len(got)).to_equal(3)
+    expect(got[0].success).to_be_true()
+    expect(web3.from_bytes(got[0].data).dec()).to_equal("1500000")
+    sym, _ := multicall.decode_result(erc.ERC20.function("symbol"), got[1])
+    expect(sym[0]).to_equal("USDC")
+    expect(web3.format_ether(web3.from_bytes(got[2].data))).to_equal("2.5")
+    expect(m.count("eth_call")).to_equal(1)
+    expect(m.last_params("eth_call")).to_contain("0xcA11bde05977b3631167028862bE2a173976CA11")
+    expect(m.last_params("eth_call")).to_contain("0x82ad56cb")    # aggregate3's selector
+  })
+
+  it("reports a failed call with allow_failure and its revert data", fn() {
+    m := node()
+    m.on_call(NOTHING, fn(data: str, from_: str) -> (str, error) { return "", mocknode.revert(web3.must_hex("0xdeadbeef")) })
+    let got: []*multicall.Result = nil
+    multicall.aggregate(m.client(), []*multicall.Call{balance_call(NOTHING, true), balance_call(USDC, true)}, "", fn(rs: []*multicall.Result, err: error) {
+      expect(err).to_be_nil()
+      got = rs
+    })
+    expect(got[0].success).to_be_false()
+    expect(web3.to_hex(got[0].data)).to_equal("0xdeadbeef")
+    expect(got[1].success).to_be_true()
+    _, derr := multicall.decode_result(erc.ERC20.function("balanceOf"), got[0])
+    expect(derr.Error()).to_contain("failed")
+  })
+
+  it("fails the whole call when a call without allow_failure reverts", fn() {
+    m := node()
+    m.on_call(NOTHING, fn(data: str, from_: str) -> (str, error) { return "", mocknode.revert("") })
+    let e: error = nil
+    multicall.aggregate(m.client(), []*multicall.Call{balance_call(NOTHING, false), balance_call(USDC, true)}, "", fn(rs: []*multicall.Result, err: error) { e = err })
+    expect(rpc.is_revert(e)).to_be_true()
+  })
+
+  it("splits long lists into chunks of CHUNK_SIZE calls", fn() {
+    m := node()
+    calls := []*multicall.Call{}
+    for i := 0; i < 1201; i++ {
+      if i % 2 == 0 { calls = append(calls, balance_call(USDC, true)) } else { calls = append(calls, balance_call(DAI, true)) }
+    }
+    let got: []*multicall.Result = nil
+    multicall.aggregate(m.client(), calls, "latest", fn(rs: []*multicall.Result, err: error) {
+      expect(err).to_be_nil()
+      got = rs
+    })
+    expect(m.count("eth_call")).to_equal(3)
+    expect(len(got)).to_equal(1201)
+    expect(web3.from_bytes(got[1200].data).dec()).to_equal("1500000")
+    expect(web3.format_ether(web3.from_bytes(got[1199].data))).to_equal("2.5")
+  })
+
+  it("takes a chunk size with aggregate_at", fn() {
+    m := node()
+    calls := []*multicall.Call{}
+    for i := 0; i < 7; i++ { calls = append(calls, balance_call(USDC, true)) }
+    n := 0
+    multicall.aggregate_at(m.client(), chains.MULTICALL3, calls, "latest", 3, fn(rs: []*multicall.Result, err: error) { n = len(rs) })
+    expect(n).to_equal(7)
+    expect(m.count("eth_call")).to_equal(3)
+  })
+
+  it("answers an empty list without a request", fn() {
+    m := node()
+    n := -1
+    multicall.aggregate(m.client(), []*multicall.Call{}, "latest", fn(rs: []*multicall.Result, err: error) { n = len(rs) })
+    expect(n).to_equal(0)
+    expect(len(m.methods)).to_equal(0)
+  })
+
+  it("refuses a chain without Multicall3", fn() {
+    m := node()
+    m.chain = chains.define_chain(999999, "Nowhere", "ETH", "http://localhost:1")
+    m.chain.multicall3 = ""
+    let e: error = nil
+    multicall.aggregate(m.client(), []*multicall.Call{balance_call(USDC, true)}, "", fn(rs: []*multicall.Result, err: error) { e = err })
+    expect(e.Error()).to_contain("no Multicall3")
+  })
+})
+
+describe("multicall balances", fn() {
+  it("reads ERC-20 balances, nil for tokens that fail or are not contracts", fn() {
+    m := node()
+    m.on_call(NOTHING, fn(data: str, from_: str) -> (str, error) { return "", mocknode.revert("") })
+    let got: []*web3.U256 = nil
+    multicall.erc20_balances(m.client(), OWNER, []str{USDC, DAI, NOTHING, "0x1111111111111111111111111111111111111111"}, fn(bs: []*web3.U256, err: error) {
+      expect(err).to_be_nil()
+      got = bs
+    })
+    expect(len(got)).to_equal(4)
+    expect(got[0].dec()).to_equal("1500000")
+    expect(web3.format_ether(got[1])).to_equal("2.5")
+    expect(got[2] == nil).to_be_true()
+    expect(got[3] == nil).to_be_true()
+    expect(m.count("eth_call")).to_equal(1)
+  })
+
+  it("reads native balances through getEthBalance", fn() {
+    m := node()
+    m.balances["0xd8da6bf26964af9d7eed9e03e53415d37aa96045"] = web3.parse_ether("1.25")
+    let got: []*web3.U256 = nil
+    multicall.get_eth_balances(m.client(), []str{OWNER, USDC}, fn(bs: []*web3.U256, err: error) {
+      expect(err).to_be_nil()
+      got = bs
+    })
+    expect(web3.format_ether(got[0])).to_equal("1.25")
+    expect(got[1].is_zero()).to_be_true()
+  })
+
+  it("refuses an invalid owner before any request", fn() {
+    m := node()
+    let e: error = nil
+    multicall.erc20_balances(m.client(), "0xnope", []str{USDC}, fn(bs: []*web3.U256, err: error) { e = err })
+    expect(e == nil).to_be_false()
+    expect(len(m.methods)).to_equal(0)
+  })
+})

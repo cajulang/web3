@@ -1,0 +1,478 @@
+# web3/ens: Ethereum Name Service (import "github.com/cajulang/web3/ens").
+#
+#   ens.resolve_address(client, "vitalik.eth", fn(addr: str, err: error) { ... })   # "0xd8dA..."
+#   ens.lookup_name(client, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", fn(name: str, err: error) { ... })
+#   ens.get_text(client, "vitalik.eth", "url", fn(v: str, err: error) { ... })
+#   web3.to_hex(ens.namehash("eth"))   # "0x93cdeb70..."
+#
+# Lookups go through the ENS Universal Resolver of the client's chain
+# (chains.Chain.ens_universal_resolver: Ethereum and Sepolia), which finds the name's resolver,
+# follows wildcards (ENSIP-10) and offchain names: the CCIP-read (EIP-3668) round trip to the
+# gateways is done here, including the local batch gateway ("x-batch-gateway:true", ENSIP-21).
+# "Not found" is not an error: a name without a resolver or without that record gives "", nil.
+#
+# Names: normalize accepts ASCII names only (lower-cased; labels of a-z, 0-9, "-" and leading
+# "_"). Full UTS-46 / ENSIP-15 normalization (Unicode, emoji, confusables) is NOT implemented:
+# names with non-ASCII characters are refused with an error rather than hashed wrongly.
+# namehash, labelhash and dns_encode take names as they are (normalize first).
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/abi"
+import "github.com/cajulang/web3/rpc"
+import "github.com/cajulang/web3/contracts"
+import "github.com/cajulang/fetch"
+import "std/strings"
+import "std/json"
+
+fn err_(msg: str) -> error { return errors.New("ens: " + msg) }
+
+fn run0(f: fn()) { f() }
+
+# ---------------------------------------------------------------- names
+
+fn is_hex_digit(c: int) -> bool { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') }
+
+# the normalized form of an ASCII name (lower case), or why it is not a valid name. Names with
+# non-ASCII characters are refused: full ENSIP-15 normalization is not implemented
+export fn normalize(name: str) -> (str, error) {
+  if name == "" { return "", nil }
+  out := []byte{}
+  for i := 0; i < len(name); i++ {
+    c := int(name[i])
+    if c >= 0x80 { return "", err_("\"" + name + "\" has non-ASCII characters: Unicode (ENSIP-15) normalization is not supported") }
+    if c >= 'A' && c <= 'Z' { c = c + 32 }
+    out = append(out, byte(c))
+  }
+  n := string(out)
+  for _, label := range strings.split(n, ".") {
+    if label == "" { return "", err_("\"" + name + "\" has an empty label") }
+    lead := true
+    for j := 0; j < len(label); j++ {
+      ch := int(label[j])
+      if ch == '_' {
+        if !lead { return "", err_("\"" + name + "\": an underscore is only allowed at the start of a label") }
+        continue
+      }
+      lead = false
+      if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-') {
+        return "", err_("\"" + name + "\" has an invalid character " + strings.from_byte(ch))
+      }
+    }
+    if len(label) >= 4 && label[2:4] == "--" { return "", err_("\"" + name + "\": a label cannot have \"--\" at its 3rd and 4th characters") }
+  }
+  return n, nil
+}
+
+# a label written as its hash, "[" + 64 hex digits + "]": the hash (raw), or ""
+fn hashed_label(label: str) -> str {
+  if len(label) != 66 || label[0:1] != "[" || label[65:66] != "]" { return "" }
+  for i := 1; i < 65; i++ { if !is_hex_digit(int(label[i])) { return "" } }
+  b, err := web3.from_hex("0x" + label[1:65])
+  if err != nil { return "" }
+  return b
+}
+
+# keccak256 of a label (raw 32 bytes); a "[<64 hex digits>]" label is that hash
+export fn labelhash(label: str) -> str {
+  h := hashed_label(label)
+  if h != "" { return h }
+  return web3.keccak256(label)
+}
+
+# the ENS node of a name (raw 32 bytes; web3.to_hex for "0x..."): namehash("") is 32 zero bytes
+export fn namehash(name: str) -> str {
+  node := web3.zeros(32)
+  if name == "" { return node }
+  labels := strings.split(name, ".")
+  for i := len(labels) - 1; i >= 0; i-- { node = web3.keccak256(node + labelhash(labels[i])) }
+  return node
+}
+
+# the DNS wire format of a name (length-prefixed labels, ending in a zero byte), as the Universal
+# Resolver takes it; a label longer than 255 bytes goes as "[" + its labelhash + "]"
+export fn dns_encode(name: str) -> str {
+  if name == "" { return "\x00" }
+  parts := []str{}
+  for _, label := range strings.split(name, ".") {
+    l := label
+    if len(l) > 255 { l = "[" + web3.to_hex(web3.keccak256(label))[2:] + "]" }
+    parts = append(parts, string([]byte{byte(len(l))}) + l)
+  }
+  return strings.join(parts, "") + string([]byte{byte(0)})
+}
+
+# ---------------------------------------------------------------- the Universal Resolver
+
+export let UNIVERSAL_RESOLVER_ABI = []str{
+  "function resolve(bytes name, bytes data) view returns (bytes result, address resolver)",
+  "function reverse(bytes lookupAddress, uint256 coinType) view returns (string primary, address resolver, address reverseResolver)",
+  "error ResolverNotFound(bytes name)",
+  "error ResolverNotContract(bytes name, address resolver)",
+  "error UnsupportedResolverProfile(bytes4 selector)",
+  "error ResolverError(bytes errorData)",
+  "error ReverseAddressMismatch(string primary, bytes primaryAddress)",
+  "error HttpError(uint16 status, string message)",
+  "error ResolverWildcardNotSupported()",
+  "error OffchainLookup(address sender, string[] urls, bytes callData, bytes4 callbackFunction, bytes extraData)",
+}
+
+export let RESOLVER_ABI = []str{
+  "function addr(bytes32 node) view returns (address)",
+  "function addr(bytes32 node, uint256 coinType) view returns (bytes)",
+  "function name(bytes32 node) view returns (string)",
+  "function text(bytes32 node, string key) view returns (string)",
+  "function contenthash(bytes32 node) view returns (bytes)",
+}
+
+export let BATCH_GATEWAY_ABI = []str{
+  "function query((address sender, string[] urls, bytes data)[] requests) returns (bool[] failures, bytes[] responses)",
+}
+
+let UR = abi.must_human(UNIVERSAL_RESOLVER_ABI)
+let RESOLVER = abi.must_human(RESOLVER_ABI)
+let BATCH = abi.must_human(BATCH_GATEWAY_ABI)
+let OFFCHAIN_LOOKUP = UR.error_("OffchainLookup")
+let HTTP_ERROR = UR.error_("HttpError")
+
+# how many OffchainLookup round trips one lookup may take
+const MAX_CCIP_ROUNDS = 4
+
+# the local batch gateway (ENSIP-21): the client does the batched lookups itself
+export const LOCAL_BATCH_GATEWAY = "x-batch-gateway:true"
+
+struct Lookup {
+  canceled: bool
+  finished: bool
+  abort: fn()
+}
+
+fn (l: *Lookup) track(a: fn()) { if a != nil && !l.canceled && !l.finished { l.abort = a } }
+
+fn (l: *Lookup) cancel_fn() -> fn() {
+  return fn() {
+    if l.canceled || l.finished { return }
+    l.canceled = true
+    if l.abort != nil { run0(l.abort) }
+  }
+}
+
+# a fetch client for the gateways: the RPC client's transport (so mocks reach it) without its
+# headers (an RPC key must not go to a gateway)
+fn gateway_client(client: *rpc.Client) -> *fetch.Client {
+  cfg := &fetch.Config{timeout_ms: 10000}
+  if client.http != nil { cfg.transport = client.http.config.transport }
+  return fetch.create(cfg)
+}
+
+fn lower_hex(b: str) -> str { return strings.to_lower(web3.to_hex(b)) }
+
+# one gateway request: the URLs in order until one answers (a 4xx stops: EIP-3668)
+fn gateway_try(http: *fetch.Client, sender: str, urls: []str, i: int, data: str, last: error, st: *Lookup, cb: fn(str, error)) {
+  if st.canceled { return }
+  if i >= len(urls) {
+    if last == nil { last = err_("no gateway URL in the OffchainLookup") }
+    cb("", last)
+    return
+  }
+  url := urls[i]
+  if url == LOCAL_BATCH_GATEWAY {
+    local_batch(http, data, st, fn(resp: str, berr: error) {
+      if berr != nil {
+        gateway_try(http, sender, urls, i + 1, data, berr, st, cb)
+        return
+      }
+      cb(resp, nil)
+    })
+    return
+  }
+  sender_hex := strings.to_lower(sender)
+  data_hex := lower_hex(data)
+  req := &fetch.Request{method: "GET", url: strings.replace_all(strings.replace_all(url, "{sender}", sender_hex), "{data}", data_hex)}
+  if !strings.contains(url, "{data}") {
+    body, _ := json.marshal(map[str]any{"data": data_hex, "sender": sender_hex})
+    req.method = "POST"
+    req.body = body
+    req.headers = map[str]str{"Content-Type": "application/json"}
+  }
+  call := http.request(req)
+  st.track(fn() { call.cancel() })
+  call.done(fn(r: *fetch.Response, err: error) {
+    if st.canceled { return }
+    if err != nil {
+      gerr := err_("gateway " + url + ": " + err.Error())
+      if r != nil && r.status >= 400 && r.status < 500 {
+        cb("", gerr)
+        return
+      }
+      gateway_try(http, sender, urls, i + 1, data, gerr, st, cb)
+      return
+    }
+    doc, perr := json.parse(r.body)
+    hexd := ""
+    if perr == nil && doc.kind == "object" { hexd = doc.get_str("data", "") }
+    out, herr := web3.from_hex(hexd)
+    if hexd == "" || herr != nil {
+      gateway_try(http, sender, urls, i + 1, data, err_("gateway " + url + " answered no data"), st, cb)
+      return
+    }
+    cb(out, nil)
+  })
+}
+
+# the local batch gateway: query((sender, urls, data)[]) answered with (failures, responses)
+fn local_batch(http: *fetch.Client, data: str, st: *Lookup, cb: fn(str, error)) {
+  q := BATCH.function("query")
+  if len(data) < 4 || data[0:4] != abi.selector(q) {
+    cb("", err_("the batch gateway call is not query(...)"))
+    return
+  }
+  vals, err := abi.decode(q.inputs, data[4:])
+  if err != nil {
+    cb("", err)
+    return
+  }
+  reqs := vals[0].([]any)
+  batch_step(http, reqs, 0, []any{}, []any{}, st, cb)
+}
+
+fn batch_step(http: *fetch.Client, reqs: []any, i: int, failures: []any, responses: []any, st: *Lookup, cb: fn(str, error)) {
+  if i >= len(reqs) {
+    out, err := abi.encode(BATCH.function("query").outputs, []any{failures, responses})
+    cb(out, err)
+    return
+  }
+  r := reqs[i].([]any)
+  urls := []str{}
+  for _, u := range r[1].([]any) { urls = append(urls, u.(str)) }
+  gateway_try(http, r[0].(str), urls, 0, r[2].(str), nil, st, fn(resp: str, err: error) {
+    if err != nil {
+      enc, _ := abi.encode_function_data(HTTP_ERROR, []any{500, err.Error()})
+      batch_step(http, reqs, i + 1, append(failures, true), append(responses, enc), st, cb)
+      return
+    }
+    batch_step(http, reqs, i + 1, append(failures, false), append(responses, resp), st, cb)
+  })
+}
+
+# eth_call to to with data, following OffchainLookup reverts (EIP-3668) through the gateways
+fn ccip_call(client: *rpc.Client, http: *fetch.Client, to_: str, data: str, round: int, st: *Lookup, cb: fn(str, error)) {
+  st.track(client.call(&rpc.CallRequest{to_: to_, data: data}, "latest", fn(out: str, err: error) {
+    if st.canceled { return }
+    if err == nil {
+      cb(out, nil)
+      return
+    }
+    rd, ok := rpc.revert_data(err)
+    if !ok || len(rd) < 4 || rd[0:4] != abi.selector(OFFCHAIN_LOOKUP) {
+      cb("", err)
+      return
+    }
+    if round >= MAX_CCIP_ROUNDS {
+      cb("", err_("too many OffchainLookup round trips"))
+      return
+    }
+    v, derr := abi.decode(OFFCHAIN_LOOKUP.inputs, rd[4:])
+    if derr != nil {
+      cb("", derr)
+      return
+    }
+    sender := v[0].(str)
+    if !web3.same_address(sender, to_) {
+      cb("", err_("OffchainLookup sender " + sender + " is not the contract called (" + to_ + ")"))
+      return
+    }
+    urls := []str{}
+    for _, u := range v[1].([]any) { urls = append(urls, u.(str)) }
+    callback := v[3].(str)
+    extra := v[4].(str)
+    gateway_try(http, sender, urls, 0, v[2].(str), nil, st, fn(resp: str, gerr: error) {
+      if gerr != nil {
+        cb("", gerr)
+        return
+      }
+      args, eerr := abi.encode_types([]str{"bytes", "bytes"}, []any{resp, extra})
+      if eerr != nil {
+        cb("", eerr)
+        return
+      }
+      ccip_call(client, http, to_, callback + args, round + 1, st, cb)
+    })
+  }))
+}
+
+# the Universal Resolver of the client's chain, or an error
+fn universal_resolver(client: *rpc.Client) -> (str, error) {
+  if client == nil { return "", err_("nil client") }
+  if client.chain == nil || client.chain.ens_universal_resolver == "" {
+    name := "the client's chain"
+    if client.chain != nil { name = client.chain.name }
+    return "", err_("no ENS Universal Resolver on " + name + " (ENS lives on Ethereum and Sepolia)")
+  }
+  return client.chain.ens_universal_resolver, nil
+}
+
+# whether a Universal Resolver revert means "no such record" (answered as "", nil)
+fn not_found(rd: str) -> bool {
+  name, args, err := abi.decode_error_result(UR, rd)
+  if err != nil { return false }
+  switch name {
+  case "ResolverNotFound", "ResolverNotContract", "UnsupportedResolverProfile", "ResolverWildcardNotSupported":
+    return true
+  case "ResolverError":
+    return len(args[0].(str)) == 0
+  }
+  return false
+}
+
+# a readable error for a Universal Resolver revert (ResolverError carries the resolver's own)
+fn ur_error(ur: str, err: error) -> error {
+  rd, ok := rpc.revert_data(err)
+  if ok {
+    name, args, derr := abi.decode_error_result(UR, rd)
+    if derr == nil && name == "ResolverError" {
+      inner := contracts.decode_revert(UR, args[0].(str))
+      return err_("the resolver reverted: " + inner.message)
+    }
+  }
+  return contracts.contract_error(UR, "resolve", ur, err)
+}
+
+# asks the Universal Resolver for the record call (a resolver function's calldata) of name; cb
+# gets the record's ABI-encoded value, or "" when there is none
+fn resolve_raw(client: *rpc.Client, name: str, call: str, cb: fn(str, error)) -> fn() {
+  ur, err := universal_resolver(client)
+  if err != nil {
+    cb("", err)
+    return nil
+  }
+  data, eerr := abi.encode_function_data(UR.function("resolve"), []any{dns_encode(name), call})
+  if eerr != nil {
+    cb("", eerr)
+    return nil
+  }
+  st := &Lookup{}
+  ccip_call(client, gateway_client(client), ur, data, 0, st, fn(out: str, cerr: error) {
+    if st.canceled || st.finished { return }
+    st.finished = true
+    if cerr != nil {
+      rd, ok := rpc.revert_data(cerr)
+      if ok && not_found(rd) {
+        cb("", nil)
+        return
+      }
+      cb("", ur_error(ur, cerr))
+      return
+    }
+    vals, derr := abi.decode_function_result(UR.function("resolve"), out)
+    if derr != nil {
+      cb("", derr)
+      return
+    }
+    cb(vals[0].(str), nil)
+  })
+  return st.cancel_fn()
+}
+
+# calldata of a resolver function for node
+fn resolver_call(sig: str, args: []any) -> str {
+  data, _ := abi.encode_function_data(RESOLVER.function(sig), args)
+  return data
+}
+
+fn forward(client: *rpc.Client, n: str, cb: fn(str, error)) -> fn() {
+  return resolve_raw(client, n, resolver_call("addr(bytes32)", []any{namehash(n)}), fn(res: str, err: error) {
+    if err != nil || len(res) == 0 {
+      cb("", err)
+      return
+    }
+    vals, derr := abi.decode_types([]str{"address"}, res)
+    if derr != nil {
+      cb("", derr)
+      return
+    }
+    a := vals[0].(str)
+    if a == web3.ZERO_ADDRESS {
+      cb("", nil)
+      return
+    }
+    cb(a, nil)
+  })
+}
+
+# the Ethereum address of name (EIP-55), or "" when it has none
+export fn resolve_address(client: *rpc.Client, name: str, cb: fn(str, error)) -> fn() {
+  n, err := normalize(name)
+  if err != nil {
+    cb("", err)
+    return nil
+  }
+  if n == "" {
+    cb("", err_("empty name"))
+    return nil
+  }
+  return forward(client, n, cb)
+}
+
+# a string record of name: text(node, key); "" when it has none
+fn string_record(client: *rpc.Client, n: str, call: str, cb: fn(str, error)) -> fn() {
+  return resolve_raw(client, n, call, fn(res: str, err: error) {
+    if err != nil || len(res) == 0 {
+      cb("", err)
+      return
+    }
+    vals, derr := abi.decode_types([]str{"string"}, res)
+    if derr != nil {
+      cb("", derr)
+      return
+    }
+    cb(vals[0].(str), nil)
+  })
+}
+
+# the text record key of name ("url", "avatar", "com.twitter", "description"...); "" when unset
+export fn get_text(client: *rpc.Client, name: str, key: str, cb: fn(str, error)) -> fn() {
+  n, err := normalize(name)
+  if err != nil {
+    cb("", err)
+    return nil
+  }
+  return string_record(client, n, resolver_call("text", []any{namehash(n), key}), cb)
+}
+
+# the avatar record of name as it is (https://, ipfs://, eip155:1/erc721:... or data:); it is not
+# fetched or resolved further
+export fn get_avatar_url(client: *rpc.Client, name: str, cb: fn(str, error)) -> fn() {
+  return get_text(client, name, "avatar", cb)
+}
+
+# the primary name of address: the name record of <address>.addr.reverse, kept only if that name
+# resolves back to address (forward verification); "" when there is none or it does not match
+export fn lookup_name(client: *rpc.Client, address: str, cb: fn(str, error)) -> fn() {
+  if !web3.is_address(address) {
+    cb("", err_("invalid address " + address))
+    return nil
+  }
+  rev := strings.to_lower(address[2:]) + ".addr.reverse"
+  st := &Lookup{}
+  st.track(string_record(client, rev, resolver_call("name", []any{namehash(rev)}), fn(name: str, err: error) {
+    if st.canceled { return }
+    if err != nil || name == "" {
+      st.finished = true
+      cb("", err)
+      return
+    }
+    st.track(forward(client, name, fn(back: str, ferr: error) {
+      if st.canceled { return }
+      st.finished = true
+      if ferr != nil {
+        cb("", ferr)
+        return
+      }
+      if !web3.same_address(back, address) {
+        cb("", nil)
+        return
+      }
+      cb(name, nil)
+    }))
+  }))
+  return st.cancel_fn()
+}

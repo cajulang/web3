@@ -401,3 +401,177 @@ a3, err := k.account()
 The mnemonic is used with its whitespace trimmed and collapsed; BIP-39 also asks for Unicode
 NFKD, which leaves ASCII unchanged: normalize non-ASCII passphrases before calling. Deriving a
 seed takes about 35 ms. Not included yet: parsing xprv/xpub strings and public-only derivation.
+
+## web3/contracts
+
+A contract through its ABI: reads (`eth_call`), simulations, gas estimates, writes from a local
+account or from the browser wallet, and events. Reverts come back as a `*contracts.ContractError`
+decoded with the contract's ABI.
+
+```caju
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/contracts"
+import "github.com/cajulang/web3/erc"
+
+usdc := contracts.contract("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", erc.ERC20, client)
+
+usdc.read("balanceOf", []any{owner}, fn(vals: []any, err: error) {
+  print(web3.format_units(vals[0].(*web3.U256), 6))
+})
+
+# would it work? (eth_call from an account)
+usdc.simulate("transfer", []any{to, amount}, &contracts.WriteOptions{from_: me}, fn(vals: []any, err: error) {
+  if ce, ok := err.(*contracts.ContractError); ok {
+    print(ce.message)          # ERC20InsufficientBalance(0xf39F..., 100, 250)
+    return
+  }
+})
+
+# send it: a local account (server) signs it; the browser wallet signs it in the page
+contracts.write_with_account(usdc, acct, "transfer", []any{to, amount}, nil, fn(hash: str, err: error) { ... })
+contracts.write_with_wallet(usdc, w, "transfer", []any{to, amount}, nil, fn(hash: str, err: error) { ... })
+
+# native coin
+contracts.send_value_with_account(client, acct, to, web3.parse_ether("0.1"), fn(hash: str, err: error) { ... })
+w.send_transaction(&wallet.TxRequest{to_: to, value: web3.parse_ether("0.1")}, fn(hash: str, err: error) { ... })   # browser
+
+# events
+contracts.get_events(usdc, "Transfer", map[str]any{"from": owner}, rpc.quantity_int(19000000), "latest", fn(logs: []*contracts.DecodedLog, err: error) {
+  for _, l := range logs { print(l.args["to"], l.args["value"].(*web3.U256).dec(), l.log.transaction_hash) }
+})
+stop := contracts.watch_contract_event(usdc, "Transfer", nil, &rpc.WatchOptions{}, fn(logs: []*contracts.DecodedLog) { ... }, nil)
+```
+
+| | |
+|---|---|
+| `contract(address, a *abi.Abi, client) -> *Contract` | `Contract { address, abi, client }` |
+| `c.read(fn_name, args, cb fn([]any, error))` | `eth_call` at `"latest"` and the decoded return values |
+| `c.simulate(fn_name, args, opts *WriteOptions, cb fn([]any, error))` | `eth_call` with `from_`, `value`, `gas` (and `opts.block`) |
+| `c.estimate_gas(fn_name, args, opts, cb fn(*web3.U256, error))` | `eth_estimateGas` |
+| `c.encode_write(fn_name, args) -> (str, error)` | the calldata (raw bytes) |
+| `c.function(name, nargs) -> (*abi.Item, error)` | overloads: a signature (`"get(uint256,bool)"`), or the first with that many inputs |
+| `write_with_account(c, acct, fn_name, args, opts, cb fn(hash, error))` | fills, signs, `eth_sendRawTransaction` |
+| `write_with_wallet(c, w, fn_name, args, opts, cb fn(hash, error))` | `wallet.send_transaction` (the wallet fills the rest) |
+| `send_transaction_with_account(client, acct, to, data, opts, cb)` | any transaction from a local account (calldata from `erc.erc20_transfer_data`...) |
+| `send_value_with_account(client, acct, to, value, cb)` | a native transfer |
+| `get_events(c, event_name, args, from_block, to_block, cb fn([]*DecodedLog, error))` | `eth_getLogs` filtered by indexed args by name (missing: any); `""` event: all of the contract's |
+| `watch_contract_event(c, event_name, args, opts *rpc.WatchOptions, on_logs, on_error)` | polling, as `rpc.watch_event` |
+| `decode_revert(a, data) -> *ContractError`, `contract_error(a, fn_name, address, err) -> error` | revert decoding for your own calls |
+
+`WriteOptions { from_, value, gas, max_fee_per_gas, max_priority_fee_per_gas, gas_price, nonce,
+block }`, all optional. A write from a local account fills in what is missing: the chain id (the
+client's chain, or `eth_chainId`), the nonce (`eth_getTransactionCount(..., "pending")`), the gas
+(`eth_estimateGas` + 20%) and EIP-1559 fees (`rpc.estimate_fees_per_gas`: twice the base fee plus
+the node's tip); on a chain without a base fee, or with `gas_price` set, it sends a legacy
+transaction. A revert while estimating gas is a `ContractError` too, and nothing is sent.
+
+`ContractError { name, args, data, message, function, address, cause }`: `name` is the custom
+error (`"ERC20InsufficientBalance"`), `"Error"` (a `require` message: `Error("not owner")`) or
+`"Panic"` (`Panic(0x11: arithmetic underflow or overflow)`), `""` when the data is missing or
+unknown; `data` the revert data (raw bytes); `cause` the node's `*rpc.RpcError`. Errors that are
+not reverts (network, node) are passed through as they are. A read that returns nothing (no
+contract at that address on this chain) is an error saying so.
+
+## web3/erc
+
+Ready ABIs and helpers for ERC-20 tokens and ERC-721 collections. `erc.ERC20` and `erc.ERC721` are
+parsed `*abi.Abi` (`ERC20_ABI` / `ERC721_ABI` are the human-readable lines), with OpenZeppelin 5's
+custom errors (`ERC20InsufficientBalance`, `ERC20InsufficientAllowance`, `ERC721NonexistentToken`,
+`ERC721IncorrectOwner`...).
+
+```caju
+import "github.com/cajulang/web3/erc"
+
+erc.erc20_metadata(client, usdc, fn(m: *erc.TokenMeta, err: error) {
+  print(m.name, m.symbol, m.decimals)      # USD Coin USDC 6 (one eth_call, through Multicall3)
+})
+erc.erc20_balance_of(client, usdc, owner, fn(v: *web3.U256, err: error) { ... })
+
+data, err := erc.erc20_transfer_data(to, web3.must_u256("2500000"))       # 2.5 USDC
+w.send_transaction(&wallet.TxRequest{to_: usdc, data: data}, cb)           # browser wallet
+contracts.send_transaction_with_account(client, acct, usdc, data, nil, cb) # local account
+```
+
+| ERC-20 | |
+|---|---|
+| `erc20_balance_of(client, token, owner, cb fn(*web3.U256, error))` | |
+| `erc20_allowance(client, token, owner, spender, cb)`, `erc20_total_supply(client, token, cb)` | `*web3.U256` |
+| `erc20_decimals(client, token, cb fn(int, error))` | |
+| `erc20_name`, `erc20_symbol(client, token, cb fn(str, error))` | `string`, or `bytes32` for old tokens (MKR, SAI) |
+| `erc20_metadata(client, token, cb fn(*TokenMeta, error))` | `TokenMeta { address, name, symbol, decimals }` in one multicall (three calls without Multicall3); an error if `decimals()` fails |
+| `erc20_transfer_data(to, amount)`, `erc20_approve_data(spender, amount)`, `erc20_transfer_from_data(from_, to, amount)` | `(calldata, error)` |
+| `erc20(client, token) -> *contracts.Contract` | for anything else (`get_events(..., "Transfer", ...)`) |
+
+| ERC-721 | |
+|---|---|
+| `erc721_owner_of(client, token, id, cb fn(str, error))` | a nonexistent token reverts with `ERC721NonexistentToken(id)` |
+| `erc721_balance_of(client, token, owner, cb fn(*web3.U256, error))` | |
+| `erc721_token_uri(client, token, id, cb fn(str, error))` | as the contract answers it (`ipfs://`, `https://`, `data:`) |
+| `erc721_transfer_from_data(from_, to, id)`, `erc721_safe_transfer_from_data(from_, to, id, data)` | `data` `""`: the 3-argument overload |
+| `erc721_approve_data(to, id)`, `erc721_set_approval_for_all_data(operator, approved)` | |
+| `erc721(client, token) -> *contracts.Contract` | |
+
+Reads are `contracts` reads: a revert is a `*contracts.ContractError`.
+
+## web3/multicall
+
+Many reads in one `eth_call` through [Multicall3](https://www.multicall3.com) (`aggregate3`, with
+`allowFailure` per call), at the chain's `multicall3` address (an error on a chain without one).
+Long lists go in chunks of `multicall.CHUNK_SIZE` (500) calls, one `eth_call` after the other.
+
+```caju
+import "github.com/cajulang/web3/multicall"
+
+multicall.erc20_balances(client, owner, []str{usdc, usdt, dai}, fn(bs: []*web3.U256, err: error) {
+  # one per token, nil where the call failed (not a token, no contract)
+})
+multicall.get_eth_balances(client, []str{a, b}, fn(bs: []*web3.U256, err: error) { ... })
+
+c1, _ := multicall.call_of(usdc, erc.ERC20.function("symbol"), []any{}, true)
+c2 := &multicall.Call{target: dai, data: calldata, allow_failure: false}
+multicall.aggregate(client, []*multicall.Call{c1, c2}, "latest", fn(rs: []*multicall.Result, err: error) {
+  vals, err := multicall.decode_result(erc.ERC20.function("symbol"), rs[0])
+})
+```
+
+`Call { target, data, allow_failure }`, `Result { success, data }` (raw bytes; the revert data
+when it failed). A call with `allow_failure` false that fails makes the whole `eth_call` revert.
+Also: `aggregate_at(client, address, calls, block, chunk, cb)` (another Multicall3, another chunk
+size), `address_of(client)`, `encode_aggregate3(calls)`, `decode_aggregate3(data)` and the ABI
+(`MULTICALL3_ABI`, `MULTICALL3`).
+
+## web3/ens
+
+ENS names on Ethereum and Sepolia, through the ENS Universal Resolver (the chain's
+`ens_universal_resolver`): forward and reverse resolution, text records, wildcards and offchain
+names. The CCIP-read round trip (EIP-3668) is done here, including the local batch gateway
+(`x-batch-gateway:true`, ENSIP-21), so names like `jesse.base.eth` resolve too. Gateways are
+reached with fetch, through the client's `http_client` transport but without its headers.
+
+```caju
+import "github.com/cajulang/web3/ens"
+
+ens.resolve_address(client, "vitalik.eth", fn(addr: str, err: error) { ... })     # "0xd8dA..."; "" if none
+ens.lookup_name(client, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", fn(name: str, err: error) { ... })   # "vitalik.eth"
+ens.get_text(client, "vitalik.eth", "url", fn(v: str, err: error) { ... })
+ens.get_avatar_url(client, "vitalik.eth", fn(v: str, err: error) { ... })          # the record as it is
+
+web3.to_hex(ens.namehash("foo.eth"))   # "0xde9b09fd7c5f901e23a3f19fecc54828e9c848539801e86591bd9801b019f84f"
+```
+
+| | |
+|---|---|
+| `normalize(name) -> (str, error)` | ASCII names only (see below) |
+| `namehash(name)`, `labelhash(label)` | raw 32 bytes; a `[64 hex digits]` label is its hash |
+| `dns_encode(name)` | DNS wire format (labels over 255 bytes as `[labelhash]`) |
+| `resolve_address(client, name, cb fn(str, error))` | `addr(bytes32)`; `""` without a resolver or an address |
+| `lookup_name(client, address, cb fn(str, error))` | `name()` of `<addr>.addr.reverse`, kept only if it resolves back to the address |
+| `get_text(client, name, key, cb fn(str, error))`, `get_avatar_url(client, name, cb)` | `text(bytes32,string)`; `""` when unset |
+
+"Not found" is not an error: a name without a resolver, a resolver without that record, or an
+unset record gives `""` with a nil error; a resolver that reverts is an error with its decoded
+reason. **Normalization:** `normalize` lower-cases ASCII names and accepts labels of `a-z`, `0-9`,
+`-` and leading `_` (rejecting empty labels and `--` at positions 3-4). Full UTS-46 / ENSIP-15
+normalization (Unicode, emoji, confusables) is not implemented: names with non-ASCII characters
+are refused with an error instead of being hashed wrongly. `namehash`, `labelhash` and
+`dns_encode` take the name as given.

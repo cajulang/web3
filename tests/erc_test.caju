@@ -1,0 +1,181 @@
+# web3/erc against a mock node with fake ERC-20 and ERC-721 contracts.
+import { describe, it, expect } from "std/testing"
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/abi"
+import "github.com/cajulang/web3/chains"
+import "github.com/cajulang/web3/rpc"
+import "github.com/cajulang/web3/contracts"
+import "github.com/cajulang/web3/erc"
+import "./mocknode"
+
+let OWNER = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+let BOB = "0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B"
+let USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+let MKR = "0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2"
+let NFT = "0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D"
+
+fn node() -> *mocknode.Node {
+  m := mocknode.new_node()
+  m.add_token(USDC, &mocknode.Token{name: "USD Coin", symbol: "USDC", decimals: 6, supply: web3.must_u256("54000000000000000"), balances: map[str]*web3.U256{"0xd8da6bf26964af9d7eed9e03e53415d37aa96045": web3.u256(1234567)}})
+  m.add_token(MKR, &mocknode.Token{name: "Maker", symbol: "MKR", decimals: 18, bytes32_meta: true})
+  m.on_call(NFT, fn(data: str, from_: str) -> (str, error) {
+    fit, args, err := abi.decode_function_data(erc.ERC721, data)
+    if err != nil { return "", mocknode.revert("") }
+    switch fit.name {
+    case "ownerOf":
+      id := args[0].(*web3.U256)
+      if id.gt(web3.u256(9999)) {
+        e, _ := abi.encode_function_data(erc.ERC721.error_("ERC721NonexistentToken"), []any{id})
+        return "", mocknode.revert(e)
+      }
+      return mocknode.ret([]str{"address"}, []any{OWNER}), nil
+    case "balanceOf": return mocknode.ret([]str{"uint256"}, []any{3}), nil
+    case "tokenURI": return mocknode.ret([]str{"string"}, []any{"ipfs://QmeSjSinHpPnmXmspMjwiXyN6zS4E9zccariGR3jxcaWtq/" + args[0].(*web3.U256).dec()}), nil
+    }
+    return "", mocknode.revert("")
+  })
+  return m
+}
+
+describe("erc: ERC-20 reads", fn() {
+  it("reads balance, decimals, name, symbol, total supply and allowance", fn() {
+    c := node().client()
+    bal := ""
+    dec := 0
+    name := ""
+    sym := ""
+    supply := ""
+    allow := ""
+    erc.erc20_balance_of(c, USDC, OWNER, fn(v: *web3.U256, err: error) { bal = web3.format_units(v, 6) })
+    erc.erc20_decimals(c, USDC, fn(v: int, err: error) { dec = v })
+    erc.erc20_name(c, USDC, fn(v: str, err: error) { name = v })
+    erc.erc20_symbol(c, USDC, fn(v: str, err: error) { sym = v })
+    erc.erc20_total_supply(c, USDC, fn(v: *web3.U256, err: error) { supply = v.dec() })
+    erc.erc20_allowance(c, USDC, OWNER, BOB, fn(v: *web3.U256, err: error) { allow = v.dec() })
+    expect(bal).to_equal("1.234567")
+    expect(dec).to_equal(6)
+    expect(name).to_equal("USD Coin")
+    expect(sym).to_equal("USDC")
+    expect(supply).to_equal("54000000000000000")
+    expect(allow).to_equal("42")
+  })
+
+  it("reads bytes32 names and symbols (MKR)", fn() {
+    c := node().client()
+    sym := ""
+    name := ""
+    erc.erc20_symbol(c, MKR, fn(v: str, err: error) {
+      expect(err).to_be_nil()
+      sym = v
+    })
+    erc.erc20_name(c, MKR, fn(v: str, err: error) { name = v })
+    expect(sym).to_equal("MKR")
+    expect(name).to_equal("Maker")
+    s, err := erc.decode_string_or_bytes32(web3.pad_right("DAI", 32))
+    expect(err).to_be_nil()
+    expect(s).to_equal("DAI")
+    _, err2 := erc.decode_string_or_bytes32("abc")
+    expect(err2 == nil).to_be_false()
+  })
+
+  it("reads the metadata in one multicall", fn() {
+    m := node()
+    let got: *erc.TokenMeta = nil
+    erc.erc20_metadata(m.client(), "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", fn(t: *erc.TokenMeta, err: error) {
+      expect(err).to_be_nil()
+      got = t
+    })
+    expect(got.address).to_equal(USDC)
+    expect(got.name).to_equal("USD Coin")
+    expect(got.symbol).to_equal("USDC")
+    expect(got.decimals).to_equal(6)
+    expect(m.count("eth_call")).to_equal(1)
+    let mkr: *erc.TokenMeta = nil
+    erc.erc20_metadata(m.client(), MKR, fn(t: *erc.TokenMeta, err: error) { mkr = t })
+    expect(mkr.symbol).to_equal("MKR")
+    expect(mkr.decimals).to_equal(18)
+  })
+
+  it("reads the metadata call by call on a chain without Multicall3", fn() {
+    m := node()
+    m.chain = chains.define_chain(999999, "Nowhere", "ETH", "http://localhost:1")
+    m.chain.multicall3 = ""
+    let got: *erc.TokenMeta = nil
+    erc.erc20_metadata(m.client(), USDC, fn(t: *erc.TokenMeta, err: error) { got = t })
+    expect(got.symbol).to_equal("USDC")
+    expect(got.decimals).to_equal(6)
+    expect(m.count("eth_call")).to_equal(3)
+  })
+
+  it("says when an address is not a token", fn() {
+    m := node()
+    let e: error = nil
+    erc.erc20_metadata(m.client(), BOB, fn(t: *erc.TokenMeta, err: error) { e = err })
+    expect(e.Error()).to_contain("not an ERC-20")
+    let e2: error = nil
+    erc.erc20_metadata(m.client(), "0x1234", fn(t: *erc.TokenMeta, err: error) { e2 = err })
+    expect(e2.Error()).to_contain("invalid token address")
+    let e3: error = nil
+    erc.erc20_symbol(m.client(), BOB, fn(v: str, err: error) { e3 = err })
+    expect(e3.Error()).to_contain("returned no data")
+  })
+})
+
+describe("erc: calldata", fn() {
+  it("encodes ERC-20 transfer, approve and transferFrom", fn() {
+    t, err := erc.erc20_transfer_data(BOB, web3.u256(1000000))
+    expect(err).to_be_nil()
+    expect(web3.to_hex(t)).to_equal("0xa9059cbb000000000000000000000000ab5801a7d398351b8be11c439e05c5b3259aec9b00000000000000000000000000000000000000000000000000000000000f4240")
+    a, _ := erc.erc20_approve_data(BOB, web3.max_u256())
+    expect(web3.to_hex(a)).to_equal("0x095ea7b3000000000000000000000000ab5801a7d398351b8be11c439e05c5b3259aec9bffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+    f, _ := erc.erc20_transfer_from_data(OWNER, BOB, web3.u256(1))
+    expect(web3.to_hex(f[0:4])).to_equal("0x23b872dd")
+    _, berr := erc.erc20_transfer_data("0xnope", web3.u256(1))
+    expect(berr == nil).to_be_false()
+  })
+
+  it("encodes ERC-721 transfers", fn() {
+    a, _ := erc.erc721_transfer_from_data(OWNER, BOB, web3.u256(7))
+    b, _ := erc.erc721_safe_transfer_from_data(OWNER, BOB, web3.u256(7), "")
+    c, _ := erc.erc721_safe_transfer_from_data(OWNER, BOB, web3.u256(7), "hi")
+    d, _ := erc.erc721_approve_data(BOB, web3.u256(7))
+    e, _ := erc.erc721_set_approval_for_all_data(BOB, true)
+    expect(web3.to_hex(a[0:4])).to_equal("0x23b872dd")
+    expect(web3.to_hex(b[0:4])).to_equal("0x42842e0e")
+    expect(web3.to_hex(c[0:4])).to_equal("0xb88d4fde")
+    expect(len(b)).to_equal(4 + 96)
+    expect(len(c)).to_equal(4 + 32 * 6)
+    expect(web3.to_hex(d[0:4])).to_equal("0x095ea7b3")
+    expect(web3.to_hex(e[0:4])).to_equal("0xa22cb465")
+  })
+
+  it("has the OpenZeppelin 5 errors in the ABIs", fn() {
+    expect(web3.to_hex(abi.selector(erc.ERC20.error_("ERC20InsufficientBalance")))).to_equal("0xe450d38c")
+    expect(web3.to_hex(abi.selector(erc.ERC20.error_("ERC20InsufficientAllowance")))).to_equal("0xfb8f41b2")
+    expect(web3.to_hex(abi.selector(erc.ERC721.error_("ERC721NonexistentToken")))).to_equal("0x7e273289")
+  })
+})
+
+describe("erc: ERC-721 reads", fn() {
+  it("reads owner, balance and token URI", fn() {
+    c := node().client()
+    owner := ""
+    bal := ""
+    uri := ""
+    erc.erc721_owner_of(c, NFT, web3.u256(1), fn(v: str, err: error) { owner = v })
+    erc.erc721_balance_of(c, NFT, OWNER, fn(v: *web3.U256, err: error) { bal = v.dec() })
+    erc.erc721_token_uri(c, NFT, web3.u256(1), fn(v: str, err: error) { uri = v })
+    expect(owner).to_equal(OWNER)
+    expect(bal).to_equal("3")
+    expect(uri).to_equal("ipfs://QmeSjSinHpPnmXmspMjwiXyN6zS4E9zccariGR3jxcaWtq/1")
+  })
+
+  it("decodes ERC721NonexistentToken", fn() {
+    c := node().client()
+    let e: error = nil
+    erc.erc721_owner_of(c, NFT, web3.u256(10000), fn(v: str, err: error) { e = err })
+    ce := e.(*contracts.ContractError)
+    expect(ce.message).to_equal("ERC721NonexistentToken(10000)")
+    expect(rpc.is_revert(ce.cause)).to_be_true()
+  })
+})

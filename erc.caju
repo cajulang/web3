@@ -1,0 +1,289 @@
+# web3/erc: ERC-20 and ERC-721 tokens (import "github.com/cajulang/web3/erc").
+#
+#   erc.erc20_metadata(client, usdc, fn(m: *erc.TokenMeta, err: error) {
+#     print(m.symbol, m.decimals)                            # USDC 6
+#   })
+#   erc.erc20_balance_of(client, usdc, owner, fn(v: *web3.U256, err: error) {
+#     print(web3.format_units(v, 6))
+#   })
+#   data, err := erc.erc20_transfer_data(to, web3.must_u256("1000000"))   # calldata for a wallet or an account
+#   w.send_transaction(&wallet.TxRequest{to_: usdc, data: data}, fn(hash: str, err: error) { ... })
+#
+# ERC20 and ERC721 are the parsed ABIs (ERC20_ABI and ERC721_ABI the human-readable lines), with
+# OpenZeppelin 5's custom errors, so reverts read as ERC20InsufficientBalance(...). Reads go
+# through web3/contracts (a revert is a *contracts.ContractError). Tokens that answer name() and
+# symbol() with bytes32 instead of string (MKR, SAI...) are read too.
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/abi"
+import "github.com/cajulang/web3/rpc"
+import "github.com/cajulang/web3/contracts"
+import "github.com/cajulang/web3/multicall"
+
+export let ERC20_ABI = []str{
+  "function name() view returns (string)",
+  "function symbol() view returns (string)",
+  "function decimals() view returns (uint8)",
+  "function totalSupply() view returns (uint256)",
+  "function balanceOf(address account) view returns (uint256)",
+  "function allowance(address owner, address spender) view returns (uint256)",
+  "function transfer(address to, uint256 value) returns (bool)",
+  "function approve(address spender, uint256 value) returns (bool)",
+  "function transferFrom(address from, address to, uint256 value) returns (bool)",
+  "event Transfer(address indexed from, address indexed to, uint256 value)",
+  "event Approval(address indexed owner, address indexed spender, uint256 value)",
+  "error ERC20InsufficientBalance(address sender, uint256 balance, uint256 needed)",
+  "error ERC20InvalidSender(address sender)",
+  "error ERC20InvalidReceiver(address receiver)",
+  "error ERC20InsufficientAllowance(address spender, uint256 allowance, uint256 needed)",
+  "error ERC20InvalidApprover(address approver)",
+  "error ERC20InvalidSpender(address spender)",
+}
+
+export let ERC721_ABI = []str{
+  "function name() view returns (string)",
+  "function symbol() view returns (string)",
+  "function tokenURI(uint256 tokenId) view returns (string)",
+  "function balanceOf(address owner) view returns (uint256)",
+  "function ownerOf(uint256 tokenId) view returns (address)",
+  "function getApproved(uint256 tokenId) view returns (address)",
+  "function isApprovedForAll(address owner, address operator) view returns (bool)",
+  "function supportsInterface(bytes4 interfaceId) view returns (bool)",
+  "function approve(address to, uint256 tokenId)",
+  "function setApprovalForAll(address operator, bool approved)",
+  "function transferFrom(address from, address to, uint256 tokenId)",
+  "function safeTransferFrom(address from, address to, uint256 tokenId)",
+  "function safeTransferFrom(address from, address to, uint256 tokenId, bytes data)",
+  "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)",
+  "event Approval(address indexed owner, address indexed approved, uint256 indexed tokenId)",
+  "event ApprovalForAll(address indexed owner, address indexed operator, bool approved)",
+  "error ERC721InvalidOwner(address owner)",
+  "error ERC721NonexistentToken(uint256 tokenId)",
+  "error ERC721IncorrectOwner(address sender, uint256 tokenId, address owner)",
+  "error ERC721InvalidSender(address sender)",
+  "error ERC721InvalidReceiver(address receiver)",
+  "error ERC721InsufficientApproval(address operator, uint256 tokenId)",
+  "error ERC721InvalidApprover(address approver)",
+  "error ERC721InvalidOperator(address operator)",
+}
+
+export let ERC20 = abi.must_human(ERC20_ABI)
+export let ERC721 = abi.must_human(ERC721_ABI)
+
+# an ERC-20 token's description
+export struct TokenMeta {
+  address: str
+  name: str
+  symbol: str
+  decimals: int
+}
+
+fn err_(msg: str) -> error { return errors.New("erc: " + msg) }
+
+# the ERC-20 token at address, as a contract
+export fn erc20(client: *rpc.Client, token: str) -> *contracts.Contract { return contracts.contract(token, ERC20, client) }
+
+# the ERC-721 collection at address, as a contract
+export fn erc721(client: *rpc.Client, token: str) -> *contracts.Contract { return contracts.contract(token, ERC721, client) }
+
+# ---------------------------------------------------------------- decoding helpers
+
+# a string result, or a bytes32 one (old tokens: MKR, SAI) up to its first zero byte
+export fn decode_string_or_bytes32(data: str) -> (str, error) {
+  vals, err := abi.decode_types([]str{"string"}, data)
+  if err == nil { return vals[0].(str), nil }
+  if len(data) == 32 {
+    n := 0
+    while n < 32 && int(data[n]) != 0 { n++ }
+    return data[0:n], nil
+  }
+  return "", err_("not a string nor a bytes32: " + web3.to_hex(data))
+}
+
+fn u256_cb(c: *contracts.Contract, fn_name: str, args: []any, cb: fn(*web3.U256, error)) -> fn() {
+  return c.read(fn_name, args, fn(vals: []any, err: error) {
+    if err != nil {
+      cb(nil, err)
+      return
+    }
+    cb(vals[0].(*web3.U256), nil)
+  })
+}
+
+# a name()/symbol() read that accepts bytes32 answers
+fn string_call(client: *rpc.Client, token: str, fn_name: str, cb: fn(str, error)) -> fn() {
+  it := ERC20.function(fn_name)
+  data, _ := abi.encode_function_data(it, []any{})
+  return client.call(&rpc.CallRequest{to_: token, data: data}, "latest", fn(out: str, err: error) {
+    if err != nil {
+      cb("", contracts.contract_error(ERC20, fn_name, token, err))
+      return
+    }
+    if len(out) == 0 {
+      cb("", err_(fn_name + " returned no data (is there a token at " + token + " on this chain?)"))
+      return
+    }
+    s, derr := decode_string_or_bytes32(out)
+    cb(s, derr)
+  })
+}
+
+# ---------------------------------------------------------------- ERC-20 reads
+
+# the token balance of owner (in the token's smallest unit: web3.format_units(v, decimals))
+export fn erc20_balance_of(client: *rpc.Client, token: str, owner: str, cb: fn(*web3.U256, error)) -> fn() {
+  return u256_cb(erc20(client, token), "balanceOf", []any{owner}, cb)
+}
+
+# how many tokens spender may still move for owner
+export fn erc20_allowance(client: *rpc.Client, token: str, owner: str, spender: str, cb: fn(*web3.U256, error)) -> fn() {
+  return u256_cb(erc20(client, token), "allowance", []any{owner, spender}, cb)
+}
+
+export fn erc20_total_supply(client: *rpc.Client, token: str, cb: fn(*web3.U256, error)) -> fn() {
+  return u256_cb(erc20(client, token), "totalSupply", []any{}, cb)
+}
+
+export fn erc20_decimals(client: *rpc.Client, token: str, cb: fn(int, error)) -> fn() {
+  return erc20(client, token).read("decimals", []any{}, fn(vals: []any, err: error) {
+    if err != nil {
+      cb(0, err)
+      return
+    }
+    n, _ := vals[0].(*web3.U256).to_int()
+    cb(n, nil)
+  })
+}
+
+export fn erc20_name(client: *rpc.Client, token: str, cb: fn(str, error)) -> fn() {
+  return string_call(client, token, "name", cb)
+}
+
+export fn erc20_symbol(client: *rpc.Client, token: str, cb: fn(str, error)) -> fn() {
+  return string_call(client, token, "symbol", cb)
+}
+
+# name, symbol and decimals in one eth_call (Multicall3). A token without name() or symbol() gets
+# "" for it; without decimals() it is an error. On a chain without Multicall3: three calls
+export fn erc20_metadata(client: *rpc.Client, token: str, cb: fn(*TokenMeta, error)) -> fn() {
+  if !web3.is_address(token) {
+    cb(nil, err_("invalid token address " + token))
+    return nil
+  }
+  _, merr := multicall.address_of(client)
+  if merr != nil { return metadata_one_by_one(client, token, cb) }
+  calls := []*multicall.Call{}
+  for _, f := range []str{"name", "symbol", "decimals"} {
+    c, _ := multicall.call_of(token, ERC20.function(f), []any{}, true)
+    calls = append(calls, c)
+  }
+  return multicall.aggregate(client, calls, "latest", fn(rs: []*multicall.Result, err: error) {
+    if err != nil {
+      cb(nil, err)
+      return
+    }
+    m := &TokenMeta{address: web3.checksum_address(token)}
+    if rs[0].success {
+      nm, _ := decode_string_or_bytes32(rs[0].data)
+      m.name = nm
+    }
+    if rs[1].success {
+      sy, _ := decode_string_or_bytes32(rs[1].data)
+      m.symbol = sy
+    }
+    vals, derr := multicall.decode_result(ERC20.function("decimals"), rs[2])
+    if derr != nil {
+      cb(nil, err_(token + " is not an ERC-20 token (decimals() failed)"))
+      return
+    }
+    dec, _ := vals[0].(*web3.U256).to_int()
+    m.decimals = dec
+    cb(m, nil)
+  })
+}
+
+fn metadata_one_by_one(client: *rpc.Client, token: str, cb: fn(*TokenMeta, error)) -> fn() {
+  m := &TokenMeta{address: web3.checksum_address(token)}
+  return erc20_decimals(client, token, fn(d: int, err: error) {
+    if err != nil {
+      cb(nil, err)
+      return
+    }
+    m.decimals = d
+    erc20_name(client, token, fn(n: str, nerr: error) {
+      m.name = n
+      erc20_symbol(client, token, fn(s: str, serr: error) {
+        m.symbol = s
+        cb(m, nil)
+      })
+    })
+  })
+}
+
+# ---------------------------------------------------------------- ERC-20 calldata
+
+# the calldata (raw bytes) of transfer(to, amount): send it to the token's address with a wallet
+# (wallet.TxRequest{to_: token, data: data}) or an account (contracts.send_transaction_with_account)
+export fn erc20_transfer_data(to_: str, amount: *web3.U256) -> (str, error) {
+  return abi.encode_function_data(ERC20.function("transfer"), []any{to_, amount})
+}
+
+# the calldata of approve(spender, amount)
+export fn erc20_approve_data(spender: str, amount: *web3.U256) -> (str, error) {
+  return abi.encode_function_data(ERC20.function("approve"), []any{spender, amount})
+}
+
+# the calldata of transferFrom(from_, to, amount)
+export fn erc20_transfer_from_data(from_: str, to_: str, amount: *web3.U256) -> (str, error) {
+  return abi.encode_function_data(ERC20.function("transferFrom"), []any{from_, to_, amount})
+}
+
+# ---------------------------------------------------------------- ERC-721
+
+# the owner of token_id (a revert, ERC721NonexistentToken, for a token that does not exist)
+export fn erc721_owner_of(client: *rpc.Client, token: str, token_id: *web3.U256, cb: fn(str, error)) -> fn() {
+  return erc721(client, token).read("ownerOf", []any{token_id}, fn(vals: []any, err: error) {
+    if err != nil {
+      cb("", err)
+      return
+    }
+    cb(vals[0].(str), nil)
+  })
+}
+
+# how many tokens of the collection owner has
+export fn erc721_balance_of(client: *rpc.Client, token: str, owner: str, cb: fn(*web3.U256, error)) -> fn() {
+  return u256_cb(erc721(client, token), "balanceOf", []any{owner}, cb)
+}
+
+# the metadata URI of token_id (as the contract answers it: ipfs://, https://, data:...)
+export fn erc721_token_uri(client: *rpc.Client, token: str, token_id: *web3.U256, cb: fn(str, error)) -> fn() {
+  return erc721(client, token).read("tokenURI", []any{token_id}, fn(vals: []any, err: error) {
+    if err != nil {
+      cb("", err)
+      return
+    }
+    cb(vals[0].(str), nil)
+  })
+}
+
+# the calldata of transferFrom(from_, to, token_id)
+export fn erc721_transfer_from_data(from_: str, to_: str, token_id: *web3.U256) -> (str, error) {
+  return abi.encode_function_data(ERC721.function("transferFrom"), []any{from_, to_, token_id})
+}
+
+# the calldata of safeTransferFrom(from_, to, token_id) or, with data (raw bytes), of
+# safeTransferFrom(from_, to, token_id, data)
+export fn erc721_safe_transfer_from_data(from_: str, to_: str, token_id: *web3.U256, data: str) -> (str, error) {
+  if data == "" { return abi.encode_function_data(ERC721.function("safeTransferFrom(address,address,uint256)"), []any{from_, to_, token_id}) }
+  return abi.encode_function_data(ERC721.function("safeTransferFrom(address,address,uint256,bytes)"), []any{from_, to_, token_id, data})
+}
+
+# the calldata of approve(to, token_id)
+export fn erc721_approve_data(to_: str, token_id: *web3.U256) -> (str, error) {
+  return abi.encode_function_data(ERC721.function("approve"), []any{to_, token_id})
+}
+
+# the calldata of setApprovalForAll(operator, approved)
+export fn erc721_set_approval_for_all_data(operator: str, approved: bool) -> (str, error) {
+  return abi.encode_function_data(ERC721.function("setApprovalForAll"), []any{operator, approved})
+}

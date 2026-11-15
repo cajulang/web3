@@ -1,0 +1,564 @@
+# web3/contracts: a contract through its ABI (import "github.com/cajulang/web3/contracts").
+#
+#   token := contracts.contract(usdc, erc.ERC20, client)
+#   token.read("balanceOf", []any{owner}, fn(vals: []any, err: error) {
+#     if ce, ok := err.(*contracts.ContractError); ok { print(ce.message); return }   # a revert
+#     print(vals[0].(*web3.U256).dec())
+#   })
+#   contracts.write_with_account(token, acct, "transfer", []any{to, amount}, nil, fn(hash: str, err: error) { ... })
+#   contracts.write_with_wallet(token, w, "transfer", []any{to, amount}, nil, fn(hash: str, err: error) { ... })
+#
+# Reads are eth_call; simulate is an eth_call from an account (with value); writes are sent by a
+# local account (accounts.Account: nonce, gas, EIP-1559 fees, signed here, eth_sendRawTransaction)
+# or by the browser wallet (wallet.WalletClient: eth_sendTransaction, the wallet fills the rest).
+# A revert is a *ContractError, decoded with the contract's ABI (its custom errors, Error(string)
+# and Panic(uint256)). Values are as in web3/abi; callbacks as in web3/rpc (last, called once,
+# a cancel function returned).
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/abi"
+import "github.com/cajulang/web3/rpc"
+import "github.com/cajulang/web3/accounts"
+import "github.com/cajulang/web3/wallet"
+import "std/strings"
+
+# ---------------------------------------------------------------- types
+
+# a deployed contract: its address, ABI and the client that reads it
+export struct Contract {
+  address: str
+  abi: *abi.Abi
+  client: *rpc.Client
+}
+
+# the contract at address with ABI a, read through client
+export fn contract(address: str, a: *abi.Abi, client: *rpc.Client) -> *Contract {
+  return &Contract{address: address, abi: a, client: client}
+}
+
+# how a write (or simulate / estimate_gas) is sent. Everything is optional: left empty, from_ is
+# the account's (or the wallet's) address, gas is estimated (+20%), fees come from
+# rpc.estimate_fees_per_gas and the nonce from eth_getTransactionCount("pending")
+export struct WriteOptions {
+  from_: str                        # simulate / estimate_gas: the sender ("from" is a keyword)
+  value: *web3.U256                 # wei sent along (payable functions)
+  gas: int                          # 0: estimate
+  max_fee_per_gas: *web3.U256
+  max_priority_fee_per_gas: *web3.U256
+  gas_price: *web3.U256             # set: a legacy transaction with this gas price
+  nonce: *web3.U256                 # nil: the next one
+  block: str                        # simulate: the block ("" : "latest")
+}
+
+# a call that reverted. name is the error ("ERC20InsufficientBalance", "Error", "Panic"; "" when
+# the data is missing or unknown), args its decoded values, data the revert data (raw bytes) and
+# message a readable form: ERC20InsufficientBalance(0xf39F..., 0, 100), Error("not owner"),
+# Panic(0x11: arithmetic underflow or overflow)
+export struct ContractError {
+  name: str
+  args: []any
+  data: str
+  message: str
+  function: str                     # the contract function that was called ("" for a plain transfer)
+  address: str
+  cause: error                      # the node's error (*rpc.RpcError)
+}
+
+export fn (e: *ContractError) Error() -> str {
+  what := "contracts: "
+  if e.function != "" { what = what + e.function + " " }
+  return what + "reverted: " + e.message
+}
+
+# an event log decoded with the contract's ABI: the event's name and its fields by name (unnamed
+# ones by position; indexed bytes, strings, arrays and tuples are their 32-byte hash)
+export struct DecodedLog {
+  name: str
+  args: map[str]any
+  log: *rpc.Log
+}
+
+fn err_(msg: str) -> error { return errors.New("contracts: " + msg) }
+
+fn run0(f: fn()) { f() }
+
+# ---------------------------------------------------------------- readable errors
+
+fn is_digit(c: int) -> bool { return c >= '0' && c <= '9' }
+
+# the element parameter of an array parameter ("uint256[2][]" -> "uint256[2]")
+fn elem_param(p: *abi.Param) -> *abi.Param {
+  i := strings.last_index(p.type, "[")
+  return &abi.Param{type: p.type[0:i], components: p.components}
+}
+
+# a decoded value as Solidity would write it, for messages
+export fn format_value(p: *abi.Param, v: any) -> str {
+  t := p.type
+  if strings.has_suffix(t, "]") {
+    items, ok := v.([]any)
+    if !ok { return str(v) }
+    ep := elem_param(p)
+    parts := []str{}
+    for _, x := range items { parts = append(parts, format_value(ep, x)) }
+    return "[" + strings.join(parts, ", ") + "]"
+  }
+  if t == "tuple" {
+    vals, ok2 := v.([]any)
+    if !ok2 { return str(v) }
+    parts2 := []str{}
+    for i, x2 := range vals {
+      if i < len(p.components) { parts2 = append(parts2, format_value(p.components[i], x2)) } else { parts2 = append(parts2, str(x2)) }
+    }
+    return "(" + strings.join(parts2, ", ") + ")"
+  }
+  switch x3 := v.(type) {
+  case *web3.U256:
+    if x3 == nil { return "nil" }
+    if strings.has_prefix(t, "int") { return x3.signed_dec() }
+    return x3.dec()
+  case str:
+    if t == "string" { return "\"" + x3 + "\"" }
+    if t == "address" { return x3 }
+    return web3.to_hex(x3)
+  case bool:
+    if x3 { return "true" }
+    return "false"
+  }
+  return str(v)
+}
+
+# "Name(arg, arg)" for an error item and its values
+fn format_call(it: *abi.Item, args: []any) -> str {
+  parts := []str{}
+  for i, v := range args {
+    if i < len(it.inputs) { parts = append(parts, format_value(it.inputs[i], v)) } else { parts = append(parts, str(v)) }
+  }
+  return it.name + "(" + strings.join(parts, ", ") + ")"
+}
+
+# the error item named name with n inputs in a (nil if none)
+fn error_item(a: *abi.Abi, name: str, n: int) -> *abi.Item {
+  if a == nil { return nil }
+  for _, it := range a.items {
+    if it.kind == "error" && it.name == name && len(it.inputs) == n { return it }
+  }
+  return nil
+}
+
+# a *ContractError for revert data (raw bytes), decoded with a (which may be nil)
+export fn decode_revert(a: *abi.Abi, data: str) -> *ContractError {
+  ce := &ContractError{data: data, args: []any{}}
+  if len(data) == 0 {
+    ce.message = "execution reverted (no data)"
+    return ce
+  }
+  name, args, err := abi.decode_error_result(a, data)
+  if err != nil {
+    if len(data) >= 4 {
+      ce.message = "unknown error " + web3.to_hex(data[0:4])
+    } else {
+      ce.message = "invalid revert data " + web3.to_hex(data)
+    }
+    return ce
+  }
+  ce.name = name
+  ce.args = args
+  if name == "Error" && len(args) == 1 {
+    ce.message = "Error(\"" + args[0].(str) + "\")"
+  } else if name == "Panic" && len(args) == 1 {
+    code, _ := args[0].(*web3.U256).to_int()
+    ce.message = "Panic(" + args[0].(*web3.U256).hex() + ": " + abi.panic_reason(code) + ")"
+  } else {
+    it := error_item(a, name, len(args))
+    if it == nil {
+      ce.message = name
+    } else {
+      ce.message = format_call(it, args)
+    }
+  }
+  return ce
+}
+
+# err as a *ContractError when it is a revert; other errors as they are
+export fn contract_error(a: *abi.Abi, function: str, address: str, err: error) -> error {
+  if err == nil { return nil }
+  data, ok := rpc.revert_data(err)
+  if !ok && !rpc.is_revert(err) { return err }
+  ce := decode_revert(a, data)
+  if !ok {
+    if re, isrpc := err.(*rpc.RpcError); isrpc && re.message != "" { ce.message = re.message }
+  }
+  ce.function = function
+  ce.address = address
+  ce.cause = err
+  return ce
+}
+
+# ---------------------------------------------------------------- calldata
+
+# the function called name taking nargs arguments: a signature ("transfer(address,uint256)")
+# picks one overload; a bare name the first with that many inputs (or the first with that name)
+export fn (c: *Contract) function(name: str, nargs: int) -> (*abi.Item, error) {
+  if c.abi == nil { return nil, err_("the contract has no ABI") }
+  if !strings.contains(name, "(") {
+    for _, it := range c.abi.items {
+      if it.kind == "function" && it.name == name && len(it.inputs) == nargs { return it, nil }
+    }
+  }
+  it2 := c.abi.function(name)
+  if it2 == nil { return nil, err_("no function " + name + " in the ABI") }
+  return it2, nil
+}
+
+# the calldata (raw bytes) of a call of fn_name with args: what a write sends
+export fn (c: *Contract) encode_write(fn_name: str, args: []any) -> (str, error) {
+  it, err := c.function(fn_name, len(args))
+  if err != nil { return "", err }
+  return abi.encode_function_data(it, args)
+}
+
+fn (c: *Contract) decode_output(it: *abi.Item, out: str) -> ([]any, error) {
+  if len(out) == 0 && len(it.outputs) > 0 {
+    return nil, err_(it.name + " returned no data (is there a contract at " + c.address + " on this chain?)")
+  }
+  return abi.decode_function_result(it, out)
+}
+
+fn (c: *Contract) call_request(data: str, opts: *WriteOptions) -> *rpc.CallRequest {
+  req := &rpc.CallRequest{to_: c.address, data: data}
+  if opts != nil {
+    req.from_ = opts.from_
+    req.value = opts.value
+    req.gas = opts.gas
+  }
+  return req
+}
+
+# ---------------------------------------------------------------- reads
+
+# calls the view function fn_name with args (eth_call at "latest"); cb gets its return values
+export fn (c: *Contract) read(fn_name: str, args: []any, cb: fn([]any, error)) -> fn() {
+  return c.simulate(fn_name, args, nil, cb)
+}
+
+# runs fn_name with args as opts.from_ would (eth_call, with value and gas), without sending a
+# transaction: cb gets what it would return, or the *ContractError it would revert with
+export fn (c: *Contract) simulate(fn_name: str, args: []any, opts: *WriteOptions, cb: fn([]any, error)) -> fn() {
+  it, err := c.function(fn_name, len(args))
+  if err != nil {
+    cb(nil, err)
+    return nil
+  }
+  data, eerr := abi.encode_function_data(it, args)
+  if eerr != nil {
+    cb(nil, eerr)
+    return nil
+  }
+  block := ""
+  if opts != nil { block = opts.block }
+  return c.client.call(c.call_request(data, opts), block, fn(out: str, cerr: error) {
+    if cerr != nil {
+      cb(nil, contract_error(c.abi, it.name, c.address, cerr))
+      return
+    }
+    vals, derr := c.decode_output(it, out)
+    cb(vals, derr)
+  })
+}
+
+# the gas a call of fn_name would use (eth_estimateGas, from opts.from_ with opts.value)
+export fn (c: *Contract) estimate_gas(fn_name: str, args: []any, opts: *WriteOptions, cb: fn(*web3.U256, error)) -> fn() {
+  it, err := c.function(fn_name, len(args))
+  if err != nil {
+    cb(nil, err)
+    return nil
+  }
+  data, eerr := abi.encode_function_data(it, args)
+  if eerr != nil {
+    cb(nil, eerr)
+    return nil
+  }
+  req := c.call_request(data, opts)
+  req.gas = 0
+  return c.client.estimate_gas(req, fn(g: *web3.U256, gerr: error) {
+    if gerr != nil {
+      cb(nil, contract_error(c.abi, it.name, c.address, gerr))
+      return
+    }
+    cb(g, nil)
+  })
+}
+
+# ---------------------------------------------------------------- writes with a local account
+
+struct Flow {
+  canceled: bool
+  finished: bool
+  abort: fn()
+}
+
+fn (f: *Flow) track(a: fn()) {
+  if a != nil && !f.canceled && !f.finished { f.abort = a }
+}
+
+fn (f: *Flow) cancel_fn() -> fn() {
+  return fn() {
+    if f.canceled || f.finished { return }
+    f.canceled = true
+    if f.abort != nil { run0(f.abort) }
+  }
+}
+
+# the chain id: the client's chain, or eth_chainId
+fn chain_id_of(client: *rpc.Client, cb: fn(int, error)) -> fn() {
+  if client.chain != nil && client.chain.id > 0 {
+    cb(client.chain.id, nil)
+    return nil
+  }
+  return client.chain_id(cb)
+}
+
+# the nonce: opts.nonce, or eth_getTransactionCount(pending)
+fn nonce_of(client: *rpc.Client, address: str, o: *WriteOptions, cb: fn(int, error)) -> fn() {
+  if o.nonce != nil {
+    n, ok := o.nonce.to_int()
+    if !ok {
+      cb(0, err_("nonce out of range"))
+      return nil
+    }
+    cb(n, nil)
+    return nil
+  }
+  return client.get_transaction_count(address, "pending", cb)
+}
+
+# the gas limit: opts.gas, or the estimate plus 20%
+fn gas_of(client: *rpc.Client, req: *rpc.CallRequest, o: *WriteOptions, cb: fn(int, error)) -> fn() {
+  if o.gas > 0 {
+    cb(o.gas, nil)
+    return nil
+  }
+  return client.estimate_gas(req, fn(g: *web3.U256, err: error) {
+    if err != nil {
+      cb(0, err)
+      return
+    }
+    n, ok := g.to_int()
+    if !ok {
+      cb(0, err_("gas estimate out of range: " + g.dec()))
+      return
+    }
+    cb(n + n / 5, nil)
+  })
+}
+
+# the fees: from opts when given, else rpc.estimate_fees_per_gas (base_fee nil: a legacy chain)
+fn fees_of(client: *rpc.Client, o: *WriteOptions, cb: fn(*rpc.Fees, error)) -> fn() {
+  if o.gas_price != nil {
+    cb(&rpc.Fees{max_fee_per_gas: o.gas_price, max_priority_fee_per_gas: o.gas_price}, nil)
+    return nil
+  }
+  if o.max_fee_per_gas != nil && o.max_priority_fee_per_gas != nil {
+    cb(&rpc.Fees{base_fee: web3.zero(), max_fee_per_gas: o.max_fee_per_gas, max_priority_fee_per_gas: o.max_priority_fee_per_gas}, nil)
+    return nil
+  }
+  return client.estimate_fees_per_gas(fn(f: *rpc.Fees, err: error) {
+    if err != nil {
+      cb(nil, err)
+      return
+    }
+    if o.max_fee_per_gas != nil { f.max_fee_per_gas = o.max_fee_per_gas }
+    if o.max_priority_fee_per_gas != nil { f.max_priority_fee_per_gas = o.max_priority_fee_per_gas }
+    if f.max_priority_fee_per_gas.gt(f.max_fee_per_gas) { f.max_priority_fee_per_gas = f.max_fee_per_gas }
+    cb(f, nil)
+  })
+}
+
+# the transaction to sign
+fn build_tx(chain_id: int, nonce: int, gas: int, f: *rpc.Fees, o: *WriteOptions, to_: str, value: *web3.U256, data: str) -> *accounts.Transaction {
+  tx := &accounts.Transaction{chain_id: chain_id, nonce: nonce, gas: gas, to_: to_, value: value, data: data}
+  if f.base_fee == nil || o.gas_price != nil {
+    tx.type_ = accounts.TX_LEGACY
+    tx.gas_price = f.max_fee_per_gas
+  } else {
+    tx.type_ = accounts.TX_EIP1559
+    tx.max_fee_per_gas = f.max_fee_per_gas
+    tx.max_priority_fee_per_gas = f.max_priority_fee_per_gas
+  }
+  return tx
+}
+
+# signs a transaction from acct and sends it; a revert while estimating gas becomes a
+# *ContractError decoded with a (which may be nil)
+fn send_tx(client: *rpc.Client, acct: *accounts.Account, to_: str, data: str, a: *abi.Abi, fn_name: str, opts: *WriteOptions, cb: fn(str, error)) -> fn() {
+  if client == nil || acct == nil {
+    cb("", err_("nil client or account"))
+    return nil
+  }
+  o := &WriteOptions{}
+  if opts != nil { *o = *opts }
+  value := o.value
+  fl := &Flow{}
+  done := fn(hash: str, err: error) {
+    if fl.canceled || fl.finished { return }
+    fl.finished = true
+    cb(hash, err)
+  }
+  req := &rpc.CallRequest{from_: acct.address, to_: to_, data: data, value: value}
+  fl.track(chain_id_of(client, fn(chain_id: int, err: error) {
+    if err != nil {
+      done("", err)
+      return
+    }
+    fl.track(nonce_of(client, acct.address, o, fn(nonce: int, nerr: error) {
+      if nerr != nil {
+        done("", nerr)
+        return
+      }
+      fl.track(gas_of(client, req, o, fn(gas: int, gerr: error) {
+        if gerr != nil {
+          done("", contract_error(a, fn_name, to_, gerr))
+          return
+        }
+        fl.track(fees_of(client, o, fn(f: *rpc.Fees, ferr: error) {
+          if ferr != nil {
+            done("", ferr)
+            return
+          }
+          tx := build_tx(chain_id, nonce, gas, f, o, to_, value, data)
+          raw, serr := acct.sign_transaction(tx)
+          if serr != nil {
+            done("", serr)
+            return
+          }
+          fl.track(client.send_raw_transaction(raw, done))
+        }))
+      }))
+    }))
+  }))
+  return fl.cancel_fn()
+}
+
+# calls fn_name with args in a transaction signed by acct (a local account) and sent with
+# eth_sendRawTransaction; cb gets the transaction hash (wait for it with
+# client.wait_for_transaction_receipt)
+export fn write_with_account(c: *Contract, acct: *accounts.Account, fn_name: str, args: []any, opts: *WriteOptions, cb: fn(str, error)) -> fn() {
+  it, err := c.function(fn_name, len(args))
+  if err != nil {
+    cb("", err)
+    return nil
+  }
+  data, eerr := abi.encode_function_data(it, args)
+  if eerr != nil {
+    cb("", eerr)
+    return nil
+  }
+  return send_tx(c.client, acct, c.address, data, c.abi, it.name, opts, cb)
+}
+
+# signs a transaction from acct to to (data: raw calldata; to "" with data: a contract creation)
+# and sends it with eth_sendRawTransaction, filling in the chain id (the client's chain, or
+# eth_chainId), nonce (pending), gas (eth_estimateGas + 20%) and EIP-1559 fees
+# (rpc.estimate_fees_per_gas; a legacy gas price on chains without a base fee) unless opts gives
+# them; cb gets the transaction hash
+export fn send_transaction_with_account(client: *rpc.Client, acct: *accounts.Account, to_: str, data: str, opts: *WriteOptions, cb: fn(str, error)) -> fn() {
+  return send_tx(client, acct, to_, data, nil, "", opts, cb)
+}
+
+# sends value wei of the chain's coin from acct to to (see send_transaction_with_account); cb gets
+# the transaction hash. In the browser the wallet does it:
+# w.send_transaction(&wallet.TxRequest{to_: to, value: value}, cb)
+export fn send_value_with_account(client: *rpc.Client, acct: *accounts.Account, to_: str, value: *web3.U256, cb: fn(str, error)) -> fn() {
+  if !web3.is_address(to_) {
+    cb("", err_("invalid address " + to_))
+    return nil
+  }
+  return send_tx(client, acct, to_, "", nil, "", &WriteOptions{value: value}, cb)
+}
+
+# ---------------------------------------------------------------- writes with the browser wallet
+
+# asks the browser wallet w to call fn_name with args (eth_sendTransaction): the wallet fills in
+# what opts leaves empty (from_: its connected address); cb gets the transaction hash
+export fn write_with_wallet(c: *Contract, w: *wallet.WalletClient, fn_name: str, args: []any, opts: *WriteOptions, cb: fn(str, error)) -> fn() {
+  data, err := c.encode_write(fn_name, args)
+  if err != nil {
+    cb("", err)
+    return nil
+  }
+  tx := &wallet.TxRequest{to_: c.address, data: data}
+  if opts != nil {
+    tx.from_ = opts.from_
+    tx.value = opts.value
+    if opts.gas > 0 { tx.gas = web3.u256(opts.gas) }
+    tx.max_fee_per_gas = opts.max_fee_per_gas
+    tx.max_priority_fee_per_gas = opts.max_priority_fee_per_gas
+    tx.nonce = opts.nonce
+  }
+  return w.send_transaction(tx, cb)
+}
+
+# ---------------------------------------------------------------- events
+
+# the filter for event_name ("" : every log of the contract) with indexed args by name (a
+# missing or nil value matches anything)
+export fn (c: *Contract) event_filter(event_name: str, args: map[str]any, from_block: str, to_block: str) -> (*rpc.LogFilter, error) {
+  f := &rpc.LogFilter{address: []str{c.address}, from_block: from_block, to_block: to_block}
+  if event_name == "" { return f, nil }
+  it := c.abi.event(event_name)
+  if it == nil { return nil, err_("no event " + event_name + " in the ABI") }
+  if args == nil { args = map[str]any{} }
+  topics, err := abi.encode_event_topics(it, args)
+  if err != nil { return nil, err }
+  f.topics = [][]str{}
+  for _, t := range topics {
+    if t == "" {
+      f.topics = append(f.topics, []str{})
+    } else {
+      f.topics = append(f.topics, []str{t})
+    }
+  }
+  return f, nil
+}
+
+# the logs decoded with the contract's ABI (logs of events not in it are left out)
+export fn (c: *Contract) decode_logs(logs: []*rpc.Log) -> []*DecodedLog {
+  out := []*DecodedLog{}
+  for _, l := range logs {
+    it, m, err := abi.decode_event_log(c.abi, &abi.Log{address: l.address, topics: l.topics, data: l.data})
+    if err != nil { continue }
+    out = append(out, &DecodedLog{name: it.name, args: m, log: l})
+  }
+  return out
+}
+
+# the contract's event_name logs ("" : all its events) between from_block and to_block ("" :
+# "latest"; rpc.quantity_int(n) for a number), filtered by indexed args by name
+export fn get_events(c: *Contract, event_name: str, args: map[str]any, from_block: str, to_block: str, cb: fn([]*DecodedLog, error)) -> fn() {
+  f, err := c.event_filter(event_name, args, from_block, to_block)
+  if err != nil {
+    cb(nil, err)
+    return nil
+  }
+  return c.client.get_logs(f, fn(logs: []*rpc.Log, lerr: error) {
+    if lerr != nil {
+      cb(nil, lerr)
+      return
+    }
+    cb(c.decode_logs(logs), nil)
+  })
+}
+
+# calls on_logs with the contract's new event_name logs as they come (rpc.watch_event: polling;
+# see rpc.WatchOptions for where it blocks)
+export fn watch_contract_event(c: *Contract, event_name: str, args: map[str]any, opts: *rpc.WatchOptions, on_logs: fn([]*DecodedLog), on_error: fn(error)) -> fn() {
+  f, err := c.event_filter(event_name, args, "", "")
+  if err != nil {
+    if on_error != nil { on_error(err) }
+    return fn() {}
+  }
+  return c.client.watch_event(f, opts, fn(logs: []*rpc.Log) {
+    ds := c.decode_logs(logs)
+    if len(ds) > 0 { on_logs(ds) }
+  }, on_error)
+}
