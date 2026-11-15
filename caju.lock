@@ -1,7 +1,7 @@
 # Written by `caju pkg`; do not edit. It pins the exact version, commit and hash of every
 # package the project uses, directly or not.
 version = 1
-requires = ["github.com/cajulang/fetch@0.1.1", "github.com/cajulang/ui@0.4.0"]
+requires = ["github.com/cajulang/fetch@0.1.1", "github.com/cajulang/ui@0.4.1"]
 
 [[package]]
 name = "github.com/cajulang/fetch"
@@ -13,8 +13,8 @@ dependencies = ["github.com/cajulang/ui@0.3.0"]
 
 [[package]]
 name = "github.com/cajulang/ui"
-version = "0.4.0"
+version = "0.4.1"
 source = "https://github.com/cajulang/ui"
-commit = "50e9c2492c9621a31d28dfced7bc1ee9254114e3"
-hash = "sha256:f8b44f6d421ed9ea3425205e1a9cbd4d76a327bae626af80f5dc4f954e13d029"
+commit = "d49e2b9d1fb47f673632d40c4e4d2a1254d85057"
+hash = "sha256:2b8370c5418003ad97a230422c34224ed352da96c28afb344980bd7b6168cf50"
 dependencies = []

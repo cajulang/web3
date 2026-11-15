@@ -16,6 +16,19 @@ print(web3.format_ether(v) + " ETH")
 print(web3.checksum_address("0xd8da6bf26964af9d7eed9e03e53415d37aa96045"))
 ```
 
+| Package | What |
+|---|---|
+| `github.com/cajulang/web3` | hex, Keccak-256, `U256`, units, EIP-55 addresses |
+| `web3/abi` | ABI encoding and decoding |
+| `web3/rlp`, `web3/accounts`, `web3/hd` | keys, signatures (EIP-191, EIP-712), transactions (legacy to EIP-7702), mnemonics |
+| `web3/chains`, `web3/rpc` | chains and the public JSON-RPC client |
+| `web3/wallet` | browser wallets (EIP-1193, EIP-6963), in caju-ui pages |
+| `web3/contracts`, `web3/erc`, `web3/multicall`, `web3/ens` | contracts, ERC-20/721, Multicall3, ENS |
+| `web3/aa` | account abstraction (ERC-4337, EIP-7702 smart accounts) |
+
+On the server, a program that uses `web3/rpc` imports `github.com/cajulang/fetch/native` once
+(the browser's program does not); `web3/wallet` works only inside a page. Requires caju 0.9.0.
+
 The core (`github.com/cajulang/web3`) has hex helpers, Keccak-256, 256-bit integers (`U256`),
 units (`parse_units`, `format_units`, `parse_ether`...) and addresses (EIP-55). Bytes are raw
 Caju strings; hex strings start with `0x`. Operations that go to the network or to a wallet take a

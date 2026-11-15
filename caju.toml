@@ -5,8 +5,8 @@ description = "Ethereum and EVM chains for Caju, on the server and in the browse
 license = "MIT"
 authors = ["Aécio"]
 entry = "web3.caju"
-caju = "0.8.0"
+caju = "0.9.0"
 
 [dependencies]
 "github.com/cajulang/fetch" = "0.1.1"
-"github.com/cajulang/ui" = "0.4.0"
+"github.com/cajulang/ui" = "0.4.1"
