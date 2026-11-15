@@ -1,0 +1,613 @@
+# web3/aa: user operations, bundler and paymaster clients, smart accounts (mock transports, no
+# network). The hash vectors were checked against EntryPoint.getUserOpHash on Sepolia and
+# Ethereum (see aa_live_test.caju).
+import { describe, it, expect } from "std/testing"
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/accounts"
+import "github.com/cajulang/web3/aa"
+import "github.com/cajulang/web3/chains"
+import "github.com/cajulang/web3/rpc"
+import "std/json"
+
+# ---------------------------------------------------------------- a mock node
+
+struct Reply {
+  result: str
+  err: error
+}
+
+struct Mock {
+  queue: map[str][]*Reply
+  methods: []str
+  params: []str
+}
+
+fn new_mock() -> *Mock { return &Mock{queue: map[str][]*Reply{}} }
+
+fn (m: *Mock) on(method: str, result: str) { m.queue[method] = append(m.queue[method], &Reply{result: result}) }
+
+fn (m: *Mock) count(method: str) -> int {
+  n := 0
+  for _, x := range m.methods { if x == method { n++ } }
+  return n
+}
+
+# the params of the last call of method, parsed
+fn (m: *Mock) params_of(method: str) -> *json.Value {
+  for i := len(m.methods) - 1; i >= 0; i-- {
+    if m.methods[i] == method {
+      v, _ := json.parse(m.params[i])
+      return v
+    }
+  }
+  return nil
+}
+
+fn (m: *Mock) transport() -> fn(str, str, fn(str, error)) -> fn() {
+  return fn(method: str, params_json: str, cb: fn(str, error)) -> fn() {
+    m.methods = append(m.methods, method)
+    m.params = append(m.params, params_json)
+    q := m.queue[method]
+    if len(q) == 0 {
+      cb("", &rpc.RpcError{code: -32601, message: "the method " + method + " does not exist/is not available"})
+      return nil
+    }
+    r := q[0]
+    if len(q) > 1 { m.queue[method] = q[1:] }
+    cb(r.result, r.err)
+    return nil
+  }
+}
+
+fn (m: *Mock) config() -> *rpc.ClientConfig { return &rpc.ClientConfig{chain: chains.sepolia, transport: m.transport(), retries: -1} }
+
+fn qs(s: str) -> str { return "\"" + s + "\"" }
+
+# ---------------------------------------------------------------- fixtures
+
+let OWNER_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+let OWNER = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+let VITALIK = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+let USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+let OP_HASH = "0x2c2d0e4a6b5f8d8b8a1b8f7d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b"
+
+fn owner() -> *accounts.Account {
+  a, _ := accounts.private_key_to_account(OWNER_KEY)
+  return a
+}
+
+# an operation with every field set (its hashes come from EntryPoint.getUserOpHash on Sepolia)
+fn sample() -> *aa.UserOperation {
+  return &aa.UserOperation{sender: "0x1234567890123456789012345678901234567890", nonce: web3.u256(7), factory: aa.SIMPLE_ACCOUNT_FACTORY_V07, factory_data: web3.must_hex("0x5fbfb9cf000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb922660000000000000000000000000000000000000000000000000000000000000000"), call_data: web3.must_hex("0xb61d27f6"), call_gas_limit: web3.u256(100000), verification_gas_limit: web3.u256(500000), pre_verification_gas: web3.u256(50000), max_fee_per_gas: web3.u256(3000000000), max_priority_fee_per_gas: web3.u256(1000000000), paymaster: VITALIK, paymaster_verification_gas_limit: web3.u256(60000), paymaster_post_op_gas_limit: web3.u256(30000), paymaster_data: web3.must_hex("0xdeadbeef"), signature: web3.must_hex("0x1234")}
+}
+
+fn sent_op(m: *Mock) -> *aa.UserOperation {
+  p := m.params_of("eth_sendUserOperation")
+  op, _ := aa.parse_user_operation(p.items[0])
+  return op
+}
+
+let BLOCK = "{\"number\":\"0x10\",\"hash\":\"0xb282d21e36e06b967ee20a367a893098ca58971151fcb869bddaee352be2d9b0\",\"parentHash\":\"0x174e64533a3326decc947db9dd0900175ba29e2107a26f71114d53c3ad1d8d31\",\"timestamp\":\"0x6af9eb1b\",\"gasLimit\":\"0x3938700\",\"gasUsed\":\"0x10528\",\"baseFeePerGas\":\"0x3b9aca00\",\"transactions\":[]}"
+let ESTIMATE = "{\"preVerificationGas\":\"0xc350\",\"verificationGasLimit\":\"0x61a80\",\"callGasLimit\":\"0x186a0\",\"paymasterVerificationGasLimit\":\"0xea60\",\"paymasterPostOpGasLimit\":\"0x7530\"}"
+let WORD7 = "\"0x0000000000000000000000000000000000000000000000000000000000000007\""
+
+# a public node for send_calls: chain id, code, nonce and fees (1 gwei base fee, 0.1 gwei tip)
+fn public_mock(code: str) -> *Mock {
+  m := new_mock()
+  m.on("eth_chainId", qs("0xaa36a7"))
+  m.on("eth_getCode", qs(code))
+  m.on("eth_call", WORD7)
+  m.on("eth_getBlockByNumber", BLOCK)
+  m.on("eth_maxPriorityFeePerGas", qs("0x5f5e100"))
+  m.on("eth_getTransactionCount", qs("0x3"))
+  return m
+}
+
+fn bundler_mock() -> *Mock {
+  m := new_mock()
+  m.on("eth_estimateUserOperationGas", ESTIMATE)
+  m.on("eth_sendUserOperation", qs(OP_HASH))
+  return m
+}
+
+# ---------------------------------------------------------------- tests
+
+describe("aa user operations", fn() {
+  it("packs the gas limits, fees, initCode and paymasterAndData", fn() {
+    p, err := aa.pack(sample())
+    expect(err).to_be_nil()
+    expect(web3.to_hex(p.init_code)).to_equal("0x91e60e0613810449d098b0b5ec8b51a0fe8c89855fbfb9cf000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb922660000000000000000000000000000000000000000000000000000000000000000")
+    expect(web3.to_hex(p.account_gas_limits)).to_equal("0x0000000000000000000000000007a120000000000000000000000000000186a0")
+    expect(web3.to_hex(p.gas_fees)).to_equal("0x0000000000000000000000003b9aca00000000000000000000000000b2d05e00")
+    expect(web3.to_hex(p.paymaster_and_data)).to_equal("0xd8da6bf26964af9d7eed9e03e53415d37aa960450000000000000000000000000000ea6000000000000000000000000000007530deadbeef")
+    expect(p.sender).to_equal("0x1234567890123456789012345678901234567890")
+    expect(p.nonce.dec()).to_equal("7")
+  })
+
+  it("leaves initCode and paymasterAndData empty without factory and paymaster", fn() {
+    p, _ := aa.pack(&aa.UserOperation{sender: VITALIK})
+    expect(p.init_code).to_equal("")
+    expect(p.paymaster_and_data).to_equal("")
+    expect(p.account_gas_limits).to_equal(web3.zeros(32))
+  })
+
+  it("unpacks what it packs", fn() {
+    p, _ := aa.pack(sample())
+    op, err := aa.unpack(p)
+    expect(err).to_be_nil()
+    expect(op.factory).to_equal(aa.SIMPLE_ACCOUNT_FACTORY_V07)
+    expect(op.verification_gas_limit.dec()).to_equal("500000")
+    expect(op.call_gas_limit.dec()).to_equal("100000")
+    expect(op.max_fee_per_gas.dec()).to_equal("3000000000")
+    expect(op.max_priority_fee_per_gas.dec()).to_equal("1000000000")
+    expect(op.paymaster).to_equal(VITALIK)
+    expect(op.paymaster_post_op_gas_limit.dec()).to_equal("30000")
+    expect(web3.to_hex(op.paymaster_data)).to_equal("0xdeadbeef")
+    h1, _ := aa.user_operation_hash(op, aa.ENTRY_POINT_V07, 1)
+    h2, _ := aa.user_operation_hash(sample(), aa.ENTRY_POINT_V07, 1)
+    expect(h1).to_equal(h2)
+  })
+
+  it("refuses gas values above 2^128 and bad addresses", fn() {
+    op := sample()
+    op.call_gas_limit = web3.u256(1).shl(128)
+    _, err := aa.pack(op)
+    expect(err.Error()).to_contain("callGasLimit above 2^128")
+    _, err2 := aa.pack(&aa.UserOperation{sender: "0x12"})
+    expect(err2.Error()).to_contain("invalid sender")
+    _, err3 := aa.user_operation_hash(sample(), "nope", 1)
+    expect(err3.Error()).to_contain("entry point")
+  })
+
+  it("hashes as EntryPoint v0.7 getUserOpHash", fn() {
+    h, err := aa.user_operation_hash(sample(), aa.ENTRY_POINT_V07, 11155111)
+    expect(err).to_be_nil()
+    expect(h).to_equal("0xa90a29d3b2f80b32c85597d95421cccb4b09d535d43d4f5cb39dddca40dd2629")
+    h2, _ := aa.user_operation_hash(&aa.UserOperation{sender: "0x1234567890123456789012345678901234567890"}, aa.ENTRY_POINT_V07, 1)
+    expect(h2).to_equal("0x01d9438c681049c75ed3a4b0e23e4ab3b4f4230aa4e8be878266300a62c6c58e")
+    # the signature is not hashed
+    op := sample()
+    op.signature = "other"
+    h3, _ := aa.user_operation_hash(op, aa.ENTRY_POINT_V07, 11155111)
+    expect(h3).to_equal(h)
+  })
+
+  it("hashes as EntryPoint v0.8 getUserOpHash (EIP-712)", fn() {
+    h, err := aa.user_operation_hash(sample(), aa.ENTRY_POINT_V08, 11155111)
+    expect(err).to_be_nil()
+    expect(h).to_equal("0x67a7a90251144655bf9734bdc47687d4b080472ae71721b00cda485e5f1876e6")
+    h2, _ := aa.user_operation_hash_v08(sample(), aa.ENTRY_POINT_V08, 11155111)
+    expect(h2).to_equal(h)
+  })
+
+  it("hashes an EIP-7702 initCode with the delegate in place of the marker", fn() {
+    op := sample()
+    op.factory = aa.EIP7702_FACTORY
+    _, err := aa.user_operation_hash(op, aa.ENTRY_POINT_V08, 1)
+    expect(err.Error()).to_contain("eip7702_auth")
+    op.eip7702_auth = &accounts.Authorization{chain_id: 1, address: aa.SIMPLE_7702_ACCOUNT_V08, nonce: 0, r: web3.u256(1), s: web3.u256(1)}
+    h, _ := aa.user_operation_hash(op, aa.ENTRY_POINT_V08, 1)
+    same := sample()
+    same.factory = aa.SIMPLE_7702_ACCOUNT_V08
+    want, _ := aa.user_operation_hash(same, aa.ENTRY_POINT_V08, 1)
+    expect(h).to_equal(want)
+    # the short marker "0x7702" packs the same
+    op.factory = "0x7702"
+    h2, _ := aa.user_operation_hash(op, aa.ENTRY_POINT_V08, 1)
+    expect(h2).to_equal(want)
+  })
+
+  it("encodes the call data of getUserOpHash", fn() {
+    d, err := aa.encode_get_user_op_hash(sample())
+    expect(err).to_be_nil()
+    expect(web3.to_hex(d[0:4])).to_equal("0x22cdde4c")
+  })
+})
+
+describe("aa JSON-RPC form", fn() {
+  it("writes the v0.7 fields with hex quantities", fn() {
+    s, _ := json.marshal(aa.user_operation_json(sample()))
+    expect(s).to_equal("{\"callData\":\"0xb61d27f6\",\"callGasLimit\":\"0x186a0\",\"factory\":\"0x91E60e0613810449d098b0b5Ec8b51A0FE8c8985\",\"factoryData\":\"0x5fbfb9cf000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb922660000000000000000000000000000000000000000000000000000000000000000\",\"maxFeePerGas\":\"0xb2d05e00\",\"maxPriorityFeePerGas\":\"0x3b9aca00\",\"nonce\":\"0x7\",\"paymaster\":\"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045\",\"paymasterData\":\"0xdeadbeef\",\"paymasterPostOpGasLimit\":\"0x7530\",\"paymasterVerificationGasLimit\":\"0xea60\",\"preVerificationGas\":\"0xc350\",\"sender\":\"0x1234567890123456789012345678901234567890\",\"signature\":\"0x1234\",\"verificationGasLimit\":\"0x7a120\"}")
+  })
+
+  it("leaves out factory and paymaster fields when unset, and writes eip7702Auth", fn() {
+    op := &aa.UserOperation{sender: VITALIK, eip7702_auth: &accounts.Authorization{chain_id: 1, address: aa.SIMPLE_7702_ACCOUNT_V08, nonce: 5, y_parity: 1, r: web3.u256(16), s: web3.u256(17)}}
+    s, _ := json.marshal(aa.user_operation_json(op))
+    expect(s).to_equal("{\"callData\":\"0x\",\"callGasLimit\":\"0x0\",\"eip7702Auth\":{\"address\":\"0x4Cd241E8d1510e30b2076397afc7508Ae59C66c9\",\"chainId\":\"0x1\",\"nonce\":\"0x5\",\"r\":\"0x10\",\"s\":\"0x11\",\"yParity\":\"0x1\"},\"maxFeePerGas\":\"0x0\",\"maxPriorityFeePerGas\":\"0x0\",\"nonce\":\"0x0\",\"preVerificationGas\":\"0x0\",\"sender\":\"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045\",\"signature\":\"0x\",\"verificationGasLimit\":\"0x0\"}")
+  })
+
+  it("reads back what it writes", fn() {
+    s, _ := json.marshal(aa.user_operation_json(sample()))
+    v, _ := json.parse(s)
+    op, err := aa.parse_user_operation(v)
+    expect(err).to_be_nil()
+    h1, _ := aa.user_operation_hash(op, aa.ENTRY_POINT_V07, 5)
+    h2, _ := aa.user_operation_hash(sample(), aa.ENTRY_POINT_V07, 5)
+    expect(h1).to_equal(h2)
+    expect(web3.to_hex(op.signature)).to_equal("0x1234")
+    _, err2 := aa.parse_user_operation(nil)
+    expect(err2).not_().to_be_nil()
+  })
+})
+
+describe("aa bundler client", fn() {
+  it("sends a user operation", fn() {
+    m := bundler_mock()
+    b := aa.create_bundler_client(m.config())
+    got := ""
+    b.send_user_operation(sample(), "", fn(h: str, err: error) {
+      expect(err).to_be_nil()
+      got = h
+    })
+    expect(got).to_equal(OP_HASH)
+    p := m.params_of("eth_sendUserOperation")
+    expect(p.items[1].s).to_equal(aa.ENTRY_POINT_V07)
+    expect(p.items[0].get_str("callGasLimit", "")).to_equal("0x186a0")
+  })
+
+  it("estimates the gas of a user operation", fn() {
+    m := bundler_mock()
+    b := aa.create_bundler_client(m.config())
+    let g: *aa.GasEstimate = nil
+    b.estimate_user_operation_gas(sample(), aa.ENTRY_POINT_V07, fn(v: *aa.GasEstimate, err: error) { g = v })
+    expect(g.pre_verification_gas.dec()).to_equal("50000")
+    expect(g.verification_gas_limit.dec()).to_equal("400000")
+    expect(g.call_gas_limit.dec()).to_equal("100000")
+    expect(g.paymaster_verification_gas_limit.dec()).to_equal("60000")
+    expect(g.paymaster_post_op_gas_limit.dec()).to_equal("30000")
+  })
+
+  it("passes on bundler errors", fn() {
+    m := new_mock()
+    b := aa.create_bundler_client(m.config())
+    let e: error = nil
+    b.estimate_user_operation_gas(sample(), "", fn(v: *aa.GasEstimate, err: error) { e = err })
+    expect(e.Error()).to_contain("does not exist")
+  })
+
+  it("reads a user operation receipt", fn() {
+    m := new_mock()
+    m.on("eth_getUserOperationReceipt", "{\"userOpHash\":\"" + OP_HASH + "\",\"entryPoint\":\"0x0000000071727de22e5e9d8baf0edac6f37da032\",\"sender\":\"0xd8da6bf26964af9d7eed9e03e53415d37aa96045\",\"nonce\":\"0x1\",\"paymaster\":\"0x0000000000000000000000000000000000000000\",\"actualGasCost\":\"0x1000\",\"actualGasUsed\":\"0x100\",\"success\":true,\"reason\":\"\",\"logs\":[{\"address\":\"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48\",\"topics\":[\"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef\"],\"data\":\"0x01\",\"logIndex\":\"0x2\"}],\"receipt\":{\"transactionHash\":\"0x6d54978373a88961e590170ea6e3bdab3494d47be1f1b12b8b2baf45cc4d3021\",\"blockNumber\":\"0x10\",\"status\":\"0x1\",\"gasUsed\":\"0x5208\",\"logs\":[]}}")
+    b := aa.create_bundler_client(m.config())
+    let r: *aa.UserOperationReceipt = nil
+    b.get_user_operation_receipt(OP_HASH, fn(v: *aa.UserOperationReceipt, err: error) { r = v })
+    expect(r.success).to_be_true()
+    expect(r.sender).to_equal(VITALIK)
+    expect(r.entry_point).to_equal(aa.ENTRY_POINT_V07)
+    expect(r.actual_gas_cost.dec()).to_equal("4096")
+    expect(len(r.logs)).to_equal(1)
+    expect(r.logs[0].address).to_equal(USDC)
+    expect(r.logs[0].log_index).to_equal(2)
+    expect(r.receipt.block_number).to_equal(16)
+    expect(r.receipt.gas_used).to_equal(21000)
+  })
+
+  it("reads a user operation by hash, and null as not found", fn() {
+    m := new_mock()
+    s, _ := json.marshal(aa.user_operation_json(sample()))
+    m.on("eth_getUserOperationByHash", "{\"userOperation\":" + s + ",\"entryPoint\":\"0x0000000071727De22E5E9d8BAf0edAc6f37da032\",\"blockNumber\":\"0x10\",\"blockHash\":\"0xb282d21e36e06b967ee20a367a893098ca58971151fcb869bddaee352be2d9b0\",\"transactionHash\":\"0x6d54978373a88961e590170ea6e3bdab3494d47be1f1b12b8b2baf45cc4d3021\"}")
+    m.on("eth_getUserOperationByHash", "null")
+    b := aa.create_bundler_client(m.config())
+    let info: *aa.UserOperationInfo = nil
+    b.get_user_operation_by_hash(OP_HASH, fn(v: *aa.UserOperationInfo, err: error) { info = v })
+    expect(info.block_number).to_equal(16)
+    expect(info.user_operation.nonce.dec()).to_equal("7")
+    expect(info.user_operation.paymaster).to_equal(VITALIK)
+    called := false
+    b.get_user_operation_by_hash(OP_HASH, fn(v: *aa.UserOperationInfo, err: error) {
+      called = true
+      expect(v == nil).to_be_true()
+      expect(err).to_be_nil()
+    })
+    expect(called).to_be_true()
+  })
+
+  it("lists the supported entry points", fn() {
+    m := new_mock()
+    m.on("eth_supportedEntryPoints", "[\"0x0000000071727de22e5e9d8baf0edac6f37da032\",\"0x4337084d9e255ff0702461cf8895ce9e3b5ff108\"]")
+    b := aa.create_bundler_client(m.config())
+    eps := []str{}
+    b.supported_entry_points(fn(v: []str, err: error) { eps = v })
+    expect(eps).to_equal([]str{aa.ENTRY_POINT_V07, aa.ENTRY_POINT_V08})
+  })
+
+  it("waits for a receipt, polling", fn() {
+    m := new_mock()
+    m.on("eth_getUserOperationReceipt", "null")
+    m.on("eth_getUserOperationReceipt", "null")
+    m.on("eth_getUserOperationReceipt", "{\"userOpHash\":\"" + OP_HASH + "\",\"success\":false,\"reason\":\"0x08c379a0\",\"logs\":[],\"receipt\":{\"blockNumber\":\"0x10\"}}")
+    b := aa.create_bundler_client(m.config())
+    let r: *aa.UserOperationReceipt = nil
+    b.wait_for_user_operation_receipt(OP_HASH, &rpc.WaitOptions{poll_ms: 1}, fn(v: *aa.UserOperationReceipt, err: error) {
+      expect(err).to_be_nil()
+      r = v
+    })
+    expect(r.success).to_be_false()
+    expect(r.reason).to_equal("0x08c379a0")
+    expect(m.count("eth_getUserOperationReceipt")).to_equal(3)
+  })
+
+  it("times out waiting", fn() {
+    m := new_mock()
+    m.on("eth_getUserOperationReceipt", "null")
+    b := aa.create_bundler_client(m.config())
+    let e: error = nil
+    b.wait_for_user_operation_receipt(OP_HASH, &rpc.WaitOptions{poll_ms: 10, timeout_ms: 30}, fn(v: *aa.UserOperationReceipt, err: error) { e = err })
+    expect(e.Error()).to_contain("timed out")
+    expect(m.count("eth_getUserOperationReceipt")).to_equal(3)
+  })
+})
+
+describe("aa paymasters (ERC-7677)", fn() {
+  it("asks for stub data and final data", fn() {
+    m := new_mock()
+    m.on("pm_getPaymasterStubData", "{\"paymaster\":\"0xd8da6bf26964af9d7eed9e03e53415d37aa96045\",\"paymasterData\":\"0x01\",\"paymasterVerificationGasLimit\":\"0x100\",\"paymasterPostOpGasLimit\":\"0x10\",\"sponsor\":{\"name\":\"Caju\"},\"isFinal\":false}")
+    m.on("pm_getPaymasterData", "{\"paymaster\":\"0xd8da6bf26964af9d7eed9e03e53415d37aa96045\",\"paymasterData\":\"0x0203\"}")
+    pm := aa.create_paymaster_client(m.config())
+    let s: *aa.PaymasterResult = nil
+    pm.get_paymaster_stub_data(sample(), "", 11155111, map[str]any{"policyId": "p1"}, fn(v: *aa.PaymasterResult, err: error) { s = v })
+    expect(s.paymaster).to_equal(VITALIK)
+    expect(s.paymaster_data).to_equal(web3.must_hex("0x01"))
+    expect(s.paymaster_verification_gas_limit.dec()).to_equal("256")
+    expect(s.sponsor_name).to_equal("Caju")
+    p := m.params_of("pm_getPaymasterStubData")
+    expect(p.items[1].s).to_equal(aa.ENTRY_POINT_V07)
+    expect(p.items[2].s).to_equal("0xaa36a7")
+    expect(p.items[3].get_str("policyId", "")).to_equal("p1")
+    let d: *aa.PaymasterResult = nil
+    pm.get_paymaster_data(sample(), "", 11155111, nil, fn(v: *aa.PaymasterResult, err: error) { d = v })
+    expect(web3.to_hex(d.paymaster_data)).to_equal("0x0203")
+    expect(d.paymaster_post_op_gas_limit == nil).to_be_true()
+    expect(m.params_of("pm_getPaymasterData").items[3].string()).to_equal("{}")
+    op := sample()
+    aa.apply_paymaster(op, d)
+    expect(op.paymaster_post_op_gas_limit.dec()).to_equal("30000")
+    expect(web3.to_hex(op.paymaster_data)).to_equal("0x0203")
+  })
+})
+
+describe("aa SimpleAccount", fn() {
+  it("computes its counterfactual address offline (CREATE2)", fn() {
+    addr, err := aa.simple_account_address(OWNER, web3.zero())
+    expect(err).to_be_nil()
+    expect(addr).to_equal("0xa3aBDC7f6334CD3EE466A115f30522377787c024")
+    a2, _ := aa.simple_account_address(OWNER, web3.u256(1))
+    expect(a2).not_().to_equal(addr)
+    acct := aa.simple_account(owner(), nil, nil)
+    got := ""
+    acct.address(fn(v: str, err2: error) { got = v })
+    expect(got).to_equal(addr)
+  })
+
+  it("reads the address from another factory with eth_call", fn() {
+    m := new_mock()
+    m.on("eth_call", "\"0x000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045\"")
+    acct := aa.simple_account(owner(), rpc.create_public_client(m.config()), nil)
+    acct.factory = USDC
+    got := ""
+    acct.address(fn(v: str, err: error) { got = v })
+    acct.address(fn(v: str, err: error) { got = v })
+    expect(got).to_equal(VITALIK)
+    expect(m.count("eth_call")).to_equal(1)
+    expect(m.params_of("eth_call").items[0].get_str("data", "")).to_start_with("0x8cb84e18")
+  })
+
+  it("deploys with createAccount(owner, salt)", fn() {
+    acct := aa.simple_account(owner(), nil, web3.u256(5))
+    f, d, err := acct.factory_args()
+    expect(err).to_be_nil()
+    expect(f).to_equal(aa.SIMPLE_ACCOUNT_FACTORY_V07)
+    expect(web3.to_hex(d)).to_equal("0x5fbfb9cf000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb922660000000000000000000000000000000000000000000000000000000000000005")
+  })
+
+  it("encodes one call as execute and several as executeBatch", fn() {
+    acct := aa.simple_account(owner(), nil, nil)
+    one, _ := acct.encode_calls([]*aa.Call{&aa.Call{to_: VITALIK, value: web3.u256(1), data: web3.must_hex("0xabcd")}})
+    expect(web3.to_hex(one)).to_equal("0xb61d27f6000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000002abcd000000000000000000000000000000000000000000000000000000000000")
+    two, _ := acct.encode_calls([]*aa.Call{&aa.Call{to_: VITALIK, value: web3.u256(1)}, &aa.Call{to_: USDC, data: web3.must_hex("0x01")}})
+    expect(web3.to_hex(two[0:4])).to_equal("0x47e1da2a")
+    expect(len(two)).to_equal(4 + 32 * 15)
+  })
+
+  it("signs the user operation hash with EIP-191", fn() {
+    acct := aa.simple_account(owner(), nil, nil)
+    sig, err := acct.sign_user_operation_hash(OP_HASH)
+    expect(err).to_be_nil()
+    expect(len(sig)).to_equal(65)
+    who, _ := accounts.recover_message_address(web3.must_hex(OP_HASH), web3.to_hex(sig))
+    expect(who).to_equal(OWNER)
+    expect(len(acct.dummy_signature())).to_equal(65)
+    _, e2 := acct.sign_authorization(1, 0)
+    expect(e2).not_().to_be_nil()
+  })
+})
+
+describe("aa EIP-7702 smart EOA", fn() {
+  it("encodes calls for Simple7702Account", fn() {
+    one, _ := aa.encode_7702_calls([]*aa.Call{&aa.Call{to_: VITALIK, value: web3.u256(1)}})
+    expect(web3.to_hex(one[0:4])).to_equal("0xb61d27f6")
+    two, _ := aa.encode_7702_calls([]*aa.Call{&aa.Call{to_: VITALIK, value: web3.u256(1)}, &aa.Call{to_: USDC, data: web3.must_hex("0x01")}})
+    expect(web3.to_hex(two)).to_equal("0x34fcd5be00000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000c0000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb480000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000010100000000000000000000000000000000000000000000000000000000000000")
+  })
+
+  it("signs user operation hashes raw and delegates to Simple7702Account", fn() {
+    acct := aa.simple_7702_account(owner(), nil)
+    expect(acct.entry_point()).to_equal(aa.ENTRY_POINT_V08)
+    expect(acct.delegation()).to_equal(aa.SIMPLE_7702_ACCOUNT_V08)
+    sig, _ := acct.sign_user_operation_hash(OP_HASH)
+    ps, _ := accounts.parse_signature(sig)
+    who, _ := accounts.recover_address(OP_HASH, ps)
+    expect(who).to_equal(OWNER)
+    auth, _ := acct.sign_authorization(11155111, 4)
+    expect(auth.address).to_equal(aa.SIMPLE_7702_ACCOUNT_V08)
+    signer, _ := accounts.recover_authorization_address(auth)
+    expect(signer).to_equal(OWNER)
+  })
+
+  it("reads a delegation from code", fn() {
+    expect(aa.delegation_of(web3.must_hex("0xef01004cd241e8d1510e30b2076397afc7508ae59c66c9"))).to_equal(aa.SIMPLE_7702_ACCOUNT_V08)
+    expect(aa.delegation_of(web3.must_hex("0x6080"))).to_equal("")
+    expect(aa.delegation_of("")).to_equal("")
+  })
+
+  it("builds a type-4 transaction that delegates, and a type-2 one once delegated", fn() {
+    acct := aa.simple_7702_account(owner(), nil)
+    calls := []*aa.Call{&aa.Call{to_: VITALIK, value: web3.u256(1)}}
+    tx, err := acct.build_transaction(1, 9, 100000, web3.u256(3), web3.u256(1), calls, false)
+    expect(err).to_be_nil()
+    expect(tx.type_).to_equal(accounts.TX_EIP7702)
+    expect(tx.to_).to_equal(OWNER)
+    expect(len(tx.authorization_list)).to_equal(1)
+    expect(tx.authorization_list[0].nonce).to_equal(10)
+    raw, serr := owner().sign_transaction(tx)
+    expect(serr).to_be_nil()
+    from_addr, _ := accounts.recover_transaction_address(raw)
+    expect(from_addr).to_equal(OWNER)
+    tx2, _ := acct.build_transaction(1, 9, 100000, web3.u256(3), web3.u256(1), calls, true)
+    expect(tx2.type_).to_equal(accounts.TX_EIP1559)
+    expect(len(tx2.authorization_list)).to_equal(0)
+  })
+
+  it("sends calls with its own transaction", fn() {
+    m := public_mock("0x")
+    m.on("eth_estimateGas", qs("0x186a0"))
+    m.on("eth_sendRawTransaction", qs("0x6d54978373a88961e590170ea6e3bdab3494d47be1f1b12b8b2baf45cc4d3021"))
+    acct := aa.simple_7702_account(owner(), rpc.create_public_client(m.config()))
+    got := ""
+    acct.send_transaction([]*aa.Call{&aa.Call{to_: VITALIK, value: web3.u256(1)}}, fn(h: str, err: error) {
+      expect(err).to_be_nil()
+      got = h
+    })
+    expect(got).to_equal("0x6d54978373a88961e590170ea6e3bdab3494d47be1f1b12b8b2baf45cc4d3021")
+    est := m.params_of("eth_estimateGas").items[0]
+    expect(len(est.get_array("authorizationList"))).to_equal(1)
+    rawhex := m.params_of("eth_sendRawTransaction").items[0].s
+    tx, _, perr := accounts.parse_transaction(web3.must_hex(rawhex))
+    expect(perr).to_be_nil()
+    expect(tx.type_).to_equal(4)
+    expect(tx.chain_id).to_equal(11155111)
+    expect(tx.nonce).to_equal(3)
+    expect(tx.gas).to_equal(120000)
+    expect(tx.authorization_list[0].nonce).to_equal(4)
+    expect(web3.format_gwei(tx.max_fee_per_gas)).to_equal("2.1")
+  })
+})
+
+describe("aa send_calls", fn() {
+  it("deploys, estimates, signs and sends a SimpleAccount operation", fn() {
+    pm := public_mock("0x")
+    bm := bundler_mock()
+    acct := aa.simple_account(owner(), rpc.create_public_client(pm.config()), nil)
+    b := aa.create_bundler_client(bm.config())
+    got := ""
+    aa.send_calls(acct, b, acct.public, []*aa.Call{&aa.Call{to_: VITALIK, value: web3.u256(1)}}, nil, fn(h: str, err: error) {
+      expect(err).to_be_nil()
+      got = h
+    })
+    expect(got).to_equal(OP_HASH)
+    # the estimate saw the dummy signature, the send the real one
+    est, _ := aa.parse_user_operation(bm.params_of("eth_estimateUserOperationGas").items[0])
+    expect(web3.to_hex(est.signature)).to_equal(aa.DUMMY_SIGNATURE)
+    op := sent_op(bm)
+    expect(op.sender).to_equal("0xa3aBDC7f6334CD3EE466A115f30522377787c024")
+    expect(op.factory).to_equal(aa.SIMPLE_ACCOUNT_FACTORY_V07)
+    expect(web3.to_hex(op.factory_data[0:4])).to_equal("0x5fbfb9cf")
+    expect(op.nonce.dec()).to_equal("7")
+    expect(web3.format_gwei(op.max_fee_per_gas)).to_equal("2.1")
+    expect(web3.format_gwei(op.max_priority_fee_per_gas)).to_equal("0.1")
+    expect(op.verification_gas_limit.dec()).to_equal("400000")
+    expect(op.paymaster).to_equal("")
+    expect(web3.to_hex(op.call_data[0:4])).to_equal("0xb61d27f6")
+    h, _ := aa.user_operation_hash(op, aa.ENTRY_POINT_V07, 11155111)
+    who, _ := accounts.recover_message_address(web3.must_hex(h), web3.to_hex(op.signature))
+    expect(who).to_equal(OWNER)
+    # getNonce(sender, 0) at the EntryPoint
+    call := pm.params_of("eth_call").items[0]
+    expect(call.get_str("to", "")).to_equal(aa.ENTRY_POINT_V07)
+    expect(call.get_str("data", "")).to_start_with("0x35567e1a")
+  })
+
+  it("leaves the factory out once deployed and uses given fees and nonce", fn() {
+    pm := public_mock("0x6080")
+    bm := bundler_mock()
+    acct := aa.simple_account(owner(), rpc.create_public_client(pm.config()), nil)
+    b := aa.create_bundler_client(bm.config())
+    opts := &aa.SendOptions{nonce: web3.u256(42), max_fee_per_gas: web3.u256(5), max_priority_fee_per_gas: web3.u256(2)}
+    aa.send_calls(acct, b, acct.public, []*aa.Call{&aa.Call{to_: VITALIK}, &aa.Call{to_: USDC}}, opts, fn(h: str, err: error) { expect(err).to_be_nil() })
+    op := sent_op(bm)
+    expect(op.factory).to_equal("")
+    expect(op.nonce.dec()).to_equal("42")
+    expect(op.max_fee_per_gas.dec()).to_equal("5")
+    expect(web3.to_hex(op.call_data[0:4])).to_equal("0x47e1da2a")
+    expect(pm.count("eth_call")).to_equal(0)
+    expect(pm.count("eth_getBlockByNumber")).to_equal(0)
+  })
+
+  it("gets paymaster stub data, then the final data", fn() {
+    pm := public_mock("0x6080")
+    bm := bundler_mock()
+    bm.on("pm_getPaymasterStubData", "{\"paymaster\":\"0xd8da6bf26964af9d7eed9e03e53415d37aa96045\",\"paymasterData\":\"0x01\",\"paymasterVerificationGasLimit\":\"0x100\",\"paymasterPostOpGasLimit\":\"0x10\"}")
+    bm.on("pm_getPaymasterData", "{\"paymaster\":\"0xd8da6bf26964af9d7eed9e03e53415d37aa96045\",\"paymasterData\":\"0x0203\"}")
+    acct := aa.simple_account(owner(), rpc.create_public_client(pm.config()), nil)
+    b := aa.create_bundler_client(bm.config())
+    aa.send_calls(acct, b, acct.public, []*aa.Call{&aa.Call{to_: VITALIK}}, &aa.SendOptions{paymaster: b.paymaster()}, fn(h: str, err: error) { expect(err).to_be_nil() })
+    est, _ := aa.parse_user_operation(bm.params_of("eth_estimateUserOperationGas").items[0])
+    expect(web3.to_hex(est.paymaster_data)).to_equal("0x01")
+    op := sent_op(bm)
+    expect(op.paymaster).to_equal(VITALIK)
+    expect(web3.to_hex(op.paymaster_data)).to_equal("0x0203")
+    expect(op.paymaster_verification_gas_limit.dec()).to_equal("60000")
+    expect(op.paymaster_post_op_gas_limit.dec()).to_equal("30000")
+    h, _ := aa.user_operation_hash(op, aa.ENTRY_POINT_V07, 11155111)
+    who, _ := accounts.recover_message_address(web3.must_hex(h), web3.to_hex(op.signature))
+    expect(who).to_equal(OWNER)
+  })
+
+  it("adds the EIP-7702 authorization for an EOA not yet delegated (EntryPoint v0.8)", fn() {
+    pm := public_mock("0x")
+    bm := bundler_mock()
+    acct := aa.simple_7702_account(owner(), rpc.create_public_client(pm.config()))
+    b := aa.create_bundler_client(bm.config())
+    aa.send_calls(acct, b, acct.public, []*aa.Call{&aa.Call{to_: VITALIK, value: web3.u256(1)}}, nil, fn(h: str, err: error) { expect(err).to_be_nil() })
+    expect(bm.params_of("eth_sendUserOperation").items[1].s).to_equal(aa.ENTRY_POINT_V08)
+    op := sent_op(bm)
+    expect(op.sender).to_equal(OWNER)
+    expect(op.factory).to_equal(aa.EIP7702_FACTORY)
+    expect(op.eip7702_auth.nonce).to_equal(3)
+    expect(op.eip7702_auth.chain_id).to_equal(11155111)
+    signer, _ := accounts.recover_authorization_address(op.eip7702_auth)
+    expect(signer).to_equal(OWNER)
+    h, _ := aa.user_operation_hash(op, aa.ENTRY_POINT_V08, 11155111)
+    ps, _ := accounts.parse_signature(op.signature)
+    who, _ := accounts.recover_address(h, ps)
+    expect(who).to_equal(OWNER)
+  })
+
+  it("skips the authorization once delegated", fn() {
+    pm := public_mock("0xef01004cd241e8d1510e30b2076397afc7508ae59c66c9")
+    bm := bundler_mock()
+    acct := aa.simple_7702_account(owner(), rpc.create_public_client(pm.config()))
+    b := aa.create_bundler_client(bm.config())
+    aa.send_calls(acct, b, acct.public, []*aa.Call{&aa.Call{to_: VITALIK}}, nil, fn(h: str, err: error) { expect(err).to_be_nil() })
+    op := sent_op(bm)
+    expect(op.factory).to_equal("")
+    expect(op.eip7702_auth == nil).to_be_true()
+    expect(pm.count("eth_getTransactionCount")).to_equal(0)
+  })
+
+  it("stops at the first error", fn() {
+    pm := public_mock("0x")
+    bm := new_mock()
+    acct := aa.simple_account(owner(), rpc.create_public_client(pm.config()), nil)
+    b := aa.create_bundler_client(bm.config())
+    let e: error = nil
+    n := 0
+    aa.send_calls(acct, b, acct.public, []*aa.Call{&aa.Call{to_: VITALIK}}, nil, fn(h: str, err: error) {
+      e = err
+      n++
+    })
+    expect(n).to_equal(1)
+    expect(e.Error()).to_contain("eth_estimateUserOperationGas")
+    expect(bm.count("eth_sendUserOperation")).to_equal(0)
+  })
+})

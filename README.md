@@ -401,3 +401,92 @@ a3, err := k.account()
 The mnemonic is used with its whitespace trimmed and collapsed; BIP-39 also asks for Unicode
 NFKD, which leaves ASCII unchanged: normalize non-ASCII passphrases before calling. Deriving a
 seed takes about 35 ms. Not included yet: parsing xprv/xpub strings and public-only derivation.
+
+## web3/aa
+
+Account abstraction: ERC-4337 user operations (EntryPoint v0.7 and v0.8), bundler and paymaster
+(ERC-7677) clients, and smart accounts: eth-infinitism's SimpleAccount and EIP-7702 "smart EOAs"
+delegated to Simple7702Account.
+
+```caju
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/aa"
+import "github.com/cajulang/web3/accounts"
+import "github.com/cajulang/web3/chains"
+import "github.com/cajulang/web3/rpc"
+
+owner, err := accounts.private_key_to_account(key)
+public := rpc.create_public_client(&rpc.ClientConfig{chain: chains.sepolia})
+bundler := aa.create_bundler_client(&rpc.ClientConfig{url: "https://api.pimlico.io/v2/sepolia/rpc?apikey=..."})
+
+acct := aa.simple_account(owner, public, web3.zero())   # SimpleAccount v0.7, salt 0
+calls := []*aa.Call{&aa.Call{to_: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", value: web3.parse_ether("0.001")}}
+opts := &aa.SendOptions{paymaster: bundler.paymaster()}  # nil: the account pays its own gas
+aa.send_calls(acct, bundler, public, calls, opts, fn(hash: str, err: error) {
+  if err != nil { print(err.Error()); return }
+  bundler.wait_for_user_operation_receipt(hash, nil, fn(r: *aa.UserOperationReceipt, err: error) {
+    if err == nil { print(r.success, r.receipt.transaction_hash) }
+  })
+})
+```
+
+`send_calls` fills the user operation: the sender's address, the factory when it has no code yet
+(or, for an EIP-7702 account, the authorization when the EOA is not delegated yet), the nonce
+(`EntryPoint.getNonce`), the fees (`public.estimate_fees_per_gas`), the call data, paymaster stub
+data, the gas (the bundler's `eth_estimateUserOperationGas`, with a dummy signature), the final
+paymaster data; then it signs and sends. `prepare_user_operation(...)` stops before signing
+(`cb(op, chain_id, err)`); `sign_user_operation(acct, op, chain_id)` signs.
+
+- **User operations**: `UserOperation { sender, nonce, factory, factory_data, call_data,
+  call_gas_limit, verification_gas_limit, pre_verification_gas, max_fee_per_gas,
+  max_priority_fee_per_gas, paymaster, paymaster_verification_gas_limit,
+  paymaster_post_op_gas_limit, paymaster_data, signature, eip7702_auth }` (byte fields raw,
+  amounts `*web3.U256`, nil is zero). `pack(op) -> *PackedUserOperation` (initCode,
+  accountGasLimits, gasFees, paymasterAndData as the EntryPoint takes them) and `unpack(p)`.
+  `user_operation_hash(op, entry_point, chain_id)` ("0x" hex): the EntryPoint v0.7 formula, or
+  `user_operation_hash_v08` (EIP-712, with the EIP-7702 initCode rule) when `entry_point` is
+  `ENTRY_POINT_V08`. `get_user_operation_hash(public, entry_point, op, cb)` asks the EntryPoint
+  (eth_call), `get_nonce(public, entry_point, sender, key, cb)`.
+- **JSON-RPC form** (ERC-7769, v0.7 fields, hex quantities): `user_operation_json(op) ->
+  map[str]any` (factory and paymaster fields only when set; `eip7702Auth` when set),
+  `parse_user_operation(v *json.Value)`.
+- **Bundler**: `create_bundler_client(&rpc.ClientConfig{url: ...})` (or `transport:` for mocks).
+  `b.send_user_operation(op, entry_point, cb(hash, err))`,
+  `b.estimate_user_operation_gas(op, entry_point, cb(*GasEstimate, err))`,
+  `b.get_user_operation_receipt(hash, cb(*UserOperationReceipt, err))` (nil while pending),
+  `b.get_user_operation_by_hash(hash, cb(*UserOperationInfo, err))`,
+  `b.supported_entry_points(cb)`, `b.chain_id(cb)`,
+  `b.wait_for_user_operation_receipt(hash, opts *rpc.WaitOptions, cb)` (polls like
+  `rpc.wait_for_transaction_receipt`; 180 s timeout by default). `entry_point` "" is v0.7.
+- **Paymasters** (ERC-7677): `create_paymaster_client(cfg)` or `b.paymaster()`;
+  `p.get_paymaster_stub_data(op, entry_point, chain_id, context, cb(*PaymasterResult, err))`,
+  `p.get_paymaster_data(...)`, `apply_paymaster(op, r)`. `context` is the service's options
+  (`map[str]any{"sponsorshipPolicyId": ...}`; nil is `{}`).
+- **Smart accounts**: the `SmartAccount` interface (`entry_point()`, `address(cb)`,
+  `factory_args() -> (factory, data, err)`, `encode_calls(calls)`,
+  `sign_user_operation_hash(h)`, `dummy_signature()`, `delegation()`,
+  `sign_authorization(chain_id, nonce)`); implement it to add Safe, Kernel, Coinbase Smart
+  Wallet and others.
+  - `simple_account(owner, public, salt) -> *SimpleAccount`: eth-infinitism SimpleAccount v0.7
+    (factory `SIMPLE_ACCOUNT_FACTORY_V07`, EntryPoint v0.7). The address is computed offline with
+    CREATE2 (`simple_account_address(owner, salt)`, the same as the factory's `getAddress`); with
+    another `factory`, it is read with `getAddress` by eth_call. One call is `execute`, several
+    `executeBatch(address[], uint256[], bytes[])`; signatures are EIP-191 of the hash.
+  - `simple_7702_account(owner, public) -> *Simple7702Account`: the owner's EOA delegated with
+    EIP-7702 to `SIMPLE_7702_ACCOUNT_V08` (eth-infinitism Simple7702Account, EntryPoint v0.8;
+    `implementation` can name another contract with the same interface). Through a bundler,
+    `send_calls` adds `eip7702Auth` and the `0x7702` factory marker while the EOA is not
+    delegated. Without a bundler, `a.send_transaction(calls, cb(tx_hash, err))` sends a type-4
+    transaction from the EOA to itself (it delegates and runs `executeBatch` at once; type 2 once
+    delegated), and `a.build_transaction(...)` builds it offline. `encode_7702_calls(calls)`,
+    `delegation_of(code)` (the delegate of a `0xef0100 || address` code).
+- **Addresses** (checked on Ethereum, Base, Sepolia and Base Sepolia): `ENTRY_POINT_V07`
+  `0x0000000071727De22E5E9d8BAf0edAc6f37da032`, `ENTRY_POINT_V08`
+  `0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108`, `SIMPLE_ACCOUNT_FACTORY_V07`
+  `0x91E60e0613810449d098b0b5Ec8b51A0FE8c8985` (implementation
+  `0x68641DE71cfEa5a5d0D29712449Ee254bb1400C2`), `SIMPLE_7702_ACCOUNT_V08`
+  `0x4Cd241E8d1510e30b2076397afc7508Ae59C66c9`.
+
+Not included yet: EntryPoint v0.6, other accounts (Safe, Kernel, Light, Coinbase Smart Wallet),
+bundler-specific gas price methods (`pimlico_getUserOperationGasPrice`), state overrides in gas
+estimation, ERC-1271/ERC-6492 signature verification and ERC-5792 `wallet_sendCalls`.

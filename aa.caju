@@ -1,0 +1,1259 @@
+# web3/aa: account abstraction, ERC-4337 user operations, bundlers, paymasters and smart
+# accounts (SimpleAccount, EIP-7702 smart EOAs) (import "github.com/cajulang/web3/aa").
+#
+#   owner, _ := accounts.private_key_to_account(key)
+#   public := rpc.create_public_client(&rpc.ClientConfig{chain: chains.sepolia})
+#   bundler := aa.create_bundler_client(&rpc.ClientConfig{url: "https://api.pimlico.io/v2/sepolia/rpc?apikey=..."})
+#   acct := aa.simple_account(owner, public, web3.zero())       # SimpleAccount v0.7 (counterfactual)
+#   calls := []*aa.Call{&aa.Call{to_: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", value: web3.parse_ether("0.001")}}
+#   aa.send_calls(acct, bundler, public, calls, nil, fn(hash: str, err: error) {
+#     bundler.wait_for_user_operation_receipt(hash, nil, fn(r: *aa.UserOperationReceipt, err: error) { ... })
+#   })
+#
+# User operations follow EntryPoint v0.7 (and v0.8, which hashes them with EIP-712): byte fields
+# are raw bytes (Caju strings), amounts and gas are *web3.U256 (nil is zero), addresses are "0x"
+# strings. Hashes (user operation hashes, transaction hashes) are "0x" hex. Network calls take a
+# callback last, fn(result, err: error), and return a function that cancels them, as in web3/rpc.
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/abi"
+import "github.com/cajulang/web3/accounts"
+import "github.com/cajulang/web3/rpc"
+import "github.com/cajulang/ui"
+import "std/json"
+import "std/strings"
+import "std/os"
+
+# ---------------------------------------------------------------- addresses
+
+# EntryPoint v0.7 (the same address on every chain)
+export const ENTRY_POINT_V07 = "0x0000000071727De22E5E9d8BAf0edAc6f37da032"
+# EntryPoint v0.8 (hashes user operations with EIP-712; supports EIP-7702 senders)
+export const ENTRY_POINT_V08 = "0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108"
+# eth-infinitism SimpleAccountFactory for EntryPoint v0.7
+export const SIMPLE_ACCOUNT_FACTORY_V07 = "0x91E60e0613810449d098b0b5Ec8b51A0FE8c8985"
+# the SimpleAccount implementation SIMPLE_ACCOUNT_FACTORY_V07 deployed (its accountImplementation())
+export const SIMPLE_ACCOUNT_V07_IMPLEMENTATION = "0x68641DE71cfEa5a5d0D29712449Ee254bb1400C2"
+# eth-infinitism Simple7702Account (EntryPoint v0.8): the implementation an EOA delegates to
+export const SIMPLE_7702_ACCOUNT_V08 = "0x4Cd241E8d1510e30b2076397afc7508Ae59C66c9"
+# the factory a user operation names when its sender is an EIP-7702 account being delegated
+# (EntryPoint v0.8: initCode starting with 0x7702 then 18 zero bytes)
+export const EIP7702_FACTORY = "0x7702000000000000000000000000000000000000"
+
+# a 65-byte signature with a valid shape, for gas estimation before the real one (it recovers to
+# an unrelated address, so validation fails without reverting)
+export const DUMMY_SIGNATURE = "0xfffffffffffffffffffffffffffffff0000000000000000000000000000000007aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1c"
+
+let ENTRY_POINT_ABI = abi.must_human([]str{
+  "struct PackedUserOperation { address sender; uint256 nonce; bytes initCode; bytes callData; bytes32 accountGasLimits; uint256 preVerificationGas; bytes32 gasFees; bytes paymasterAndData; bytes signature; }",
+  "function getNonce(address sender, uint192 key) view returns (uint256 nonce)",
+  "function getUserOpHash(PackedUserOperation userOp) view returns (bytes32)",
+  "function balanceOf(address account) view returns (uint256)",
+})
+
+let SIMPLE_ACCOUNT_ABI = abi.must_human([]str{
+  "function execute(address dest, uint256 value, bytes func)",
+  "function executeBatch(address[] dest, uint256[] value, bytes[] func)",
+  "function createAccount(address owner, uint256 salt) returns (address)",
+  "function getAddress(address owner, uint256 salt) view returns (address)",
+  "function initialize(address anOwner)",
+})
+
+let SIMPLE_7702_ABI = abi.must_human([]str{
+  "function execute(address target, uint256 value, bytes data)",
+  "function executeBatch((address target, uint256 value, bytes data)[] calls)",
+})
+
+# ---------------------------------------------------------------- user operations
+
+# an ERC-4337 user operation (EntryPoint v0.7/v0.8 fields). factory "" : the sender exists
+# already; paymaster "" : the sender pays. eip7702_auth: the sender's EIP-7702 authorization,
+# for an EOA that delegates in the same bundle (EntryPoint v0.8; factory EIP7702_FACTORY)
+export struct UserOperation {
+  sender: str
+  nonce: *web3.U256
+  factory: str
+  factory_data: str
+  call_data: str
+  call_gas_limit: *web3.U256
+  verification_gas_limit: *web3.U256
+  pre_verification_gas: *web3.U256
+  max_fee_per_gas: *web3.U256
+  max_priority_fee_per_gas: *web3.U256
+  paymaster: str
+  paymaster_verification_gas_limit: *web3.U256
+  paymaster_post_op_gas_limit: *web3.U256
+  paymaster_data: str
+  signature: str
+  eip7702_auth: *accounts.Authorization
+}
+
+# the on-chain form of a user operation (PackedUserOperation): raw bytes
+export struct PackedUserOperation {
+  sender: str
+  nonce: *web3.U256
+  init_code: str                    # factory || factoryData
+  call_data: str
+  account_gas_limits: str           # 32 bytes: verificationGasLimit (16) || callGasLimit (16)
+  pre_verification_gas: *web3.U256
+  gas_fees: str                     # 32 bytes: maxPriorityFeePerGas (16) || maxFeePerGas (16)
+  paymaster_and_data: str           # paymaster || pmVerificationGas (16) || pmPostOpGas (16) || paymasterData
+  signature: str
+}
+
+# a call a smart account makes
+export struct Call {
+  to_: str                          # "to" (a reserved word)
+  value: *web3.U256                 # nil: 0
+  data: str                         # raw bytes
+}
+
+fn uz(u: *web3.U256) -> *web3.U256 {
+  if u == nil { return web3.zero() }
+  return u
+}
+
+# the 16 bytes of a value below 2^128
+fn u128(u: *web3.U256, what: str) -> (str, error) {
+  v := uz(u)
+  if !v.shr(128).is_zero() { return "", errors.New("aa: " + what + " above 2^128") }
+  return v.bytes32()[16:32], nil
+}
+
+fn addr20(s: str, what: str) -> (str, error) {
+  b, err := web3.address_bytes(s)
+  if err != nil { return "", errors.New("aa: invalid " + what + " address \"" + s + "\"") }
+  return b, nil
+}
+
+# factory || factoryData ("" without a factory). The 0x7702 marker is padded to 20 bytes
+fn init_code(op: *UserOperation) -> (str, error) {
+  if op.factory == "" { return "", nil }
+  if web3.is_hex(op.factory, 2) && strings.to_lower(op.factory) == "0x7702" { return web3.must_hex(EIP7702_FACTORY) + op.factory_data, nil }
+  f, err := addr20(op.factory, "factory")
+  if err != nil { return "", err }
+  return f + op.factory_data, nil
+}
+
+# the PackedUserOperation of op, as EntryPoint v0.7/v0.8 takes it
+export fn pack(op: *UserOperation) -> (*PackedUserOperation, error) {
+  if op == nil { return nil, errors.New("aa: nil user operation") }
+  if _, err := addr20(op.sender, "sender"); err != nil { return nil, err }
+  ic, err := init_code(op)
+  if err != nil { return nil, err }
+  vgl, e1 := u128(op.verification_gas_limit, "verificationGasLimit")
+  if e1 != nil { return nil, e1 }
+  cgl, e2 := u128(op.call_gas_limit, "callGasLimit")
+  if e2 != nil { return nil, e2 }
+  mpf, e3 := u128(op.max_priority_fee_per_gas, "maxPriorityFeePerGas")
+  if e3 != nil { return nil, e3 }
+  mf, e4 := u128(op.max_fee_per_gas, "maxFeePerGas")
+  if e4 != nil { return nil, e4 }
+  pmd := ""
+  if op.paymaster != "" {
+    pm, e5 := addr20(op.paymaster, "paymaster")
+    if e5 != nil { return nil, e5 }
+    pvg, e6 := u128(op.paymaster_verification_gas_limit, "paymasterVerificationGasLimit")
+    if e6 != nil { return nil, e6 }
+    ppo, e7 := u128(op.paymaster_post_op_gas_limit, "paymasterPostOpGasLimit")
+    if e7 != nil { return nil, e7 }
+    pmd = pm + pvg + ppo + op.paymaster_data
+  }
+  sender, _ := web3.get_address(op.sender)
+  return &PackedUserOperation{sender: sender, nonce: uz(op.nonce), init_code: ic, call_data: op.call_data, account_gas_limits: vgl + cgl, pre_verification_gas: uz(op.pre_verification_gas), gas_fees: mpf + mf, paymaster_and_data: pmd, signature: op.signature}, nil
+}
+
+# the user operation a PackedUserOperation holds (the reverse of pack)
+export fn unpack(p: *PackedUserOperation) -> (*UserOperation, error) {
+  if p == nil { return nil, errors.New("aa: nil packed user operation") }
+  if len(p.account_gas_limits) != 32 || len(p.gas_fees) != 32 { return nil, errors.New("aa: accountGasLimits and gasFees must have 32 bytes") }
+  if len(p.paymaster_and_data) > 0 && len(p.paymaster_and_data) < 52 { return nil, errors.New("aa: paymasterAndData shorter than 52 bytes") }
+  if len(p.init_code) > 0 && len(p.init_code) < 20 { return nil, errors.New("aa: initCode shorter than 20 bytes") }
+  op := &UserOperation{sender: p.sender, nonce: uz(p.nonce), call_data: p.call_data, pre_verification_gas: uz(p.pre_verification_gas), signature: p.signature}
+  op.verification_gas_limit = web3.from_bytes(p.account_gas_limits[0:16])
+  op.call_gas_limit = web3.from_bytes(p.account_gas_limits[16:32])
+  op.max_priority_fee_per_gas = web3.from_bytes(p.gas_fees[0:16])
+  op.max_fee_per_gas = web3.from_bytes(p.gas_fees[16:32])
+  if len(p.init_code) >= 20 {
+    op.factory = web3.address_from_bytes(p.init_code[0:20])
+    op.factory_data = p.init_code[20:]
+  }
+  if len(p.paymaster_and_data) >= 52 {
+    op.paymaster = web3.address_from_bytes(p.paymaster_and_data[0:20])
+    op.paymaster_verification_gas_limit = web3.from_bytes(p.paymaster_and_data[20:36])
+    op.paymaster_post_op_gas_limit = web3.from_bytes(p.paymaster_and_data[36:52])
+    op.paymaster_data = p.paymaster_and_data[52:]
+  }
+  return op, nil
+}
+
+# the tuple getUserOpHash and handleOps take
+fn packed_tuple(p: *PackedUserOperation) -> []any {
+  return []any{p.sender, p.nonce, p.init_code, p.call_data, p.account_gas_limits, p.pre_verification_gas, p.gas_fees, p.paymaster_and_data, p.signature}
+}
+
+let PACKED_TYPES = []str{"address", "uint256", "bytes32", "bytes32", "bytes32", "uint256", "bytes32", "bytes32"}
+
+# the fields of a packed user operation as UserOperationLib.encode hashes them (no signature)
+fn hashed_fields(p: *PackedUserOperation, init_code_hash: str) -> []any {
+  return []any{p.sender, p.nonce, init_code_hash, web3.keccak256(p.call_data), p.account_gas_limits, p.pre_verification_gas, p.gas_fees, web3.keccak256(p.paymaster_and_data)}
+}
+
+# the hash an account signs, "0x" hex, as EntryPoint.getUserOpHash computes it. For
+# ENTRY_POINT_V08 this is user_operation_hash_v08; any other entry point uses the v0.7 formula
+# keccak256(abi.encode(keccak256(abi.encode(sender, nonce, keccak256(initCode),
+# keccak256(callData), accountGasLimits, preVerificationGas, gasFees,
+# keccak256(paymasterAndData))), entryPoint, chainId))
+export fn user_operation_hash(op: *UserOperation, entry_point: str, chain_id: int) -> (str, error) {
+  if web3.same_address(entry_point, ENTRY_POINT_V08) { return user_operation_hash_v08(op, entry_point, chain_id) }
+  p, err := pack(op)
+  if err != nil { return "", err }
+  if _, e2 := addr20(entry_point, "entry point"); e2 != nil { return "", e2 }
+  inner, e3 := abi.encode_types(PACKED_TYPES, hashed_fields(p, web3.keccak256(p.init_code)))
+  if e3 != nil { return "", e3 }
+  outer, e4 := abi.encode_types([]str{"bytes32", "address", "uint256"}, []any{web3.keccak256(inner), entry_point, chain_id})
+  if e4 != nil { return "", e4 }
+  return web3.keccak256_hex(outer), nil
+}
+
+let PACKED_USEROP_TYPEHASH = web3.keccak256("PackedUserOperation(address sender,uint256 nonce,bytes initCode,bytes callData,bytes32 accountGasLimits,uint256 preVerificationGas,bytes32 gasFees,bytes paymasterAndData)")
+let EIP712_DOMAIN_TYPEHASH = web3.keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
+
+# the EntryPoint v0.8 hash: EIP-712 typed data of the PackedUserOperation, domain
+# {name: "ERC4337", version: "1", chainId, verifyingContract: entry_point}. With an EIP-7702
+# initCode (factory EIP7702_FACTORY) the hashed initCode is the delegate (eip7702_auth.address)
+# followed by factoryData, as the EntryPoint does
+export fn user_operation_hash_v08(op: *UserOperation, entry_point: str, chain_id: int) -> (str, error) {
+  p, err := pack(op)
+  if err != nil { return "", err }
+  if _, e2 := addr20(entry_point, "entry point"); e2 != nil { return "", e2 }
+  ich := web3.keccak256(p.init_code)
+  if len(p.init_code) >= 20 && p.init_code[0:20] == web3.must_hex(EIP7702_FACTORY) {
+    if op.eip7702_auth == nil { return "", errors.New("aa: an EIP-7702 user operation needs eip7702_auth (the delegate)") }
+    d, e5 := addr20(op.eip7702_auth.address, "delegate")
+    if e5 != nil { return "", e5 }
+    ich = web3.keccak256(d + p.init_code[20:])
+  }
+  fields := append([]any{PACKED_USEROP_TYPEHASH}, hashed_fields(p, ich)...)
+  sh, e3 := abi.encode_types(append([]str{"bytes32"}, PACKED_TYPES...), fields)
+  if e3 != nil { return "", e3 }
+  dom, e4 := abi.encode_types([]str{"bytes32", "bytes32", "bytes32", "uint256", "address"}, []any{EIP712_DOMAIN_TYPEHASH, web3.keccak256("ERC4337"), web3.keccak256("1"), chain_id, entry_point})
+  if e4 != nil { return "", e4 }
+  return web3.keccak256_hex(string([]byte{byte(0x19), byte(0x01)}) + web3.keccak256(dom) + web3.keccak256(sh)), nil
+}
+
+# the call data of EntryPoint.getUserOpHash(op) (to check a hash against the chain with eth_call)
+export fn encode_get_user_op_hash(op: *UserOperation) -> (str, error) {
+  p, err := pack(op)
+  if err != nil { return "", err }
+  return abi.encode_function_data(ENTRY_POINT_ABI.function("getUserOpHash"), []any{packed_tuple(p)})
+}
+
+# ---------------------------------------------------------------- JSON-RPC form (ERC-7769)
+
+fn q(u: *web3.U256) -> str { return uz(u).hex() }
+
+fn authorization_json(a: *accounts.Authorization) -> map[str]any {
+  return map[str]any{"chainId": rpc.quantity_int(a.chain_id), "address": a.address, "nonce": rpc.quantity_int(a.nonce), "yParity": rpc.quantity_int(a.y_parity), "r": q(a.r), "s": q(a.s)}
+}
+
+# op as bundlers take it (ERC-7769, EntryPoint v0.7 format): hex quantities, "0x" hex bytes;
+# factory/factoryData and the paymaster fields only when set; eip7702Auth when set
+export fn user_operation_json(op: *UserOperation) -> map[str]any {
+  m := map[str]any{}
+  m["sender"] = op.sender
+  m["nonce"] = q(op.nonce)
+  if op.factory != "" {
+    m["factory"] = op.factory
+    m["factoryData"] = web3.to_hex(op.factory_data)
+  }
+  m["callData"] = web3.to_hex(op.call_data)
+  m["callGasLimit"] = q(op.call_gas_limit)
+  m["verificationGasLimit"] = q(op.verification_gas_limit)
+  m["preVerificationGas"] = q(op.pre_verification_gas)
+  m["maxFeePerGas"] = q(op.max_fee_per_gas)
+  m["maxPriorityFeePerGas"] = q(op.max_priority_fee_per_gas)
+  if op.paymaster != "" {
+    m["paymaster"] = op.paymaster
+    m["paymasterVerificationGasLimit"] = q(op.paymaster_verification_gas_limit)
+    m["paymasterPostOpGasLimit"] = q(op.paymaster_post_op_gas_limit)
+    m["paymasterData"] = web3.to_hex(op.paymaster_data)
+  }
+  m["signature"] = web3.to_hex(op.signature)
+  if op.eip7702_auth != nil { m["eip7702Auth"] = authorization_json(op.eip7702_auth) }
+  return m
+}
+
+# a user operation from its JSON-RPC form (a JSON object)
+export fn parse_user_operation(v: *json.Value) -> (*UserOperation, error) {
+  if v == nil || v.kind != "object" { return nil, errors.New("aa: a user operation must be a JSON object") }
+  op := &UserOperation{sender: jaddr(v.field("sender")), nonce: uz(ju256(v.field("nonce"))), factory: jaddr(v.field("factory")), factory_data: jbytes(v.field("factoryData")), call_data: jbytes(v.field("callData")), call_gas_limit: uz(ju256(v.field("callGasLimit"))), verification_gas_limit: uz(ju256(v.field("verificationGasLimit"))), pre_verification_gas: uz(ju256(v.field("preVerificationGas"))), max_fee_per_gas: uz(ju256(v.field("maxFeePerGas"))), max_priority_fee_per_gas: uz(ju256(v.field("maxPriorityFeePerGas"))), paymaster: jaddr(v.field("paymaster")), paymaster_verification_gas_limit: ju256(v.field("paymasterVerificationGasLimit")), paymaster_post_op_gas_limit: ju256(v.field("paymasterPostOpGasLimit")), paymaster_data: jbytes(v.field("paymasterData")), signature: jbytes(v.field("signature"))}
+  a := v.field("eip7702Auth")
+  if a != nil && a.kind == "object" {
+    op.eip7702_auth = &accounts.Authorization{chain_id: jint(a.field("chainId")), address: jaddr(a.field("address")), nonce: jint(a.field("nonce")), y_parity: jint(a.field("yParity")), r: uz(ju256(a.field("r"))), s: uz(ju256(a.field("s")))}
+  }
+  if op.sender == "" { return nil, errors.New("aa: a user operation without sender") }
+  return op, nil
+}
+
+# ---------------------------------------------------------------- JSON helpers
+
+fn ju256(v: *json.Value) -> *web3.U256 {
+  if v == nil { return nil }
+  if v.kind == "number" {
+    if v.is_int { return web3.from_int(v.i) }
+    return web3.from_int(int(v.n))
+  }
+  if v.kind != "string" || v.s == "" { return nil }
+  r, err := web3.parse_u256(v.s)
+  if err != nil { return nil }
+  return r
+}
+
+fn jint(v: *json.Value) -> int {
+  u := ju256(v)
+  if u == nil { return 0 }
+  n, _ := u.to_int()
+  return n
+}
+
+fn jstr(v: *json.Value) -> str {
+  if v == nil || v.kind != "string" { return "" }
+  return v.s
+}
+
+fn jbytes(v: *json.Value) -> str {
+  s := jstr(v)
+  if s == "" { return "" }
+  b, err := web3.from_hex(s)
+  if err != nil { return "" }
+  return b
+}
+
+fn jaddr(v: *json.Value) -> str {
+  s := jstr(v)
+  if s == "" { return "" }
+  if web3.is_hex(s, 20) { return web3.checksum_address(s) }
+  return s
+}
+
+fn log_of(v: *json.Value) -> *rpc.Log {
+  topics := []str{}
+  for _, t := range v.get_array("topics") { topics = append(topics, jbytes(t)) }
+  return &rpc.Log{address: jaddr(v.field("address")), topics: topics, data: jbytes(v.field("data")), block_number: jint(v.field("blockNumber")), block_hash: jstr(v.field("blockHash")), transaction_hash: jstr(v.field("transactionHash")), transaction_index: jint(v.field("transactionIndex")), log_index: jint(v.field("logIndex")), removed: v.get_bool("removed", false)}
+}
+
+fn logs_of(v: *json.Value) -> []*rpc.Log {
+  out := []*rpc.Log{}
+  if v == nil || v.kind != "array" { return out }
+  for _, x := range v.items { out = append(out, log_of(x)) }
+  return out
+}
+
+fn receipt_of(v: *json.Value) -> *rpc.Receipt {
+  if v == nil || v.kind != "object" { return nil }
+  return &rpc.Receipt{transaction_hash: jstr(v.field("transactionHash")), transaction_index: jint(v.field("transactionIndex")), block_hash: jstr(v.field("blockHash")), block_number: jint(v.field("blockNumber")), from_: jaddr(v.field("from")), to_: jaddr(v.field("to")), status: jint(v.field("status")), gas_used: jint(v.field("gasUsed")), cumulative_gas_used: jint(v.field("cumulativeGasUsed")), effective_gas_price: ju256(v.field("effectiveGasPrice")), contract_address: jaddr(v.field("contractAddress")), logs: logs_of(v.field("logs")), tx_type: jint(v.field("type"))}
+}
+
+fn bad(method: str, res: str) -> error {
+  if len(res) > 120 { res = res[0:120] + "..." }
+  return errors.New("aa: unexpected result for " + method + ": " + res)
+}
+
+# the JSON result of a request: an object (nil for null), or an error
+fn object_result(method: str, res: str) -> (*json.Value, error) {
+  doc, err := json.parse(res)
+  if err != nil { return nil, errors.New("aa: " + method + " answered invalid JSON") }
+  if doc.is_null() { return nil, nil }
+  if doc.kind != "object" { return nil, bad(method, res) }
+  return doc, nil
+}
+
+fn ep_or_default(ep: str) -> str {
+  if ep == "" { return ENTRY_POINT_V07 }
+  return ep
+}
+
+# ---------------------------------------------------------------- bundler client
+
+# a bundler (ERC-4337 JSON-RPC: eth_sendUserOperation...). Pimlico, Alchemy, Stackup, Biconomy,
+# Candide and others serve these methods; most also serve ERC-7677 paymaster methods (paymaster())
+export struct BundlerClient {
+  client: *rpc.Client
+}
+
+# a bundler client: c.url is the bundler's URL (c.transport for tests and mocks)
+export fn create_bundler_client(c: *rpc.ClientConfig) -> *BundlerClient {
+  return &BundlerClient{client: rpc.create_public_client(c)}
+}
+
+# what eth_estimateUserOperationGas answers (paymaster limits nil without a paymaster)
+export struct GasEstimate {
+  pre_verification_gas: *web3.U256
+  verification_gas_limit: *web3.U256
+  call_gas_limit: *web3.U256
+  paymaster_verification_gas_limit: *web3.U256
+  paymaster_post_op_gas_limit: *web3.U256
+}
+
+# what eth_getUserOperationReceipt answers once the operation is in a block
+export struct UserOperationReceipt {
+  user_op_hash: str
+  entry_point: str
+  sender: str
+  nonce: *web3.U256
+  paymaster: str
+  actual_gas_cost: *web3.U256
+  actual_gas_used: *web3.U256
+  success: bool
+  reason: str                       # the revert data (hex) when success is false
+  logs: []*rpc.Log                  # the logs of this user operation
+  receipt: *rpc.Receipt             # the bundle transaction's receipt
+}
+
+# what eth_getUserOperationByHash answers
+export struct UserOperationInfo {
+  user_operation: *UserOperation
+  entry_point: str
+  block_number: int                 # 0 while pending
+  block_hash: str
+  transaction_hash: str
+}
+
+# sends a signed user operation; cb gets its hash ("0x" hex). entry_point "": ENTRY_POINT_V07
+export fn (b: *BundlerClient) send_user_operation(op: *UserOperation, entry_point: str, cb: fn(str, error)) -> fn() {
+  method := "eth_sendUserOperation"
+  return b.client.request(method, []any{user_operation_json(op), ep_or_default(entry_point)}, fn(res: str, err: error) {
+    if err != nil {
+      cb("", err)
+      return
+    }
+    doc, perr := json.parse(res)
+    if perr != nil || doc.kind != "string" {
+      cb("", bad(method, res))
+      return
+    }
+    cb(doc.s, nil)
+  })
+}
+
+# the gas a user operation needs (sign it with a dummy signature first: dummy_signature())
+export fn (b: *BundlerClient) estimate_user_operation_gas(op: *UserOperation, entry_point: str, cb: fn(*GasEstimate, error)) -> fn() {
+  method := "eth_estimateUserOperationGas"
+  return b.client.request(method, []any{user_operation_json(op), ep_or_default(entry_point)}, fn(res: str, err: error) {
+    if err != nil {
+      cb(nil, err)
+      return
+    }
+    v, perr := object_result(method, res)
+    if perr == nil && v == nil { perr = bad(method, res) }
+    if perr != nil {
+      cb(nil, perr)
+      return
+    }
+    cb(&GasEstimate{pre_verification_gas: ju256(v.field("preVerificationGas")), verification_gas_limit: ju256(v.field("verificationGasLimit")), call_gas_limit: ju256(v.field("callGasLimit")), paymaster_verification_gas_limit: ju256(v.field("paymasterVerificationGasLimit")), paymaster_post_op_gas_limit: ju256(v.field("paymasterPostOpGasLimit"))}, nil)
+  })
+}
+
+# the receipt of a user operation; nil, nil while it is not in a block
+export fn (b: *BundlerClient) get_user_operation_receipt(hash: str, cb: fn(*UserOperationReceipt, error)) -> fn() {
+  method := "eth_getUserOperationReceipt"
+  return b.client.request(method, []any{hash}, fn(res: str, err: error) {
+    if err != nil {
+      cb(nil, err)
+      return
+    }
+    v, perr := object_result(method, res)
+    if perr != nil || v == nil {
+      cb(nil, perr)
+      return
+    }
+    r := &UserOperationReceipt{user_op_hash: jstr(v.field("userOpHash")), entry_point: jaddr(v.field("entryPoint")), sender: jaddr(v.field("sender")), nonce: ju256(v.field("nonce")), paymaster: jaddr(v.field("paymaster")), actual_gas_cost: ju256(v.field("actualGasCost")), actual_gas_used: ju256(v.field("actualGasUsed")), success: v.get_bool("success", false), reason: jstr(v.field("reason")), logs: logs_of(v.field("logs")), receipt: receipt_of(v.field("receipt"))}
+    cb(r, nil)
+  })
+}
+
+# a user operation the bundler knows; nil, nil if it does not
+export fn (b: *BundlerClient) get_user_operation_by_hash(hash: str, cb: fn(*UserOperationInfo, error)) -> fn() {
+  method := "eth_getUserOperationByHash"
+  return b.client.request(method, []any{hash}, fn(res: str, err: error) {
+    if err != nil {
+      cb(nil, err)
+      return
+    }
+    v, perr := object_result(method, res)
+    if perr != nil || v == nil {
+      cb(nil, perr)
+      return
+    }
+    op, oerr := parse_user_operation(v.field("userOperation"))
+    if oerr != nil {
+      cb(nil, oerr)
+      return
+    }
+    cb(&UserOperationInfo{user_operation: op, entry_point: jaddr(v.field("entryPoint")), block_number: jint(v.field("blockNumber")), block_hash: jstr(v.field("blockHash")), transaction_hash: jstr(v.field("transactionHash"))}, nil)
+  })
+}
+
+# the entry points the bundler serves
+export fn (b: *BundlerClient) supported_entry_points(cb: fn([]str, error)) -> fn() {
+  method := "eth_supportedEntryPoints"
+  return b.client.request(method, nil, fn(res: str, err: error) {
+    if err != nil {
+      cb(nil, err)
+      return
+    }
+    doc, perr := json.parse(res)
+    if perr != nil || doc.kind != "array" {
+      cb(nil, bad(method, res))
+      return
+    }
+    out := []str{}
+    for _, x := range doc.items { out = append(out, jaddr(x)) }
+    cb(out, nil)
+  })
+}
+
+# the chain id the bundler serves
+export fn (b: *BundlerClient) chain_id(cb: fn(int, error)) -> fn() { return b.client.chain_id(cb) }
+
+# the bundler as an ERC-7677 paymaster service (many bundlers serve both)
+export fn (b: *BundlerClient) paymaster() -> *PaymasterClient { return &PaymasterClient{client: b.client} }
+
+struct Waiter {
+  b: *BundlerClient
+  hash: str
+  poll_ms: int
+  timeout_ms: int
+  polls: int
+  done: bool
+  timer: int
+  abort: fn()
+  last_err: error
+  cb: fn(*UserOperationReceipt, error)
+}
+
+fn (w: *Waiter) finish(r: *UserOperationReceipt, err: error) {
+  if w.done { return }
+  w.done = true
+  k := w.cb
+  k(r, err)
+}
+
+# one poll; in the page the next one is scheduled on a timer
+fn (w: *Waiter) poll() {
+  if w.done { return }
+  if w.timeout_ms > 0 && w.polls * w.poll_ms >= w.timeout_ms {
+    msg := "aa: timed out after " + str(w.timeout_ms) + " ms waiting for the receipt of user operation " + w.hash
+    if w.last_err != nil { msg = msg + " (last error: " + w.last_err.Error() + ")" }
+    w.finish(nil, errors.New(msg))
+    return
+  }
+  w.polls++
+  w.abort = w.b.get_user_operation_receipt(w.hash, fn(r: *UserOperationReceipt, err: error) {
+    if w.done { return }
+    if err != nil {
+      if _, isrpc := err.(*rpc.RpcError); isrpc {
+        w.finish(nil, err)
+        return
+      }
+      w.last_err = err
+    } else if r != nil {
+      w.finish(r, nil)
+      return
+    }
+    if ui.in_page() { w.timer = ui.set_timeout(w.poll_ms, fn() { w.poll() }) }
+  })
+}
+
+# polls eth_getUserOperationReceipt until the operation is in a block; cb gets the receipt or an
+# error (a bundler error, or the timeout: opts.timeout_ms, 0 means 180000, negative none).
+# opts.poll_ms 0: the client's. Polls on page timers in the page; on the server it blocks until
+# done (as rpc.wait_for_transaction_receipt). opts.confirmations is ignored
+export fn (b: *BundlerClient) wait_for_user_operation_receipt(hash: str, opts: *rpc.WaitOptions, cb: fn(*UserOperationReceipt, error)) -> fn() {
+  w := &Waiter{b: b, hash: hash, poll_ms: b.client.poll_ms, timeout_ms: 180000, cb: cb}
+  if opts != nil {
+    if opts.poll_ms > 0 { w.poll_ms = opts.poll_ms }
+    if opts.timeout_ms != 0 { w.timeout_ms = opts.timeout_ms }
+  }
+  if ui.in_page() {
+    w.poll()
+    return fn() {
+      w.done = true
+      ui.clear_timer(w.timer)
+      if w.abort != nil { run0(w.abort) }
+    }
+  }
+  while !w.done {
+    w.poll()
+    if w.done { break }
+    os.sleep(num(w.poll_ms) / 1000.0)
+  }
+  return fn() { w.done = true }
+}
+
+fn run0(f: fn()) { f() }
+
+# ---------------------------------------------------------------- paymasters (ERC-7677)
+
+# a paymaster service (ERC-7677: pm_getPaymasterStubData, pm_getPaymasterData)
+export struct PaymasterClient {
+  client: *rpc.Client
+}
+
+# a paymaster client: c.url is the service's URL
+export fn create_paymaster_client(c: *rpc.ClientConfig) -> *PaymasterClient {
+  return &PaymasterClient{client: rpc.create_public_client(c)}
+}
+
+# what a paymaster service answers (v0.7 fields). is_final: the stub data is already the final
+# data (pm_getPaymasterData is not needed). The gas limits may be nil
+export struct PaymasterResult {
+  paymaster: str
+  paymaster_data: str
+  paymaster_verification_gas_limit: *web3.U256
+  paymaster_post_op_gas_limit: *web3.U256
+  sponsor_name: str
+  sponsor_icon: str
+  is_final: bool
+}
+
+fn (p: *PaymasterClient) pm_call(method: str, op: *UserOperation, entry_point: str, chain_id: int, context: any, cb: fn(*PaymasterResult, error)) -> fn() {
+  ctx := context
+  if ctx == nil { ctx = map[str]any{} }
+  return p.client.request(method, []any{user_operation_json(op), ep_or_default(entry_point), rpc.quantity_int(chain_id), ctx}, fn(res: str, err: error) {
+    if err != nil {
+      cb(nil, err)
+      return
+    }
+    v, perr := object_result(method, res)
+    if perr == nil && v == nil { perr = bad(method, res) }
+    if perr != nil {
+      cb(nil, perr)
+      return
+    }
+    r := &PaymasterResult{paymaster: jaddr(v.field("paymaster")), paymaster_data: jbytes(v.field("paymasterData")), paymaster_verification_gas_limit: ju256(v.field("paymasterVerificationGasLimit")), paymaster_post_op_gas_limit: ju256(v.field("paymasterPostOpGasLimit")), sponsor_name: v.get_str("sponsor.name", ""), sponsor_icon: v.get_str("sponsor.icon", ""), is_final: v.get_bool("isFinal", false)}
+    if r.paymaster == "" {
+      cb(nil, errors.New("aa: " + method + " answered no paymaster"))
+      return
+    }
+    cb(r, nil)
+  })
+}
+
+# paymaster data good enough for gas estimation (context: the service's options, nil for {})
+export fn (p: *PaymasterClient) get_paymaster_stub_data(op: *UserOperation, entry_point: str, chain_id: int, context: any, cb: fn(*PaymasterResult, error)) -> fn() {
+  return p.pm_call("pm_getPaymasterStubData", op, entry_point, chain_id, context, cb)
+}
+
+# the final paymaster data for op (with its gas limits filled in)
+export fn (p: *PaymasterClient) get_paymaster_data(op: *UserOperation, entry_point: str, chain_id: int, context: any, cb: fn(*PaymasterResult, error)) -> fn() {
+  return p.pm_call("pm_getPaymasterData", op, entry_point, chain_id, context, cb)
+}
+
+# sets op's paymaster fields from r (the gas limits only when r has them)
+export fn apply_paymaster(op: *UserOperation, r: *PaymasterResult) {
+  op.paymaster = r.paymaster
+  op.paymaster_data = r.paymaster_data
+  if r.paymaster_verification_gas_limit != nil { op.paymaster_verification_gas_limit = r.paymaster_verification_gas_limit }
+  if r.paymaster_post_op_gas_limit != nil { op.paymaster_post_op_gas_limit = r.paymaster_post_op_gas_limit }
+}
+
+# ---------------------------------------------------------------- EntryPoint reads
+
+# the next nonce of sender at the EntryPoint for a 192-bit key (nil: 0); the key is in the top
+# 192 bits of the result
+export fn get_nonce(public: *rpc.Client, entry_point: str, sender: str, key: *web3.U256, cb: fn(*web3.U256, error)) -> fn() {
+  data, err := abi.encode_function_data(ENTRY_POINT_ABI.function("getNonce"), []any{sender, uz(key)})
+  if err != nil {
+    cb(nil, err)
+    return nil
+  }
+  return public.call(&rpc.CallRequest{to_: ep_or_default(entry_point), data: data}, "latest", fn(out: str, cerr: error) {
+    if cerr != nil {
+      cb(nil, cerr)
+      return
+    }
+    if len(out) != 32 {
+      cb(nil, errors.New("aa: getNonce answered " + str(len(out)) + " bytes (is there an EntryPoint at " + entry_point + "?)"))
+      return
+    }
+    cb(web3.from_bytes(out), nil)
+  })
+}
+
+# the user operation hash as the EntryPoint computes it (eth_call getUserOpHash), "0x" hex
+export fn get_user_operation_hash(public: *rpc.Client, entry_point: str, op: *UserOperation, cb: fn(str, error)) -> fn() {
+  data, err := encode_get_user_op_hash(op)
+  if err != nil {
+    cb("", err)
+    return nil
+  }
+  return public.call(&rpc.CallRequest{to_: ep_or_default(entry_point), data: data}, "latest", fn(out: str, cerr: error) {
+    if cerr != nil {
+      cb("", cerr)
+      return
+    }
+    if len(out) != 32 {
+      cb("", errors.New("aa: getUserOpHash answered " + str(len(out)) + " bytes"))
+      return
+    }
+    cb(web3.to_hex(out), nil)
+  })
+}
+
+# ---------------------------------------------------------------- smart accounts
+
+# a smart account that send_calls can drive. Implemented here: *SimpleAccount (ERC-4337,
+# EntryPoint v0.7) and *Simple7702Account (an EOA delegated with EIP-7702, EntryPoint v0.8).
+# Another account (Safe, Kernel, Light, Coinbase Smart Wallet...) implements these methods
+export interface SmartAccount {
+  # the EntryPoint it works with
+  entry_point() -> str
+  # its address (counterfactual: before it is deployed)
+  address(cb: fn(str, error)) -> fn()
+  # the factory and factory data that deploy it ("" and "" when there is nothing to deploy)
+  factory_args() -> (str, str, error)
+  # the call data that makes it run calls (callData of the user operation)
+  encode_calls(calls: []*Call) -> (str, error)
+  # its signature (raw bytes) of a user operation hash ("0x" hex or 32 raw bytes)
+  sign_user_operation_hash(h: str) -> (str, error)
+  # a signature of the right shape for gas estimation (raw bytes)
+  dummy_signature() -> str
+  # the EIP-7702 implementation it delegates to ("" for a contract account)
+  delegation() -> str
+  # signs the EIP-7702 authorization of delegation() (an error for contract accounts)
+  sign_authorization(chain_id: int, nonce: int) -> (*accounts.Authorization, error)
+}
+
+# eth-infinitism's SimpleAccount v0.7: an ERC1967 proxy created by SimpleAccountFactory, owned
+# by one ECDSA key; its user operations are signed with EIP-191 (personal_sign of the hash)
+export struct SimpleAccount {
+  owner: *accounts.Account
+  public: *rpc.Client
+  factory: str                      # SIMPLE_ACCOUNT_FACTORY_V07
+  salt: *web3.U256
+  ep: str                           # ENTRY_POINT_V07
+  addr: str                         # the address, once known (set it to skip the eth_call)
+}
+
+# the SimpleAccount of owner with salt (nil: 0); public reads its address from the factory
+export fn simple_account(owner: *accounts.Account, public: *rpc.Client, salt: *web3.U256) -> *SimpleAccount {
+  return &SimpleAccount{owner: owner, public: public, factory: SIMPLE_ACCOUNT_FACTORY_V07, salt: uz(salt), ep: ENTRY_POINT_V07}
+}
+
+export fn (a: *SimpleAccount) entry_point() -> str { return a.ep }
+
+# the account's address: computed (simple_account_address) with the default factory; with
+# another factory, factory.getAddress(owner, salt) by eth_call (once; then cached)
+export fn (a: *SimpleAccount) address(cb: fn(str, error)) -> fn() {
+  if a.addr == "" && web3.same_address(a.factory, SIMPLE_ACCOUNT_FACTORY_V07) {
+    addr, aerr := simple_account_address(a.owner.address, a.salt)
+    if aerr != nil {
+      cb("", aerr)
+      return nil
+    }
+    a.addr = addr
+  }
+  if a.addr != "" {
+    cb(a.addr, nil)
+    return nil
+  }
+  data, err := abi.encode_function_data(SIMPLE_ACCOUNT_ABI.function("getAddress"), []any{a.owner.address, a.salt})
+  if err != nil {
+    cb("", err)
+    return nil
+  }
+  if a.public == nil {
+    cb("", errors.New("aa: SimpleAccount needs a public client to read its address"))
+    return nil
+  }
+  return a.public.call(&rpc.CallRequest{to_: a.factory, data: data}, "latest", fn(out: str, cerr: error) {
+    if cerr != nil {
+      cb("", cerr)
+      return
+    }
+    if len(out) != 32 {
+      cb("", errors.New("aa: getAddress answered " + str(len(out)) + " bytes (is there a SimpleAccountFactory at " + a.factory + "?)"))
+      return
+    }
+    a.addr = web3.address_from_bytes(out[12:32])
+    cb(a.addr, nil)
+  })
+}
+
+# the creation code of the ERC1967Proxy that SIMPLE_ACCOUNT_FACTORY_V07 deploys (OpenZeppelin 5,
+# solc 0.8.23), as embedded in the factory's code
+let ERC1967_PROXY_CODE = web3.must_hex("0x608060405260405161041738038061041783398101604081905261002291610268565b61002c8282610033565b5050610352565b61003c82610092565b6040516001600160a01b038316907fbc7cd75a20ee27fd9adebab32041f755214dbc6bffa90cc0225b39da2e5c2d3b90600090a280511561008657610081828261010e565b505050565b61008e610185565b5050565b806001600160a01b03163b6000036100cd57604051634c9c8ce360e01b81526001600160a01b03821660048201526024015b60405180910390fd5b7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc80546001600160a01b0319166001600160a01b0392909216919091179055565b6060600080846001600160a01b03168460405161012b9190610336565b600060405180830381855af49150503d8060008114610166576040519150601f19603f3d011682016040523d82523d6000602084013e61016b565b606091505b50909250905061017c8583836101a6565b95945050505050565b34156101a45760405163b398979f60e01b815260040160405180910390fd5b565b6060826101bb576101b682610205565b6101fe565b81511580156101d257506001600160a01b0384163b155b156101fb57604051639996b31560e01b81526001600160a01b03851660048201526024016100c4565b50805b9392505050565b8051156102155780518082602001fd5b604051630a12f52160e11b815260040160405180910390fd5b634e487b7160e01b600052604160045260246000fd5b60005b8381101561025f578181015183820152602001610247565b50506000910152565b6000806040838503121561027b57600080fd5b82516001600160a01b038116811461029257600080fd5b60208401519092506001600160401b03808211156102af57600080fd5b818501915085601f8301126102c357600080fd5b8151818111156102d5576102d561022e565b604051601f8201601f19908116603f011681019083821181831017156102fd576102fd61022e565b8160405282815288602084870101111561031657600080fd5b610327836020830160208801610244565b80955050505050509250929050565b60008251610348818460208701610244565b9190910192915050565b60b7806103606000396000f3fe6080604052600a600c565b005b60186014601a565b605e565b565b600060597f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc5473ffffffffffffffffffffffffffffffffffffffff1690565b905090565b3660008037600080366000845af43d6000803e808015607c573d6000f35b3d6000fdfea2646970667358221220d7f23a80daebb5531c9e4a18d87e812fca112e5df7e56433218edcc12bbe415d64736f6c63430008170033")
+
+# the CREATE2 address (EIP-1014) of init code deployed by deployer with a 32-byte salt
+export fn create2_address(deployer: str, salt: *web3.U256, init_code_hash: str) -> (str, error) {
+  d, err := addr20(deployer, "deployer")
+  if err != nil { return "", err }
+  return web3.address_from_bytes(web3.keccak256(string([]byte{byte(0xff)}) + d + uz(salt).bytes32() + init_code_hash)[12:32]), nil
+}
+
+# the counterfactual address of the SimpleAccount v0.7 of owner with salt, as
+# SIMPLE_ACCOUNT_FACTORY_V07.getAddress(owner, salt) computes it (no network)
+export fn simple_account_address(owner: str, salt: *web3.U256) -> (str, error) {
+  init, err := abi.encode_function_data(SIMPLE_ACCOUNT_ABI.function("initialize"), []any{owner})
+  if err != nil { return "", err }
+  args, err2 := abi.encode_types([]str{"address", "bytes"}, []any{SIMPLE_ACCOUNT_V07_IMPLEMENTATION, init})
+  if err2 != nil { return "", err2 }
+  return create2_address(SIMPLE_ACCOUNT_FACTORY_V07, salt, web3.keccak256(ERC1967_PROXY_CODE + args))
+}
+
+# factory and createAccount(owner, salt)
+export fn (a: *SimpleAccount) factory_args() -> (str, str, error) {
+  data, err := abi.encode_function_data(SIMPLE_ACCOUNT_ABI.function("createAccount"), []any{a.owner.address, a.salt})
+  if err != nil { return "", "", err }
+  return a.factory, data, nil
+}
+
+# execute(dest, value, func) for one call; executeBatch(dest[], value[], func[]) for several
+export fn (a: *SimpleAccount) encode_calls(calls: []*Call) -> (str, error) {
+  if len(calls) == 1 {
+    c := calls[0]
+    return abi.encode_function_data(SIMPLE_ACCOUNT_ABI.function("execute"), []any{c.to_, uz(c.value), c.data})
+  }
+  dests := []any{}
+  values := []any{}
+  datas := []any{}
+  for _, c2 := range calls {
+    if c2 == nil { return "", errors.New("aa: nil call") }
+    dests = append(dests, c2.to_)
+    values = append(values, uz(c2.value))
+    datas = append(datas, c2.data)
+  }
+  return abi.encode_function_data(SIMPLE_ACCOUNT_ABI.function("executeBatch"), []any{dests, values, datas})
+}
+
+# the owner's EIP-191 signature of the hash (65 raw bytes)
+export fn (a: *SimpleAccount) sign_user_operation_hash(h: str) -> (str, error) {
+  hb, err := hash_bytes(h)
+  if err != nil { return "", err }
+  return web3.from_hex(a.owner.sign_message(hb))
+}
+
+export fn (a: *SimpleAccount) dummy_signature() -> str { return web3.must_hex(DUMMY_SIGNATURE) }
+export fn (a: *SimpleAccount) delegation() -> str { return "" }
+export fn (a: *SimpleAccount) sign_authorization(chain_id: int, nonce: int) -> (*accounts.Authorization, error) {
+  return nil, errors.New("aa: SimpleAccount is a contract account (no EIP-7702 authorization)")
+}
+
+fn hash_bytes(h: str) -> (str, error) {
+  if len(h) == 32 { return h, nil }
+  if web3.is_hex(h, 32) { return web3.from_hex(h) }
+  return "", errors.New("aa: a user operation hash must have 32 bytes")
+}
+
+# ---------------------------------------------------------------- EIP-7702 smart EOAs
+
+# an EOA delegated (EIP-7702) to eth-infinitism's Simple7702Account (or another implementation
+# with the same interface: execute(target, value, data), executeBatch((target, value, data)[]),
+# user operations signed with the raw ECDSA signature of the hash). Its address is the EOA's.
+# It works two ways: as an ERC-4337 account with EntryPoint v0.8 (send_calls: the first user
+# operation carries the authorization, eip7702Auth), or with plain type-4 transactions the EOA
+# sends and pays itself (send_transaction)
+export struct Simple7702Account {
+  owner: *accounts.Account
+  public: *rpc.Client
+  implementation: str               # SIMPLE_7702_ACCOUNT_V08
+  ep: str                           # ENTRY_POINT_V08
+}
+
+export fn simple_7702_account(owner: *accounts.Account, public: *rpc.Client) -> *Simple7702Account {
+  return &Simple7702Account{owner: owner, public: public, implementation: SIMPLE_7702_ACCOUNT_V08, ep: ENTRY_POINT_V08}
+}
+
+export fn (a: *Simple7702Account) entry_point() -> str { return a.ep }
+
+export fn (a: *Simple7702Account) address(cb: fn(str, error)) -> fn() {
+  cb(a.owner.address, nil)
+  return nil
+}
+
+# nothing to deploy (send_calls adds the EIP-7702 factory marker while the EOA is not delegated)
+export fn (a: *Simple7702Account) factory_args() -> (str, str, error) { return "", "", nil }
+
+# execute(target, value, data) for one call; executeBatch((target, value, data)[]) for several
+export fn (a: *Simple7702Account) encode_calls(calls: []*Call) -> (str, error) {
+  return encode_7702_calls(calls)
+}
+
+# the calls as Simple7702Account (and BaseAccount v0.8) runs them
+export fn encode_7702_calls(calls: []*Call) -> (str, error) {
+  if len(calls) == 1 {
+    c := calls[0]
+    return abi.encode_function_data(SIMPLE_7702_ABI.function("execute"), []any{c.to_, uz(c.value), c.data})
+  }
+  items := []any{}
+  for _, c2 := range calls {
+    if c2 == nil { return "", errors.New("aa: nil call") }
+    items = append(items, []any{c2.to_, uz(c2.value), c2.data})
+  }
+  return abi.encode_function_data(SIMPLE_7702_ABI.function("executeBatch"), []any{items})
+}
+
+# the owner's raw ECDSA signature of the hash (65 bytes, v 27/28)
+export fn (a: *Simple7702Account) sign_user_operation_hash(h: str) -> (str, error) {
+  sig, err := a.owner.sign_hash(h)
+  if err != nil { return "", err }
+  return accounts.serialize_signature(sig), nil
+}
+
+export fn (a: *Simple7702Account) dummy_signature() -> str { return web3.must_hex(DUMMY_SIGNATURE) }
+export fn (a: *Simple7702Account) delegation() -> str { return a.implementation }
+
+export fn (a: *Simple7702Account) sign_authorization(chain_id: int, nonce: int) -> (*accounts.Authorization, error) {
+  return a.owner.sign_authorization(chain_id, a.implementation, nonce)
+}
+
+# the address an EIP-7702 account delegates to, from its code (0xef0100 || address); "" if the
+# code is not a delegation
+export fn delegation_of(code: str) -> str {
+  if len(code) != 23 || int(code[0]) != 0xef || int(code[1]) != 0x01 || int(code[2]) != 0x00 { return "" }
+  return web3.address_from_bytes(code[3:23])
+}
+
+# the transaction that makes the EOA run calls through its delegate: to itself, with the calls
+# encoded by encode_7702_calls. With delegated false it is a type-4 transaction that also
+# delegates the EOA (the authorization's nonce is nonce + 1, since the EOA sends it); with true,
+# a type-2 transaction. Fees nil are zero
+export fn (a: *Simple7702Account) build_transaction(chain_id: int, nonce: int, gas: int, max_fee_per_gas: *web3.U256, max_priority_fee_per_gas: *web3.U256, calls: []*Call, delegated: bool) -> (*accounts.Transaction, error) {
+  data, err := encode_7702_calls(calls)
+  if err != nil { return nil, err }
+  tx := &accounts.Transaction{type_: accounts.TX_EIP1559, chain_id: chain_id, nonce: nonce, gas: gas, max_fee_per_gas: uz(max_fee_per_gas), max_priority_fee_per_gas: uz(max_priority_fee_per_gas), to_: a.owner.address, data: data}
+  if !delegated {
+    auth, aerr := a.sign_authorization(chain_id, nonce + 1)
+    if aerr != nil { return nil, aerr }
+    tx.type_ = accounts.TX_EIP7702
+    tx.authorization_list = []*accounts.Authorization{auth}
+  }
+  return tx, nil
+}
+
+# runs calls from the EOA with one transaction it signs and pays: reads chain id, nonce, code
+# (is it delegated to the implementation already?) and fees, estimates the gas (with the
+# authorization when it delegates; plus 20%), signs and sends. cb gets the transaction hash
+export fn (a: *Simple7702Account) send_transaction(calls: []*Call, cb: fn(str, error)) -> fn() {
+  f := &TxFlow{a: a, calls: calls, cb: cb}
+  f.start()
+  return fn() { f.cancel() }
+}
+
+struct TxFlow {
+  a: *Simple7702Account
+  calls: []*Call
+  cb: fn(str, error)
+  chain_id: int
+  nonce: int
+  delegated: bool
+  fees: *rpc.Fees
+  tx: *accounts.Transaction
+  done: bool
+  abort: fn()
+}
+
+fn (f: *TxFlow) finish(h: str, err: error) {
+  if f.done { return }
+  f.done = true
+  k := f.cb
+  k(h, err)
+}
+
+fn (f: *TxFlow) cancel() {
+  if f.done { return }
+  f.done = true
+  if f.abort != nil { run0(f.abort) }
+}
+
+fn (f: *TxFlow) start() {
+  if f.a.public == nil {
+    f.finish("", errors.New("aa: Simple7702Account needs a public client to send transactions"))
+    return
+  }
+  pc := f.a.public
+  f.abort = pc.chain_id(fn(id: int, err: error) {
+    if f.done { return }
+    if err != nil {
+      f.finish("", err)
+      return
+    }
+    f.chain_id = id
+    f.abort = pc.get_transaction_count(f.a.owner.address, "pending", fn(n: int, err2: error) {
+      if f.done { return }
+      if err2 != nil {
+        f.finish("", err2)
+        return
+      }
+      f.nonce = n
+      f.abort = pc.get_code(f.a.owner.address, "latest", fn(code: str, err3: error) {
+        if f.done { return }
+        if err3 != nil {
+          f.finish("", err3)
+          return
+        }
+        f.delegated = web3.same_address(delegation_of(code), f.a.implementation)
+        f.abort = pc.estimate_fees_per_gas(fn(fees: *rpc.Fees, err4: error) {
+          if f.done { return }
+          if err4 != nil {
+            f.finish("", err4)
+            return
+          }
+          f.fees = fees
+          f.estimate()
+        })
+      })
+    })
+  })
+}
+
+fn (f: *TxFlow) estimate() {
+  tx, err := f.a.build_transaction(f.chain_id, f.nonce, 0, f.fees.max_fee_per_gas, f.fees.max_priority_fee_per_gas, f.calls, f.delegated)
+  if err != nil {
+    f.finish("", err)
+    return
+  }
+  f.tx = tx
+  req := map[str]any{"from": f.a.owner.address, "to": f.a.owner.address, "data": web3.to_hex(tx.data)}
+  if len(tx.authorization_list) > 0 { req["authorizationList"] = []any{authorization_json(tx.authorization_list[0])} }
+  f.abort = f.a.public.request("eth_estimateGas", []any{req}, fn(res: str, err2: error) {
+    if f.done { return }
+    if err2 != nil {
+      f.finish("", err2)
+      return
+    }
+    doc, perr := json.parse(res)
+    g := 0
+    if perr == nil { g = jint(doc) }
+    if g <= 0 {
+      f.finish("", bad("eth_estimateGas", res))
+      return
+    }
+    f.tx.gas = g + g / 5
+    raw, serr := f.a.owner.sign_transaction(f.tx)
+    if serr != nil {
+      f.finish("", serr)
+      return
+    }
+    f.abort = f.a.public.send_raw_transaction(raw, fn(h: str, err3: error) { f.finish(h, err3) })
+  })
+}
+
+# ---------------------------------------------------------------- send_calls
+
+# how send_calls fills a user operation; nil fields are read from the network
+export struct SendOptions {
+  nonce: *web3.U256                 # nil: EntryPoint.getNonce(sender, nonce_key)
+  nonce_key: *web3.U256             # nil: 0
+  max_fee_per_gas: *web3.U256       # nil (both): the public client's estimate_fees_per_gas
+  max_priority_fee_per_gas: *web3.U256
+  paymaster: *PaymasterClient       # nil: the account pays its own gas
+  paymaster_context: any            # ERC-7677 context (nil: {})
+}
+
+struct Flow {
+  acct: SmartAccount
+  bundler: *BundlerClient
+  public: *rpc.Client
+  calls: []*Call
+  o: SendOptions
+  op: *UserOperation
+  ep: str
+  chain_id: int
+  stub_final: bool
+  done: bool
+  abort: fn()
+  cb: fn(*UserOperation, int, error)
+}
+
+fn (f: *Flow) finish(op: *UserOperation, err: error) {
+  if f.done { return }
+  f.done = true
+  k := f.cb
+  k(op, f.chain_id, err)
+}
+
+fn (f: *Flow) fail(err: error) -> bool {
+  if f.done { return true }
+  if err != nil {
+    f.finish(nil, err)
+    return true
+  }
+  return false
+}
+
+fn (f: *Flow) cancel() {
+  if f.done { return }
+  f.done = true
+  if f.abort != nil { run0(f.abort) }
+}
+
+# a user operation for calls, ready to sign: chain id, sender, factory (when the account has no
+# code yet) or EIP-7702 authorization (when the EOA is not delegated yet), nonce, fees, call
+# data, paymaster (opts.paymaster: stub data, then the final data) and gas (the bundler's
+# estimate). cb gets it with the chain id, for user_operation_hash
+export fn prepare_user_operation(acct: SmartAccount, bundler: *BundlerClient, public: *rpc.Client, calls: []*Call, opts: *SendOptions, cb: fn(*UserOperation, int, error)) -> fn() {
+  f := &Flow{acct: acct, bundler: bundler, public: public, calls: calls, op: &UserOperation{}, ep: acct.entry_point(), cb: cb}
+  if opts != nil { f.o = *opts }
+  f.start()
+  return fn() { f.cancel() }
+}
+
+fn (f: *Flow) start() {
+  data, err := f.acct.encode_calls(f.calls)
+  if f.fail(err) { return }
+  f.op.call_data = data
+  f.op.signature = f.acct.dummy_signature()
+  f.abort = f.public.chain_id(fn(id: int, err2: error) {
+    if f.fail(err2) { return }
+    f.chain_id = id
+    f.abort = f.acct.address(fn(addr: str, err3: error) {
+      if f.fail(err3) { return }
+      f.op.sender = addr
+      f.abort = f.public.get_code(addr, "latest", fn(code: str, err4: error) {
+        if f.fail(err4) { return }
+        f.deployment(code)
+      })
+    })
+  })
+}
+
+# factory or authorization, from the sender's code
+fn (f: *Flow) deployment(code: str) {
+  impl := f.acct.delegation()
+  if impl != "" {
+    if web3.same_address(delegation_of(code), impl) {
+      f.nonce()
+      return
+    }
+    f.abort = f.public.get_transaction_count(f.op.sender, "pending", fn(n: int, err: error) {
+      if f.fail(err) { return }
+      auth, aerr := f.acct.sign_authorization(f.chain_id, n)
+      if f.fail(aerr) { return }
+      f.op.factory = EIP7702_FACTORY
+      f.op.eip7702_auth = auth
+      f.nonce()
+    })
+    return
+  }
+  if code == "" {
+    fac, fdata, err2 := f.acct.factory_args()
+    if f.fail(err2) { return }
+    if fac == "" {
+      f.fail(errors.New("aa: the account " + f.op.sender + " has no code and no factory"))
+      return
+    }
+    f.op.factory = fac
+    f.op.factory_data = fdata
+  }
+  f.nonce()
+}
+
+fn (f: *Flow) nonce() {
+  if f.o.nonce != nil {
+    f.op.nonce = f.o.nonce
+    f.fees()
+    return
+  }
+  f.abort = get_nonce(f.public, f.ep, f.op.sender, f.o.nonce_key, fn(n: *web3.U256, err: error) {
+    if f.fail(err) { return }
+    f.op.nonce = n
+    f.fees()
+  })
+}
+
+fn (f: *Flow) fees() {
+  if f.o.max_fee_per_gas != nil {
+    f.op.max_fee_per_gas = f.o.max_fee_per_gas
+    f.op.max_priority_fee_per_gas = uz(f.o.max_priority_fee_per_gas)
+    f.stub()
+    return
+  }
+  f.abort = f.public.estimate_fees_per_gas(fn(fees: *rpc.Fees, err: error) {
+    if f.fail(err) { return }
+    f.op.max_fee_per_gas = fees.max_fee_per_gas
+    f.op.max_priority_fee_per_gas = fees.max_priority_fee_per_gas
+    if f.o.max_priority_fee_per_gas != nil { f.op.max_priority_fee_per_gas = f.o.max_priority_fee_per_gas }
+    f.stub()
+  })
+}
+
+fn (f: *Flow) stub() {
+  if f.o.paymaster == nil {
+    f.estimate()
+    return
+  }
+  f.abort = f.o.paymaster.get_paymaster_stub_data(f.op, f.ep, f.chain_id, f.o.paymaster_context, fn(r: *PaymasterResult, err: error) {
+    if f.fail(err) { return }
+    apply_paymaster(f.op, r)
+    f.stub_final = r.is_final
+    f.estimate()
+  })
+}
+
+fn (f: *Flow) estimate() {
+  f.abort = f.bundler.estimate_user_operation_gas(f.op, f.ep, fn(g: *GasEstimate, err: error) {
+    if f.fail(err) { return }
+    f.op.pre_verification_gas = uz(g.pre_verification_gas)
+    f.op.verification_gas_limit = uz(g.verification_gas_limit)
+    f.op.call_gas_limit = uz(g.call_gas_limit)
+    if f.op.paymaster != "" {
+      if g.paymaster_verification_gas_limit != nil { f.op.paymaster_verification_gas_limit = g.paymaster_verification_gas_limit }
+      if g.paymaster_post_op_gas_limit != nil { f.op.paymaster_post_op_gas_limit = g.paymaster_post_op_gas_limit }
+    }
+    f.final_paymaster()
+  })
+}
+
+fn (f: *Flow) final_paymaster() {
+  if f.o.paymaster == nil || f.stub_final {
+    f.finish(f.op, nil)
+    return
+  }
+  f.abort = f.o.paymaster.get_paymaster_data(f.op, f.ep, f.chain_id, f.o.paymaster_context, fn(r: *PaymasterResult, err: error) {
+    if f.fail(err) { return }
+    apply_paymaster(f.op, r)
+    f.finish(f.op, nil)
+  })
+}
+
+# signs op for acct (op.signature): the hash for acct's entry point and chain_id
+export fn sign_user_operation(acct: SmartAccount, op: *UserOperation, chain_id: int) -> error {
+  h, err := user_operation_hash(op, acct.entry_point(), chain_id)
+  if err != nil { return err }
+  sig, serr := acct.sign_user_operation_hash(h)
+  if serr != nil { return serr }
+  op.signature = sig
+  return nil
+}
+
+# runs calls from a smart account: prepare_user_operation, sign_user_operation, then
+# bundler.send_user_operation. cb gets the user operation hash (wait with
+# bundler.wait_for_user_operation_receipt)
+export fn send_calls(acct: SmartAccount, bundler: *BundlerClient, public: *rpc.Client, calls: []*Call, opts: *SendOptions, cb: fn(str, error)) -> fn() {
+  st := &SendState{}
+  st.abort = prepare_user_operation(acct, bundler, public, calls, opts, fn(op: *UserOperation, chain_id: int, err: error) {
+    if st.canceled { return }
+    if err != nil {
+      cb("", err)
+      return
+    }
+    serr := sign_user_operation(acct, op, chain_id)
+    if serr != nil {
+      cb("", serr)
+      return
+    }
+    st.abort = bundler.send_user_operation(op, acct.entry_point(), cb)
+  })
+  return fn() {
+    if st.canceled { return }
+    st.canceled = true
+    if st.abort != nil { run0(st.abort) }
+  }
+}
+
+struct SendState {
+  canceled: bool
+  abort: fn()
+}

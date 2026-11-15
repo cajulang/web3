@@ -1,0 +1,107 @@
+# web3/aa against public nodes, read-only (no bundler, no funds). Runs only with
+# CAJU_NET_TESTS=1:
+#   CAJU_NET_TESTS=1 caju test ./tests
+# caju:platforms linux
+import { describe, it, skip, expect } from "std/testing"
+import "github.com/cajulang/web3"
+import "github.com/cajulang/web3/aa"
+import "github.com/cajulang/web3/abi"
+import "github.com/cajulang/web3/chains"
+import "github.com/cajulang/web3/rpc"
+import "github.com/cajulang/fetch/native"
+import "std/os"
+
+let LIVE = os.getenv("CAJU_NET_TESTS") == "1"
+
+fn live(title: str, body: fn()) {
+  if LIVE {
+    it(title, body)
+  } else {
+    skip(title + " (set CAJU_NET_TESTS=1)", body)
+  }
+}
+
+fn client(c: *chains.Chain) -> *rpc.Client { return rpc.create_public_client(&rpc.ClientConfig{chain: c}) }
+
+fn code_size(c: *chains.Chain, addr: str) -> int {
+  n := -1
+  client(c).get_code(addr, "latest", fn(code: str, err: error) {
+    if err != nil {
+      print(c.name + ": " + err.Error())
+      return
+    }
+    n = len(code)
+  })
+  return n
+}
+
+fn sample() -> *aa.UserOperation {
+  return &aa.UserOperation{sender: "0x1234567890123456789012345678901234567890", nonce: web3.u256(7), factory: aa.SIMPLE_ACCOUNT_FACTORY_V07, factory_data: web3.must_hex("0x5fbfb9cf000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb922660000000000000000000000000000000000000000000000000000000000000000"), call_data: web3.must_hex("0xb61d27f6"), call_gas_limit: web3.u256(100000), verification_gas_limit: web3.u256(500000), pre_verification_gas: web3.u256(50000), max_fee_per_gas: web3.u256(3000000000), max_priority_fee_per_gas: web3.u256(1000000000), paymaster: "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", paymaster_verification_gas_limit: web3.u256(60000), paymaster_post_op_gas_limit: web3.u256(30000), paymaster_data: web3.must_hex("0xdeadbeef"), signature: web3.must_hex("0x1234")}
+}
+
+describe("aa on public nodes", fn() {
+  live("finds EntryPoint v0.7 and v0.8 on Ethereum, Base and Sepolia", fn() {
+    for _, c := range []*chains.Chain{chains.ethereum, chains.base, chains.sepolia, chains.base_sepolia} {
+      expect(code_size(c, aa.ENTRY_POINT_V07)).to_be_greater_than(1000)
+      expect(code_size(c, aa.ENTRY_POINT_V08)).to_be_greater_than(1000)
+    }
+  })
+
+  live("finds SimpleAccountFactory v0.7 and Simple7702Account on Sepolia and Base Sepolia", fn() {
+    for _, c := range []*chains.Chain{chains.sepolia, chains.base_sepolia} {
+      expect(code_size(c, aa.SIMPLE_ACCOUNT_FACTORY_V07)).to_be_greater_than(1000)
+      expect(code_size(c, aa.SIMPLE_ACCOUNT_V07_IMPLEMENTATION)).to_be_greater_than(1000)
+      expect(code_size(c, aa.SIMPLE_7702_ACCOUNT_V08)).to_be_greater_than(1000)
+    }
+  })
+
+  live("computes the hash getUserOpHash gives (v0.7 and v0.8, Sepolia)", fn() {
+    c := client(chains.sepolia)
+    for _, ep := range []str{aa.ENTRY_POINT_V07, aa.ENTRY_POINT_V08} {
+      want, _ := aa.user_operation_hash(sample(), ep, 11155111)
+      got := ""
+      aa.get_user_operation_hash(c, ep, sample(), fn(h: str, err: error) {
+        expect(err).to_be_nil()
+        got = h
+      })
+      expect(got).to_equal(want)
+    }
+  })
+
+  live("computes the hash getUserOpHash gives on Base", fn() {
+    want, _ := aa.user_operation_hash(sample(), aa.ENTRY_POINT_V07, 8453)
+    got := ""
+    aa.get_user_operation_hash(client(chains.base), aa.ENTRY_POINT_V07, sample(), fn(h: str, err: error) { got = h })
+    expect(got).to_equal(want)
+  })
+
+  live("computes SimpleAccount addresses as the factory's getAddress", fn() {
+    a := abi.must_human([]str{"function getAddress(address owner, uint256 salt) view returns (address)", "function accountImplementation() view returns (address)"})
+    c := client(chains.sepolia)
+    impl := ""
+    d0, _ := abi.encode_function_data(a.function("accountImplementation"), []any{})
+    c.call(&rpc.CallRequest{to_: aa.SIMPLE_ACCOUNT_FACTORY_V07, data: d0}, "latest", fn(out: str, err: error) { impl = web3.address_from_bytes(out[12:32]) })
+    expect(impl).to_equal(aa.SIMPLE_ACCOUNT_V07_IMPLEMENTATION)
+    for _, salt := range []int{0, 1, 123456} {
+      owner := "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+      d, _ := abi.encode_function_data(a.function("getAddress"), []any{owner, salt})
+      got := ""
+      c.call(&rpc.CallRequest{to_: aa.SIMPLE_ACCOUNT_FACTORY_V07, data: d}, "latest", fn(out: str, err: error) {
+        expect(err).to_be_nil()
+        got = web3.address_from_bytes(out[12:32])
+      })
+      want, _ := aa.simple_account_address(owner, web3.u256(salt))
+      expect(got).to_equal(want)
+    }
+  })
+
+  live("reads an EntryPoint nonce", fn() {
+    nonce_hex := ""
+    aa.get_nonce(client(chains.sepolia), aa.ENTRY_POINT_V07, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", web3.u256(5), fn(n: *web3.U256, err: error) {
+      expect(err).to_be_nil()
+      nonce_hex = n.hex()
+    })
+    # key 5 in the top 192 bits, sequence 0 (nobody uses that key)
+    expect(nonce_hex).to_equal("0x50000000000000000")
+  })
+})
