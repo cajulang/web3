@@ -286,73 +286,16 @@ export fn user_operation_json(op: *UserOperation) -> map[str]any {
 # a user operation from its JSON-RPC form (a JSON object)
 export fn parse_user_operation(v: *json.Value) -> (*UserOperation, error) {
   if v == nil || v.kind != "object" { return nil, errors.New("aa: a user operation must be a JSON object") }
-  op := &UserOperation{sender: jaddr(v.field("sender")), nonce: uz(ju256(v.field("nonce"))), factory: jaddr(v.field("factory")), factory_data: jbytes(v.field("factoryData")), call_data: jbytes(v.field("callData")), call_gas_limit: uz(ju256(v.field("callGasLimit"))), verification_gas_limit: uz(ju256(v.field("verificationGasLimit"))), pre_verification_gas: uz(ju256(v.field("preVerificationGas"))), max_fee_per_gas: uz(ju256(v.field("maxFeePerGas"))), max_priority_fee_per_gas: uz(ju256(v.field("maxPriorityFeePerGas"))), paymaster: jaddr(v.field("paymaster")), paymaster_verification_gas_limit: ju256(v.field("paymasterVerificationGasLimit")), paymaster_post_op_gas_limit: ju256(v.field("paymasterPostOpGasLimit")), paymaster_data: jbytes(v.field("paymasterData")), signature: jbytes(v.field("signature"))}
+  op := &UserOperation{sender: rpc.json_address(v.field("sender")), nonce: uz(rpc.json_u256(v.field("nonce"))), factory: rpc.json_address(v.field("factory")), factory_data: rpc.json_bytes(v.field("factoryData")), call_data: rpc.json_bytes(v.field("callData")), call_gas_limit: uz(rpc.json_u256(v.field("callGasLimit"))), verification_gas_limit: uz(rpc.json_u256(v.field("verificationGasLimit"))), pre_verification_gas: uz(rpc.json_u256(v.field("preVerificationGas"))), max_fee_per_gas: uz(rpc.json_u256(v.field("maxFeePerGas"))), max_priority_fee_per_gas: uz(rpc.json_u256(v.field("maxPriorityFeePerGas"))), paymaster: rpc.json_address(v.field("paymaster")), paymaster_verification_gas_limit: rpc.json_u256(v.field("paymasterVerificationGasLimit")), paymaster_post_op_gas_limit: rpc.json_u256(v.field("paymasterPostOpGasLimit")), paymaster_data: rpc.json_bytes(v.field("paymasterData")), signature: rpc.json_bytes(v.field("signature"))}
   a := v.field("eip7702Auth")
   if a != nil && a.kind == "object" {
-    op.eip7702_auth = &accounts.Authorization{chain_id: jint(a.field("chainId")), address: jaddr(a.field("address")), nonce: jint(a.field("nonce")), y_parity: jint(a.field("yParity")), r: uz(ju256(a.field("r"))), s: uz(ju256(a.field("s")))}
+    op.eip7702_auth = &accounts.Authorization{chain_id: rpc.json_int(a.field("chainId")), address: rpc.json_address(a.field("address")), nonce: rpc.json_int(a.field("nonce")), y_parity: rpc.json_int(a.field("yParity")), r: uz(rpc.json_u256(a.field("r"))), s: uz(rpc.json_u256(a.field("s")))}
   }
   if op.sender == "" { return nil, errors.New("aa: a user operation without sender") }
   return op, nil
 }
 
-# ---------------------------------------------------------------- JSON helpers
-
-fn ju256(v: *json.Value) -> *web3.U256 {
-  if v == nil { return nil }
-  if v.kind == "number" {
-    if v.is_int { return web3.from_int(v.i) }
-    return web3.from_int(int(v.n))
-  }
-  if v.kind != "string" || v.s == "" { return nil }
-  r, err := web3.parse_u256(v.s)
-  if err != nil { return nil }
-  return r
-}
-
-fn jint(v: *json.Value) -> int {
-  u := ju256(v)
-  if u == nil { return 0 }
-  n, _ := u.to_int()
-  return n
-}
-
-fn jstr(v: *json.Value) -> str {
-  if v == nil || v.kind != "string" { return "" }
-  return v.s
-}
-
-fn jbytes(v: *json.Value) -> str {
-  s := jstr(v)
-  if s == "" { return "" }
-  b, err := web3.from_hex(s)
-  if err != nil { return "" }
-  return b
-}
-
-fn jaddr(v: *json.Value) -> str {
-  s := jstr(v)
-  if s == "" { return "" }
-  if web3.is_hex(s, 20) { return web3.checksum_address(s) }
-  return s
-}
-
-fn log_of(v: *json.Value) -> *rpc.Log {
-  topics := []str{}
-  for _, t := range v.get_array("topics") { topics = append(topics, jbytes(t)) }
-  return &rpc.Log{address: jaddr(v.field("address")), topics: topics, data: jbytes(v.field("data")), block_number: jint(v.field("blockNumber")), block_hash: jstr(v.field("blockHash")), transaction_hash: jstr(v.field("transactionHash")), transaction_index: jint(v.field("transactionIndex")), log_index: jint(v.field("logIndex")), removed: v.get_bool("removed", false)}
-}
-
-fn logs_of(v: *json.Value) -> []*rpc.Log {
-  out := []*rpc.Log{}
-  if v == nil || v.kind != "array" { return out }
-  for _, x := range v.items { out = append(out, log_of(x)) }
-  return out
-}
-
-fn receipt_of(v: *json.Value) -> *rpc.Receipt {
-  if v == nil || v.kind != "object" { return nil }
-  return &rpc.Receipt{transaction_hash: jstr(v.field("transactionHash")), transaction_index: jint(v.field("transactionIndex")), block_hash: jstr(v.field("blockHash")), block_number: jint(v.field("blockNumber")), from_: jaddr(v.field("from")), to_: jaddr(v.field("to")), status: jint(v.field("status")), gas_used: jint(v.field("gasUsed")), cumulative_gas_used: jint(v.field("cumulativeGasUsed")), effective_gas_price: ju256(v.field("effectiveGasPrice")), contract_address: jaddr(v.field("contractAddress")), logs: logs_of(v.field("logs")), tx_type: jint(v.field("type"))}
-}
+# ---------------------------------------------------------------- JSON helpers (rpc.json_*)
 
 fn bad(method: str, res: str) -> error {
   if len(res) > 120 { res = res[0:120] + "..." }
@@ -450,7 +393,7 @@ export fn (b: *BundlerClient) estimate_user_operation_gas(op: *UserOperation, en
       cb(nil, perr)
       return
     }
-    cb(&GasEstimate{pre_verification_gas: ju256(v.field("preVerificationGas")), verification_gas_limit: ju256(v.field("verificationGasLimit")), call_gas_limit: ju256(v.field("callGasLimit")), paymaster_verification_gas_limit: ju256(v.field("paymasterVerificationGasLimit")), paymaster_post_op_gas_limit: ju256(v.field("paymasterPostOpGasLimit"))}, nil)
+    cb(&GasEstimate{pre_verification_gas: rpc.json_u256(v.field("preVerificationGas")), verification_gas_limit: rpc.json_u256(v.field("verificationGasLimit")), call_gas_limit: rpc.json_u256(v.field("callGasLimit")), paymaster_verification_gas_limit: rpc.json_u256(v.field("paymasterVerificationGasLimit")), paymaster_post_op_gas_limit: rpc.json_u256(v.field("paymasterPostOpGasLimit"))}, nil)
   })
 }
 
@@ -467,7 +410,7 @@ export fn (b: *BundlerClient) get_user_operation_receipt(hash: str, cb: fn(*User
       cb(nil, perr)
       return
     }
-    r := &UserOperationReceipt{user_op_hash: jstr(v.field("userOpHash")), entry_point: jaddr(v.field("entryPoint")), sender: jaddr(v.field("sender")), nonce: ju256(v.field("nonce")), paymaster: jaddr(v.field("paymaster")), actual_gas_cost: ju256(v.field("actualGasCost")), actual_gas_used: ju256(v.field("actualGasUsed")), success: v.get_bool("success", false), reason: jstr(v.field("reason")), logs: logs_of(v.field("logs")), receipt: receipt_of(v.field("receipt"))}
+    r := &UserOperationReceipt{user_op_hash: rpc.json_str(v.field("userOpHash")), entry_point: rpc.json_address(v.field("entryPoint")), sender: rpc.json_address(v.field("sender")), nonce: rpc.json_u256(v.field("nonce")), paymaster: rpc.json_address(v.field("paymaster")), actual_gas_cost: rpc.json_u256(v.field("actualGasCost")), actual_gas_used: rpc.json_u256(v.field("actualGasUsed")), success: v.get_bool("success", false), reason: rpc.json_str(v.field("reason")), logs: rpc.parse_logs(v.field("logs")), receipt: rpc.parse_receipt(v.field("receipt"))}
     cb(r, nil)
   })
 }
@@ -490,7 +433,7 @@ export fn (b: *BundlerClient) get_user_operation_by_hash(hash: str, cb: fn(*User
       cb(nil, oerr)
       return
     }
-    cb(&UserOperationInfo{user_operation: op, entry_point: jaddr(v.field("entryPoint")), block_number: jint(v.field("blockNumber")), block_hash: jstr(v.field("blockHash")), transaction_hash: jstr(v.field("transactionHash"))}, nil)
+    cb(&UserOperationInfo{user_operation: op, entry_point: rpc.json_address(v.field("entryPoint")), block_number: rpc.json_int(v.field("blockNumber")), block_hash: rpc.json_str(v.field("blockHash")), transaction_hash: rpc.json_str(v.field("transactionHash"))}, nil)
   })
 }
 
@@ -508,7 +451,7 @@ export fn (b: *BundlerClient) supported_entry_points(cb: fn([]str, error)) -> fn
       return
     }
     out := []str{}
-    for _, x := range doc.items { out = append(out, jaddr(x)) }
+    for _, x := range doc.items { out = append(out, rpc.json_address(x)) }
     cb(out, nil)
   })
 }
@@ -631,7 +574,7 @@ fn (p: *PaymasterClient) pm_call(method: str, op: *UserOperation, entry_point: s
       cb(nil, perr)
       return
     }
-    r := &PaymasterResult{paymaster: jaddr(v.field("paymaster")), paymaster_data: jbytes(v.field("paymasterData")), paymaster_verification_gas_limit: ju256(v.field("paymasterVerificationGasLimit")), paymaster_post_op_gas_limit: ju256(v.field("paymasterPostOpGasLimit")), sponsor_name: v.get_str("sponsor.name", ""), sponsor_icon: v.get_str("sponsor.icon", ""), is_final: v.get_bool("isFinal", false)}
+    r := &PaymasterResult{paymaster: rpc.json_address(v.field("paymaster")), paymaster_data: rpc.json_bytes(v.field("paymasterData")), paymaster_verification_gas_limit: rpc.json_u256(v.field("paymasterVerificationGasLimit")), paymaster_post_op_gas_limit: rpc.json_u256(v.field("paymasterPostOpGasLimit")), sponsor_name: v.get_str("sponsor.name", ""), sponsor_icon: v.get_str("sponsor.icon", ""), is_final: v.get_bool("isFinal", false)}
     if r.paymaster == "" {
       cb(nil, errors.New("aa: " + method + " answered no paymaster"))
       return
@@ -1025,7 +968,7 @@ fn (f: *TxFlow) estimate() {
     }
     doc, perr := json.parse(res)
     g := 0
-    if perr == nil { g = jint(doc) }
+    if perr == nil { g = rpc.json_int(doc) }
     if g <= 0 {
       f.finish("", bad("eth_estimateGas", res))
       return

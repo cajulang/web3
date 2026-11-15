@@ -71,6 +71,19 @@ describe("tokens on Ethereum", fn() {
     expect(bs[0].is_zero()).to_be_false()
   })
 
+  live("reads the native and token balances together (multicall.balances)", fn() {
+    let n: *web3.U256 = nil
+    let bs: []*web3.U256 = nil
+    multicall.balances(eth(), VITALIK, []str{USDC, DAI}, fn(nat: *web3.U256, v: []*web3.U256, err: error) {
+      expect(err).to_be_nil()
+      n = nat
+      bs = v
+    })
+    expect(n.is_zero()).to_be_false()
+    expect(len(bs)).to_equal(2)
+    for _, b := range bs { expect(b == nil).to_be_false() }
+  })
+
   live("decodes a real revert (USDC transfer beyond the balance)", fn() {
     usdc := contracts.contract(USDC, erc.ERC20, eth())
     let e: error = nil
@@ -117,5 +130,12 @@ describe("ENS on Ethereum", fn() {
       got = a
     })
     expect(web3.is_address(got)).to_be_true()
+  })
+
+  live("refuses an offchain name when CCIP-read is disabled", fn() {
+    c := rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum, ccip_read: &rpc.CcipRead{disabled: true}})
+    let e: error = nil
+    ens.resolve_address(c, "jesse.base.eth", fn(a: str, err: error) { e = err })
+    expect(ens.is_ccip_blocked(e)).to_be_true()
   })
 })

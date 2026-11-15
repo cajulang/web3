@@ -100,6 +100,18 @@ describe("rpc helpers", fn() {
     expect(rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum, url: "https://example.org/rpc"}).url).to_equal("https://example.org/rpc")
   })
 
+  it("exports its JSON readers", fn() {
+    doc, _ := json.parse(RECEIPT)
+    r := rpc.parse_receipt(doc)
+    expect(r.gas_used).to_equal(157647)
+    expect(rpc.json_address(doc.field("from"))).to_equal("0x5875Db54CD9AE2b2A875E09bB731772297aE9d92")
+    expect(rpc.parse_receipt(nil) == nil).to_be_true()
+    null, _ := json.parse("null")
+    expect(rpc.parse_transaction(null) == nil).to_be_true()
+    expect(rpc.json_u256(doc.field("nope")) == nil).to_be_true()
+    expect(rpc.parse_rpc_error(doc.field("from")).code).to_equal(-32603)
+  })
+
   it("fails a request without URL or transport", fn() {
     c := rpc.create_public_client(nil)
     let got: error = nil
@@ -785,5 +797,325 @@ describe("rpc waiting and watching", fn() {
     expect(p.get_str("0.fromBlock", "")).to_equal("0x13")
     expect(p.get_str("0.toBlock", "")).to_equal("0x13")
     expect(strings.contains(m.params[2], "\"fromBlock\":\"0x11\",\"toBlock\":\"0x12\"")).to_be_true()
+  })
+})
+
+# ---------------------------------------------------------------- fallback
+
+# a fetch transport with one behavior per URL: a status (0: network error) and a body, in turn
+struct Nodes {
+  replies: map[str][]*fetch.Response
+  urls: []str
+}
+
+fn new_nodes() -> *Nodes { return &Nodes{replies: map[str][]*fetch.Response{}} }
+
+# the next answers of url (the last one repeats); status 0 is a network error
+fn (n: *Nodes) on(url: str, status: int, body: str) { n.replies[url] = append(n.replies[url], &fetch.Response{status: status, body: body, headers: map[str]str{}}) }
+
+fn (n: *Nodes) hits(url: str) -> int {
+  k := 0
+  for _, u := range n.urls { if u == url { k++ } }
+  return k
+}
+
+fn (n: *Nodes) http() -> *fetch.Client {
+  return fetch.create(&fetch.Config{transport: fn(req: *fetch.Request, done: fn(*fetch.Response, error)) -> fn() {
+    n.urls = append(n.urls, req.url)
+    q := n.replies[req.url]
+    if len(q) == 0 {
+      done(nil, fetch.new_error("network", req, "connection refused"))
+      return nil
+    }
+    r := q[0]
+    if len(q) > 1 { n.replies[req.url] = q[1:] }
+    if r.status == 0 {
+      done(nil, fetch.new_error("network", req, "connection refused"))
+      return nil
+    }
+    if r.status == -1 {
+      done(nil, fetch.new_error("timeout", req, "timed out"))
+      return nil
+    }
+    done(r, nil)
+    return nil
+  }})
+}
+
+let A = "https://a.example/rpc"
+let B = "https://b.example/rpc"
+let C = "https://c.example/rpc"
+
+fn ok_body(result: str) -> str { return "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":" + result + "}" }
+
+describe("rpc fallback", fn() {
+  it("uses all of the chain's URLs by default, url alone, or url then urls", fn() {
+    c := rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum})
+    expect(c.urls).to_equal(chains.ethereum.rpc_urls)
+    expect(c.url).to_equal(chains.ethereum.rpc_urls[0])
+    expect(c.current_url()).to_equal(chains.ethereum.rpc_urls[0])
+    c2 := rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum, url: A})
+    expect(c2.urls).to_equal([]str{A})
+    c3 := rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum, url: A, urls: []str{B, A, " ", C}})
+    expect(c3.urls).to_equal([]str{A, B, C})
+    c4 := rpc.create_public_client(&rpc.ClientConfig{urls: []str{B, C}})
+    expect(c4.url).to_equal(B)
+  })
+
+  it("moves on at once on network errors, timeouts, 429 and 5xx, and sticks to the URL that answered", fn() {
+    n := new_nodes()
+    n.on(A, 0, "")
+    n.on(B, -1, "")
+    n.on(C, 200, ok_body("\"0x1\""))
+    c := rpc.create_public_client(&rpc.ClientConfig{urls: []str{A, B, C}, http_client: n.http()})
+    id := 0
+    c.chain_id(fn(v: int, err: error) {
+      expect(err).to_be_nil()
+      id = v
+    })
+    expect(id).to_equal(1)
+    expect(n.urls).to_equal([]str{A, B, C})
+    expect(c.url).to_equal(C)
+    bn := 0
+    n.replies[C] = []*fetch.Response{&fetch.Response{status: 200, body: ok_body("\"0x10\""), headers: map[str]str{}}}
+    c.block_number(fn(v: int, err: error) { bn = v })
+    expect(bn).to_equal(16)
+    expect(n.urls).to_equal([]str{A, B, C, C})
+    # C fails now: the next is A (wrapping around)
+    n2 := new_nodes()
+    n2.on(A, 200, ok_body("\"0x2\""))
+    n2.on(B, 503, "busy")
+    n2.on(C, 429, "slow down")
+    c2 := rpc.create_public_client(&rpc.ClientConfig{urls: []str{A, B, C}, http_client: n2.http()})
+    n2.replies[A] = []*fetch.Response{&fetch.Response{status: 500, body: "down", headers: map[str]str{}}, &fetch.Response{status: 200, body: ok_body("\"0x2\""), headers: map[str]str{}}}
+    n2.replies[B] = []*fetch.Response{&fetch.Response{status: 200, body: ok_body("\"0x3\""), headers: map[str]str{}}, &fetch.Response{status: 503, body: "busy", headers: map[str]str{}}}
+    c2.chain_id(fn(v: int, err: error) { id = v })
+    expect(id).to_equal(3)
+    expect(c2.url).to_equal(B)
+    c2.chain_id(fn(v: int, err: error) { id = v })
+    expect(id).to_equal(2)
+    expect(n2.urls).to_equal([]str{A, B, B, C, A})
+    expect(c2.url).to_equal(A)
+  })
+
+  it("does not fall back on JSON-RPC errors (a revert is an answer)", fn() {
+    n := new_nodes()
+    n.on(A, 200, "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":3,\"message\":\"execution reverted\",\"data\":\"0x08c379a0\"}}")
+    n.on(B, 200, ok_body("\"0x\""))
+    c := rpc.create_public_client(&rpc.ClientConfig{urls: []str{A, B}, http_client: n.http()})
+    let e: error = nil
+    c.call(&rpc.CallRequest{to_: USDC}, "", fn(b: str, err: error) { e = err })
+    expect(rpc.is_revert(e)).to_be_true()
+    expect(n.urls).to_equal([]str{A})
+    n2 := new_nodes()
+    n2.on(A, 400, "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602,\"message\":\"invalid argument\"}}")
+    c2 := rpc.create_public_client(&rpc.ClientConfig{urls: []str{A, B}, http_client: n2.http()})
+    c2.chain_id(fn(v: int, err: error) { e = err })
+    expect(e.Error()).to_contain("invalid argument")
+    expect(n2.urls).to_equal([]str{A})
+  })
+
+  it("falls back on other HTTP failures (403, an HTML page) but does not retry them", fn() {
+    n := new_nodes()
+    n.on(A, 403, "forbidden")
+    n.on(B, 200, "<html>captive portal</html>")
+    c := rpc.create_public_client(&rpc.ClientConfig{urls: []str{A, B}, http_client: n.http()})
+    let e: error = nil
+    c.chain_id(fn(v: int, err: error) { e = err })
+    expect(e.Error()).to_contain("not a JSON-RPC response")
+    expect(n.urls).to_equal([]str{A, B})
+  })
+
+  it("starts the round over after a pause, up to retries times, then gives the last error", fn() {
+    n := new_nodes()
+    n.on(A, 0, "")
+    n.on(B, 502, "bad gateway")
+    c := rpc.create_public_client(&rpc.ClientConfig{urls: []str{A, B}, http_client: n.http(), retries: 1})
+    let e: error = nil
+    c.chain_id(fn(v: int, err: error) { e = err })
+    expect(e.Error()).to_contain("HTTP 502 from " + B)
+    expect(n.urls).to_equal([]str{A, B, A, B})
+    expect(c.url).to_equal(A)
+    n.replies[B] = []*fetch.Response{&fetch.Response{status: 200, body: ok_body("\"0x5\""), headers: map[str]str{}}}
+    id := 0
+    c.chain_id(fn(v: int, err: error) { id = v })
+    expect(id).to_equal(5)
+    expect(c.url).to_equal(B)
+  })
+
+  it("falls back for batches too", fn() {
+    n := new_nodes()
+    n.on(A, 503, "")
+    n.on(B, 200, "[{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x1\"}]")
+    c := rpc.create_public_client(&rpc.ClientConfig{urls: []str{A, B}, http_client: n.http()})
+    calls := []*rpc.BatchCall{&rpc.BatchCall{method: "eth_chainId"}}
+    let berr: error = errors.New("not called")
+    c.batch(calls, fn(cs: []*rpc.BatchCall, err: error) { berr = err })
+    expect(berr).to_be_nil()
+    expect(calls[0].result).to_equal("\"0x1\"")
+    expect(n.urls).to_equal([]str{A, B})
+    expect(c.url).to_equal(B)
+  })
+
+  it("ranks the URLs: the ones that fail go last, the fastest is used", fn() {
+    n := new_nodes()
+    n.on(A, 0, "")
+    n.on(B, 200, ok_body("\"0x1\""))
+    n.on(C, 200, ok_body("\"0x1\""))
+    c := rpc.create_public_client(&rpc.ClientConfig{urls: []str{A, B, C}, http_client: n.http()})
+    let order: []str = nil
+    c.rank_urls(fn(us: []str, err: error) {
+      expect(err).to_be_nil()
+      order = us
+    })
+    expect(order[2]).to_equal(A)
+    expect(c.urls[2]).to_equal(A)
+    expect(c.url).to_equal(order[0])
+    expect(n.hits(A)).to_equal(1)
+    n2 := new_nodes()
+    c2 := rpc.create_public_client(&rpc.ClientConfig{urls: []str{A, B}, http_client: n2.http()})
+    let e: error = nil
+    c2.rank_urls(fn(us: []str, err: error) { e = err })
+    expect(e.Error()).to_contain("no URL answered")
+    expect(c2.url).to_equal(A)
+  })
+
+  it("combines transports with rpc.fallback, sticking to the one that answered", fn() {
+    m1 := new_mock()
+    m1.fail("eth_chainId", fetch.new_error("network", nil, "wallet not connected"))
+    m1.on("eth_call", "\"0x\"")
+    m2 := new_mock()
+    m2.on("eth_chainId", q("0x1"))
+    m2.fail("eth_call", &rpc.RpcError{code: 3, message: "execution reverted"})
+    c := rpc.create_public_client(&rpc.ClientConfig{transport: rpc.fallback([]fn(str, str, fn(str, error)) -> fn(){m1.transport(), m2.transport()}), retries: -1})
+    id := 0
+    c.chain_id(fn(v: int, err: error) { id = v })
+    expect(id).to_equal(1)
+    let e: error = nil
+    c.call(&rpc.CallRequest{to_: USDC}, "", fn(b: str, err: error) { e = err })
+    expect(rpc.is_revert(e)).to_be_true()
+    expect(m1.count("eth_call")).to_equal(0)
+    expect(m2.count("eth_call")).to_equal(1)
+  })
+
+  it("makes an HTTP transport for one URL", fn() {
+    n := new_nodes()
+    n.on(B, 200, ok_body("\"0x2105\""))
+    t := rpc.http_transport(B, &rpc.ClientConfig{http_client: n.http()})
+    c := rpc.create_public_client(&rpc.ClientConfig{transport: rpc.fallback([]fn(str, str, fn(str, error)) -> fn(){rpc.http_transport(A, &rpc.ClientConfig{http_client: n.http()}), t})})
+    id := 0
+    c.chain_id(fn(v: int, err: error) { id = v })
+    expect(id).to_equal(8453)
+    expect(n.urls).to_equal([]str{A, B})
+  })
+})
+
+# ---------------------------------------------------------------- replaced transactions
+
+let SENDER = "0x5875DB54cd9aE2B2A875e09bB731772297Ae9D92"
+let RECIPIENT = "0x0000000aA232009084Bd71A5797d089AA4Edfad4"
+let ORIG = "0x1111111111111111111111111111111111111111111111111111111111111111"
+let REPL = "0x2222222222222222222222222222222222222222222222222222222222222222"
+
+fn tx_json(hash: str, nonce: int, to_: str, value: str, input: str, fee: str, block: str) -> str {
+  bn := "null"
+  if block != "" { bn = q(block) }
+  return "{\"type\":\"0x2\",\"chainId\":\"0x1\",\"hash\":" + q(hash) + ",\"from\":" + q(strings.to_lower(SENDER)) + ",\"to\":" + q(to_) + ",\"nonce\":" + q(rpc.quantity_int(nonce)) + ",\"value\":" + q(value) + ",\"input\":" + q(input) + ",\"gas\":\"0x5208\",\"maxFeePerGas\":" + q(fee) + ",\"maxPriorityFeePerGas\":\"0x1\",\"blockNumber\":" + bn + "}"
+}
+
+fn full_block(number: int, txs: []str) -> str {
+  return "{\"number\":" + q(rpc.quantity_int(number)) + ",\"hash\":\"0xb282d21e36e06b967ee20a367a893098ca58971151fcb869bddaee352be2d9b0\",\"timestamp\":\"0x1\",\"gasLimit\":\"0x1\",\"gasUsed\":\"0x1\",\"transactions\":[" + strings.join(txs, ",") + "]}"
+}
+
+fn receipt_for(hash: str) -> str { return strings.replace_all(RECEIPT, TX, hash) }
+
+# a node where ORIG (nonce 7) is pending, then its nonce is used by tx (in block 0x100)
+fn replaced_node(tx: str) -> *Mock {
+  m := new_mock()
+  m.on("eth_getTransactionReceipt", "null")     # poll 1
+  m.on("eth_getTransactionReceipt", "null")     # poll 2
+  m.on("eth_getTransactionReceipt", "null")     # poll 3
+  m.on("eth_getTransactionReceipt", receipt_for(REPL))
+  m.on("eth_getTransactionByHash", tx_json(ORIG, 7, RECIPIENT, "0xde0b6b3a7640000", "0x", "0x10", ""))
+  m.on("eth_getTransactionCount", q("0x7"))     # poll 2: still unused
+  m.on("eth_getTransactionCount", q("0x8"))     # poll 3: used
+  m.on("eth_blockNumber", q("0x101"))
+  m.on("eth_getBlockByNumber", full_block(257, []str{}))
+  m.on("eth_getBlockByNumber", full_block(256, []str{tx}))
+  return m
+}
+
+describe("rpc replaced transactions", fn() {
+  it("follows a sped-up transaction (repriced) and reports it", fn() {
+    m := replaced_node(tx_json(REPL, 7, RECIPIENT, "0xde0b6b3a7640000", "0x", "0x20", "0x100"))
+    c := m.client()
+    let rep: *rpc.Replacement = nil
+    let r: *rpc.Receipt = nil
+    c.wait_for_transaction_receipt(ORIG, &rpc.WaitOptions{poll_ms: 10, on_replaced: fn(x: *rpc.Replacement) { rep = x }}, fn(v: *rpc.Receipt, err: error) {
+      expect(err).to_be_nil()
+      r = v
+    })
+    expect(r.transaction_hash).to_equal(REPL)
+    expect(rep.reason).to_equal("repriced")
+    expect(rep.transaction_hash).to_equal(REPL)
+    expect(rep.receipt == r).to_be_true()
+    expect(rep.replaced.hash).to_equal(ORIG)
+    expect(rep.transaction.max_fee_per_gas.dec()).to_equal("32")
+    expect(m.count("eth_getTransactionByHash")).to_equal(1)
+    expect(m.count("eth_getBlockByNumber")).to_equal(2)
+    expect(m.params[len(m.params) - 1]).to_equal("[\"" + REPL + "\"]")
+  })
+
+  it("tells a cancellation and a replacement apart", fn() {
+    m := replaced_node(tx_json(REPL, 7, SENDER, "0x0", "0x", "0x20", "0x100"))
+    reason := ""
+    m.client().wait_for_transaction_receipt(ORIG, &rpc.WaitOptions{poll_ms: 10, on_replaced: fn(x: *rpc.Replacement) { reason = x.reason }}, fn(v: *rpc.Receipt, err: error) {})
+    expect(reason).to_equal("cancelled")
+    m2 := replaced_node(tx_json(REPL, 7, USDC, "0x0", "0xa9059cbb", "0x20", "0x100"))
+    m2.client().wait_for_transaction_receipt(ORIG, &rpc.WaitOptions{poll_ms: 10, on_replaced: fn(x: *rpc.Replacement) { reason = x.reason }}, fn(v: *rpc.Receipt, err: error) {})
+    expect(reason).to_equal("replaced")
+  })
+
+  it("uses the transaction given in the options instead of fetching it", fn() {
+    m := replaced_node(tx_json(REPL, 7, RECIPIENT, "0xde0b6b3a7640000", "0x", "0x20", "0x100"))
+    m.queue["eth_getTransactionReceipt"] = m.queue["eth_getTransactionReceipt"][1:]
+    m.queue["eth_getTransactionByHash"] = nil
+    orig := &rpc.TransactionInfo{hash: ORIG, from_: SENDER, to_: RECIPIENT, nonce: 7, value: web3.parse_ether("1")}
+    let r: *rpc.Receipt = nil
+    m.client().wait_for_transaction_receipt(ORIG, &rpc.WaitOptions{poll_ms: 10, transaction: orig}, fn(v: *rpc.Receipt, err: error) { r = v })
+    expect(r.transaction_hash).to_equal(REPL)
+    expect(m.count("eth_getTransactionByHash")).to_equal(0)
+  })
+
+  it("keeps waiting when the nonce was used by the transaction itself", fn() {
+    m := new_mock()
+    m.on("eth_getTransactionReceipt", "null")
+    m.on("eth_getTransactionReceipt", "null")
+    m.on("eth_getTransactionReceipt", receipt_for(ORIG))
+    m.on("eth_getTransactionByHash", tx_json(ORIG, 7, RECIPIENT, "0x0", "0x", "0x10", ""))
+    m.on("eth_getTransactionCount", q("0x8"))
+    m.on("eth_blockNumber", q("0x100"))
+    m.on("eth_getBlockByNumber", full_block(256, []str{tx_json(ORIG, 7, RECIPIENT, "0x0", "0x", "0x10", "0x100")}))
+    called := false
+    let r: *rpc.Receipt = nil
+    m.client().wait_for_transaction_receipt(ORIG, &rpc.WaitOptions{poll_ms: 10, on_replaced: fn(x: *rpc.Replacement) { called = true }}, fn(v: *rpc.Receipt, err: error) { r = v })
+    expect(r.transaction_hash).to_equal(ORIG)
+    expect(called).to_be_false()
+  })
+
+  it("gives up when the nonce is used but the replacement cannot be found", fn() {
+    m := new_mock()
+    m.on("eth_getTransactionReceipt", "null")
+    m.on("eth_getTransactionByHash", tx_json(ORIG, 7, RECIPIENT, "0x0", "0x", "0x10", ""))
+    m.on("eth_getTransactionCount", q("0x8"))
+    m.on("eth_blockNumber", q("0x100"))
+    m.on("eth_blockNumber", q("0x101"))
+    m.on("eth_blockNumber", q("0x102"))
+    m.on("eth_getBlockByNumber", full_block(256, []str{}))
+    let e: error = nil
+    m.client().wait_for_transaction_receipt(ORIG, &rpc.WaitOptions{poll_ms: 10}, fn(v: *rpc.Receipt, err: error) { e = err })
+    expect(e.Error()).to_contain("nonce 7 of " + web3.checksum_address(SENDER) + " was used by another transaction")
+    # 64 blocks the first time, then only the new ones
+    expect(m.count("eth_getBlockByNumber")).to_equal(66)
   })
 })

@@ -8,8 +8,8 @@
 #   my := chains.define_chain(1337, "Local", "ETH", "http://127.0.0.1:8545")
 #
 # rpc_urls are public endpoints that need no key (checked in November 2026); they are rate
-# limited, so production apps should put their own provider's URL first (ClientConfig.url in
-# web3/rpc). Addresses are EIP-55; "" means the contract is not deployed there (or not known).
+# limited, so production apps should put their own provider's URL first (ClientConfig.url or urls
+# in web3/rpc; by default a client uses all of rpc_urls, falling back from one to the next). Addresses are EIP-55; "" means the contract is not deployed there (or not known).
 import "std/strings"
 
 # the coin a chain pays gas with

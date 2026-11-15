@@ -231,12 +231,38 @@ data, topics) are raw bytes. A block is `"latest"`, `"pending"`, `"safe"`, `"fin
 `"earliest"` or `rpc.quantity_int(n)`; `""` means `"latest"`. `from` and `to` are reserved words
 in Caju, so the fields are `from_` and `to_`.
 
-**Configuration** (`ClientConfig`): `chain`, `url` (default `chain.rpc_urls[0]`), `transport`
-(`fn(method, params_json, cb fn(result_json, err)) -> fn()`, for tests, mocks or an EIP-1193
-provider; nil is JSON-RPC over HTTP with fetch), `timeout_ms` (10000), `retries` (2; negative for
-none: only network errors, timeouts, 429 and 5xx are retried, after 200, 400, 800... ms),
-`headers`, `poll_ms` (default from the chain's block time, 1 to 4 s), `http_client` (a
-`*fetch.Client` of your own, for interceptors).
+**Configuration** (`ClientConfig`): `chain`, `url` and `urls` (see **Fallback**; by default all
+of `chain.rpc_urls`), `transport` (`fn(method, params_json, cb fn(result_json, err)) -> fn()`, for
+tests, mocks or an EIP-1193 provider; nil is JSON-RPC over HTTP with fetch), `timeout_ms` (10000,
+per HTTP request), `retries` (2; negative for none: only network errors, timeouts, 429 and 5xx
+are retried, after 200, 400, 800... ms), `headers`, `poll_ms` (default from the chain's block
+time, 1 to 4 s), `http_client` (a `*fetch.Client` of your own, for interceptors), `ccip_read`
+(`*rpc.CcipRead`: which CCIP-read gateways ENS may reach, see `web3/ens`).
+
+**Fallback.** A client over HTTP has a list of URLs, `client.urls`: `url` first, then `urls`
+(duplicates dropped); with neither, all of the chain's `rpc_urls`; `url` alone is that URL only.
+A request goes to the URL that answered last (`client.url`, `client.current_url()`). On a network
+error, a timeout, 429, 5xx or another HTTP failure without a JSON-RPC error in it (403, an HTML
+page) it moves on to the next URL at once, wrapping around; a JSON-RPC error (a revert, invalid
+params) is an answer and is returned as it is. When every URL has failed with a retryable error,
+the round starts over after the pause, up to `retries` more rounds; the callback gets the last
+error. The URL that answers becomes the one used next (sticky). Batches fall back the same way.
+
+```caju
+client := rpc.create_public_client(&rpc.ClientConfig{chain: chains.base})   # mainnet.base.org, then base-rpc.publicnode.com
+mine := rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum, url: my_provider, urls: chains.ethereum.rpc_urls})
+
+client.rank_urls(fn(order: []str, err: error) { ... })   # one eth_blockNumber per URL: fastest first, dead ones last
+
+# transports: the browser wallet's node first, then HTTP (viem's fallback)
+t := rpc.fallback([]fn(str, str, fn(str, error)) -> fn(){wallet.eip1193_transport(w), rpc.http_transport(chains.base.rpc_urls[0], nil)})
+via_wallet := rpc.create_public_client(&rpc.ClientConfig{chain: chains.base, transport: t})
+```
+
+`rank_urls(cb)` measures each URL once (no retries, one after the other) and reorders
+`client.urls` by latency, the ones that failed last; it changes nothing if none answered.
+`rpc.fallback(transports)` is the same rotation over transports (sticky; the client's `retries`
+repeat the whole round); `rpc.http_transport(url, config)` is one URL as a transport.
 
 **Errors.** A JSON-RPC error is an `*rpc.RpcError` (`code`, `message`, `data`); a revert carries
 its revert data, which `rpc.revert_data(err)` returns as bytes (`rpc.is_revert(err)` tells a
@@ -260,7 +286,8 @@ lookups below give `nil, nil`.
 | `get_block(block or hash, full_txs)` | `*Block` (nil, nil if missing) |
 | `get_transaction(hash)` | `*TransactionInfo` (nil, nil if unknown) |
 | `get_transaction_receipt(hash)` | `*Receipt` (nil, nil while pending) |
-| `wait_for_transaction_receipt(hash, *WaitOptions)` | `*Receipt` |
+| `wait_for_transaction_receipt(hash, *WaitOptions)` | `*Receipt` (the replacement's, if it was replaced) |
+| `rank_urls` | the URLs, fastest first |
 | `send_raw_transaction(raw)` | the hash |
 | `get_logs(*LogFilter)` | `[]*Log` |
 | `simulate_calls(calls, block)` | `[]*SimulateResult` (eth_simulateV1: data, status, gas, logs, error per call) |
@@ -298,6 +325,26 @@ client.watch_event(&rpc.LogFilter{address: []str{token}, topics: [][]str{[]str{t
   `opts.stop()` is called from a callback or `max_polls` is reached.
   `wait_for_transaction_receipt` blocks too until the receipt comes (or `timeout_ms`, 180 s by
   default, counted in polls).
+
+**Replaced transactions.** A wallet can speed up or cancel a pending transaction by sending
+another one with the same nonce. `wait_for_transaction_receipt` notices: while there is no
+receipt it fetches the transaction (`get_transaction`, or give it as `WaitOptions.transaction`)
+and checks the sender's nonce (`eth_getTransactionCount`); once the nonce is used, it searches the
+latest blocks (up to `rpc.REPLACEMENT_SCAN_BLOCKS`, 64) for the transaction with that sender and
+nonce. If it has another hash, the wait goes on with that transaction, and when its receipt has
+the confirmations `WaitOptions.on_replaced` gets a `*rpc.Replacement` just before the callback
+gets that receipt:
+
+```caju
+client.wait_for_transaction_receipt(hash, &rpc.WaitOptions{on_replaced: fn(r: *rpc.Replacement) {
+  print(r.reason + ": " + r.transaction_hash)    # "repriced" | "cancelled" | "replaced"
+}}, fn(rc: *rpc.Receipt, err: error) { ... })     # rc: the replacement's receipt
+```
+
+`Replacement` has `reason` (`"repriced"`: the same call with other fees; `"cancelled"`: 0 to the
+sender itself; `"replaced"`: anything else, as viem's `onReplaced`), `transaction_hash`,
+`receipt`, `transaction` (the replacement) and `replaced` (the original). If the nonce is used but
+the replacement is not found in three polls, the wait fails with an error saying so.
 
 `watch_blocks` reports the latest block number at each poll (blocks that come between two polls
 are not reported one by one); `watch_event` asks `eth_getLogs` for the blocks after the last
@@ -628,6 +675,8 @@ multicall.erc20_balances(client, owner, []str{usdc, usdt, dai}, fn(bs: []*web3.U
   # one per token, nil where the call failed (not a token, no contract)
 })
 multicall.get_eth_balances(client, []str{a, b}, fn(bs: []*web3.U256, err: error) { ... })
+# native + ERC-20 balances in one aggregate3 (the same block for all)
+multicall.balances(client, owner, []str{usdc, dai}, fn(native: *web3.U256, tokens: []*web3.U256, err: error) { ... })
 
 c1, _ := multicall.call_of(usdc, erc.ERC20.function("symbol"), []any{}, true)
 c2 := &multicall.Call{target: dai, data: calldata, allow_failure: false}
@@ -649,6 +698,21 @@ ENS names on Ethereum and Sepolia, through the ENS Universal Resolver (the chain
 names. The CCIP-read round trip (EIP-3668) is done here, including the local batch gateway
 (`x-batch-gateway:true`, ENSIP-21), so names like `jesse.base.eth` resolve too. Gateways are
 reached with fetch, through the client's `http_client` transport but without its headers.
+
+**Gateways and CSP.** A page with a strict Content-Security-Policy can only `connect-src` to the
+hosts it lists; an offchain name's gateway is somewhere else. `ClientConfig.ccip_read` decides
+which gateways may be fetched: `&rpc.CcipRead{disabled: true}` fetches none, and
+`&rpc.CcipRead{allowed_hosts: []str{"ccip.ens.xyz", "*.example.com"}}` only those hosts
+(`*.` for subdomains). Gateway URLs that are not allowed are skipped without a request; when no
+allowed one is left the lookup fails with an `*ens.CcipBlockedError` (`ens.is_ccip_blocked(err)`)
+naming the hosts, instead of a CSP violation in the console. Onchain names are not affected.
+
+```caju
+client := rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum, ccip_read: &rpc.CcipRead{disabled: true}})
+ens.resolve_address(client, "jesse.base.eth", fn(a: str, err: error) {
+  if ens.is_ccip_blocked(err) { print("offchain names are not supported here") }
+})
+```
 
 ```caju
 import "github.com/cajulang/web3/ens"

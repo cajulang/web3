@@ -11,6 +11,10 @@
 # gateways is done here, including the local batch gateway ("x-batch-gateway:true", ENSIP-21).
 # "Not found" is not an error: a name without a resolver or without that record gives "", nil.
 #
+# Gateways: ClientConfig.ccip_read (rpc.CcipRead) disables CCIP-read or limits it to some gateway
+# hosts (for a page whose Content-Security-Policy allows only those): a lookup that needs another
+# gateway fails with a *CcipBlockedError (is_ccip_blocked) and nothing is fetched.
+#
 # Names: normalize accepts ASCII names only (lower-cased; labels of a-z, 0-9, "-" and leading
 # "_"). Full UTS-46 / ENSIP-15 normalization (Unicode, emoji, confusables) is NOT implemented:
 # names with non-ASCII characters are refused with an error rather than hashed wrongly.
@@ -139,7 +143,34 @@ const MAX_CCIP_ROUNDS = 4
 # the local batch gateway (ENSIP-21): the client does the batched lookups itself
 export const LOCAL_BATCH_GATEWAY = "x-batch-gateway:true"
 
+# a lookup needed a CCIP-read gateway the client may not reach (ClientConfig.ccip_read)
+export struct CcipBlockedError {
+  disabled: bool                    # CCIP-read is disabled
+  urls: []str                       # the gateway URLs that were not allowed
+}
+
+export fn (e: *CcipBlockedError) Error() -> str {
+  if e.disabled { return "ens: this lookup needs an offchain gateway (CCIP-read, EIP-3668), which is disabled for this client (ClientConfig.ccip_read)" }
+  hosts := []str{}
+  for _, u := range e.urls {
+    h := rpc.url_host(u)
+    if h == "" { h = u }
+    dup := false
+    for _, x := range hosts { if x == h { dup = true } }
+    if !dup { hosts = append(hosts, h) }
+  }
+  return "ens: this lookup needs an offchain gateway (CCIP-read) at " + strings.join(hosts, ", ") + ", which is not in the client's allowed hosts (ClientConfig.ccip_read.allowed_hosts)"
+}
+
+# whether err is a lookup stopped by ClientConfig.ccip_read
+export fn is_ccip_blocked(err: error) -> bool {
+  if err == nil { return false }
+  _, ok := err.(*CcipBlockedError)
+  return ok
+}
+
 struct Lookup {
+  ccip: *rpc.CcipRead
   canceled: bool
   finished: bool
   abort: fn()
@@ -174,6 +205,19 @@ fn gateway_try(http: *fetch.Client, sender: str, urls: []str, i: int, data: str,
     return
   }
   url := urls[i]
+  if url != LOCAL_BATCH_GATEWAY && !st.ccip.allows(url) {
+    # skipped, never fetched; the error says so if no other URL answers
+    blocked := &CcipBlockedError{urls: []str{url}}
+    if last != nil {
+      if be, ok := last.(*CcipBlockedError); ok { blocked.urls = append(be.urls, url) } else { blocked = nil }
+    }
+    if blocked != nil {
+      gateway_try(http, sender, urls, i + 1, data, blocked, st, cb)
+    } else {
+      gateway_try(http, sender, urls, i + 1, data, last, st, cb)
+    }
+    return
+  }
   if url == LOCAL_BATCH_GATEWAY {
     local_batch(http, data, st, fn(resp: str, berr: error) {
       if berr != nil {
@@ -244,6 +288,10 @@ fn batch_step(http: *fetch.Client, reqs: []any, i: int, failures: []any, respons
   urls := []str{}
   for _, u := range r[1].([]any) { urls = append(urls, u.(str)) }
   gateway_try(http, r[0].(str), urls, 0, r[2].(str), nil, st, fn(resp: str, err: error) {
+    if is_ccip_blocked(err) {
+      cb("", err)
+      return
+    }
     if err != nil {
       enc, _ := abi.encode_function_data(HTTP_ERROR, []any{500, err.Error()})
       batch_step(http, reqs, i + 1, append(failures, true), append(responses, enc), st, cb)
@@ -282,6 +330,10 @@ fn ccip_call(client: *rpc.Client, http: *fetch.Client, to_: str, data: str, roun
     }
     urls := []str{}
     for _, u := range v[1].([]any) { urls = append(urls, u.(str)) }
+    if st.ccip != nil && st.ccip.disabled {
+      cb("", &CcipBlockedError{disabled: true, urls: urls})
+      return
+    }
     callback := v[3].(str)
     extra := v[4].(str)
     gateway_try(http, sender, urls, 0, v[2].(str), nil, st, fn(resp: str, gerr: error) {
@@ -349,10 +401,14 @@ fn resolve_raw(client: *rpc.Client, name: str, call: str, cb: fn(str, error)) ->
     cb("", eerr)
     return nil
   }
-  st := &Lookup{}
+  st := &Lookup{ccip: client.config.ccip_read}
   ccip_call(client, gateway_client(client), ur, data, 0, st, fn(out: str, cerr: error) {
     if st.canceled || st.finished { return }
     st.finished = true
+    if is_ccip_blocked(cerr) {
+      cb("", cerr)
+      return
+    }
     if cerr != nil {
       rd, ok := rpc.revert_data(cerr)
       if ok && not_found(rd) {

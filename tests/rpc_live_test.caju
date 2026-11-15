@@ -110,4 +110,31 @@ describe("rpc on public nodes", fn() {
     expect(chain_id_of(chains.arbitrum)).to_equal(42161)
     expect(chain_id_of(chains.polygon)).to_equal(137)
   })
+
+  live("falls back past dead URLs and sticks to the one that answers", fn() {
+    good := chains.ethereum.rpc_urls[0]
+    c := rpc.create_public_client(&rpc.ClientConfig{chain: chains.ethereum, urls: []str{"http://127.0.0.1:9/rpc", "https://rpc.invalid/", good}, timeout_ms: 5000})
+    id := 0
+    c.chain_id(fn(v: int, err: error) {
+      expect(err).to_be_nil()
+      id = v
+    })
+    expect(id).to_equal(1)
+    expect(c.current_url()).to_equal(good)
+    bn := 0
+    c.block_number(fn(v: int, err: error) { bn = v })
+    expect(bn).to_be_greater_than(20000000)
+    expect(c.current_url()).to_equal(good)
+  })
+
+  live("ranks URLs by latency, the dead ones last", fn() {
+    c := rpc.create_public_client(&rpc.ClientConfig{urls: []str{"http://127.0.0.1:9/rpc", chains.ethereum.rpc_urls[0], chains.ethereum.rpc_urls[1]}, timeout_ms: 5000})
+    let order: []str = nil
+    c.rank_urls(fn(us: []str, err: error) {
+      expect(err).to_be_nil()
+      order = us
+    })
+    expect(order[2]).to_equal("http://127.0.0.1:9/rpc")
+    expect(c.current_url()).to_equal(order[0])
+  })
 })

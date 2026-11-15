@@ -228,3 +228,37 @@ export fn erc20_balances(client: *rpc.Client, owner: str, tokens: []str, cb: fn(
     cb(out, nil)
   })
 }
+
+# the native balance (wei, Multicall3's getEthBalance) and the ERC-20 balances of owner, one per
+# token, in one aggregate3 (one eth_call, the same block for all). A token whose balanceOf fails
+# (not a token, no contract) gives nil; so does the native balance if getEthBalance fails
+export fn balances(client: *rpc.Client, owner: str, tokens: []str, cb: fn(*web3.U256, []*web3.U256, error)) -> fn() {
+  addr, err := address_of(client)
+  if err != nil {
+    cb(nil, nil, err)
+    return nil
+  }
+  native, nerr := call_of(addr, GET_ETH_BALANCE, []any{owner}, true)
+  if nerr != nil {
+    cb(nil, nil, nerr)
+    return nil
+  }
+  calls := []*Call{native}
+  for _, t := range tokens {
+    c, cerr := call_of(t, BALANCE_OF, []any{owner}, true)
+    if cerr != nil {
+      cb(nil, nil, cerr)
+      return nil
+    }
+    calls = append(calls, c)
+  }
+  return aggregate_at(client, addr, calls, "latest", CHUNK_SIZE, fn(rs: []*Result, aerr: error) {
+    if aerr != nil {
+      cb(nil, nil, aerr)
+      return
+    }
+    out := []*web3.U256{}
+    for _, r := range rs[1:] { out = append(out, u256_of(r)) }
+    cb(u256_of(rs[0]), out, nil)
+  })
+}

@@ -309,3 +309,87 @@ describe("ens: offchain names (CCIP-read)", fn() {
     expect(ge.Error()).to_contain("HttpError(500")
   })
 })
+
+fn setup_ccip(cfg: *rpc.CcipRead) -> (*Ens, *rpc.Client) {
+  e, c := setup()
+  c.config.ccip_read = cfg
+  return e, c
+}
+
+describe("ens: CCIP-read options (ClientConfig.ccip_read)", fn() {
+  it("fails cleanly, fetching nothing, when CCIP-read is disabled", fn() {
+    e, c := setup_ccip(&rpc.CcipRead{disabled: true})
+    e.offchain[hx(ens.dns_encode("jesse.base.eth"))] = []str{"https://gw.example/{sender}/{data}.json"}
+    e.gateway["https://gw.example/"] = gw_ok(addr_answer(BOB))
+    let ge: error = nil
+    got := "unset"
+    ens.resolve_address(c, "jesse.base.eth", fn(a: str, err: error) {
+      got = a
+      ge = err
+    })
+    expect(got).to_equal("")
+    expect(ens.is_ccip_blocked(ge)).to_be_true()
+    expect(ge.Error()).to_contain("disabled for this client")
+    expect(len(e.requests)).to_equal(0)
+  })
+
+  it("still resolves onchain names with CCIP-read disabled", fn() {
+    e, c := setup_ccip(&rpc.CcipRead{disabled: true})
+    e.set("vitalik.eth", rcall("addr(bytes32)", []any{ens.namehash("vitalik.eth")}), addr_answer(VITALIK))
+    got := ""
+    ens.resolve_address(c, "vitalik.eth", fn(a: str, err: error) {
+      expect(err).to_be_nil()
+      got = a
+    })
+    expect(got).to_equal(VITALIK)
+  })
+
+  it("fetches only allowed gateway hosts, skipping the others", fn() {
+    e, c := setup_ccip(&rpc.CcipRead{allowed_hosts: []str{"*.allowed.example"}})
+    e.offchain[hx(ens.dns_encode("off.eth"))] = []str{"https://gw.example/{data}", "https://ccip.allowed.example:8443/{data}"}
+    e.gateway["https://gw.example/"] = gw_ok(addr_answer(VITALIK))
+    e.gateway["https://ccip.allowed.example"] = gw_ok(addr_answer(BOB))
+    got := ""
+    ens.resolve_address(c, "off.eth", fn(a: str, err: error) {
+      expect(err).to_be_nil()
+      got = a
+    })
+    expect(got).to_equal(BOB)
+    expect(len(e.requests)).to_equal(1)
+    expect(e.requests[0].url).to_start_with("https://ccip.allowed.example:8443/")
+  })
+
+  it("names the hosts that are not allowed", fn() {
+    e, c := setup_ccip(&rpc.CcipRead{allowed_hosts: []str{"ccip.ens.xyz"}})
+    e.offchain[hx(ens.dns_encode("off.eth"))] = []str{"https://gw.example/{data}", "https://user@other.example/x"}
+    let ge: error = nil
+    ens.resolve_address(c, "off.eth", fn(a: str, err: error) { ge = err })
+    expect(ens.is_ccip_blocked(ge)).to_be_true()
+    expect(ge.Error()).to_contain("at gw.example, other.example, which is not in the client's allowed hosts")
+    expect(len(e.requests)).to_equal(0)
+  })
+
+  it("applies the allowlist inside the local batch gateway", fn() {
+    e, c := setup_ccip(&rpc.CcipRead{allowed_hosts: []str{"ccip.ens.xyz"}})
+    e.batch = true
+    e.offchain[hx(ens.dns_encode("batch.eth"))] = []str{"https://gw.example/{sender}/{data}"}
+    e.gateway["https://gw.example/"] = gw_ok(addr_answer(BOB))
+    let ge: error = nil
+    ens.resolve_address(c, "batch.eth", fn(a: str, err: error) { ge = err })
+    expect(ens.is_ccip_blocked(ge)).to_be_true()
+    expect(len(e.requests)).to_equal(0)
+  })
+
+  it("matches gateway hosts", fn() {
+    expect(rpc.url_host("https://User:pw@CCIP.Example.com:443/a?b#c")).to_equal("ccip.example.com")
+    expect(rpc.url_host("http://[::1]:8080/x")).to_equal("[::1]")
+    expect(rpc.url_host("x-batch-gateway:true")).to_equal("")
+    r := &rpc.CcipRead{allowed_hosts: []str{"ccip.ens.xyz", "*.example.com"}}
+    expect(r.allows("https://ccip.ens.xyz/{data}")).to_be_true()
+    expect(r.allows("https://a.b.example.com/")).to_be_true()
+    expect(r.allows("https://example.com.evil.io/")).to_be_false()
+    expect(r.allows("https://notexample.com/")).to_be_false()
+    let none: *rpc.CcipRead = nil
+    expect(none.allows("https://anything.example/")).to_be_true()
+  })
+})

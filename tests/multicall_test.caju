@@ -152,3 +152,38 @@ describe("multicall balances", fn() {
     expect(len(m.methods)).to_equal(0)
   })
 })
+
+describe("multicall.balances", fn() {
+  it("reads the native and the token balances in one eth_call", fn() {
+    m := node()
+    m.balances["0xd8da6bf26964af9d7eed9e03e53415d37aa96045"] = web3.parse_ether("3")
+    m.on_call(NOTHING, fn(data: str, from_: str) -> (str, error) { return "", mocknode.revert("") })
+    let native: *web3.U256 = nil
+    let toks: []*web3.U256 = nil
+    multicall.balances(m.client(), OWNER, []str{USDC, NOTHING, DAI}, fn(n: *web3.U256, bs: []*web3.U256, err: error) {
+      expect(err).to_be_nil()
+      native = n
+      toks = bs
+    })
+    expect(web3.format_ether(native)).to_equal("3")
+    expect(len(toks)).to_equal(3)
+    expect(toks[0].dec()).to_equal("1500000")
+    expect(toks[1] == nil).to_be_true()
+    expect(web3.format_ether(toks[2])).to_equal("2.5")
+    expect(m.count("eth_call")).to_equal(1)
+  })
+
+  it("works without tokens, and fails on a chain without Multicall3", fn() {
+    m := node()
+    let native: *web3.U256 = nil
+    multicall.balances(m.client(), OWNER, []str{}, fn(n: *web3.U256, bs: []*web3.U256, err: error) {
+      expect(len(bs)).to_equal(0)
+      native = n
+    })
+    expect(native.is_zero()).to_be_true()
+    c := rpc.create_public_client(&rpc.ClientConfig{chain: &chains.Chain{id: 999999, name: "Nowhere"}, transport: m.transport()})
+    let e: error = nil
+    multicall.balances(c, OWNER, []str{USDC}, fn(n: *web3.U256, bs: []*web3.U256, err: error) { e = err })
+    expect(e.Error()).to_contain("no Multicall3 address for Nowhere")
+  })
+})
